@@ -77,7 +77,13 @@ impl RectPx {
 /// producing garbage coordinates — an empty rect is never hit, so the worst case
 /// is "the flyout does not trigger", never a mis-claimed region.
 #[must_use]
-pub fn logical_rect_to_physical(left: f32, top: f32, right: f32, bottom: f32, scale: f32) -> RectPx {
+pub fn logical_rect_to_physical(
+    left: f32,
+    top: f32,
+    right: f32,
+    bottom: f32,
+    scale: f32,
+) -> RectPx {
     if !scale.is_finite() || scale <= 0.0 {
         return RectPx::default();
     }
