@@ -42,6 +42,40 @@
 //!
 //! Trade-off of clearing `WS_SYSMENU`: Alt+Space and the taskbar right-click
 //! system menu go away; the custom titlebar already provides min/max/close.
+//! [`set_snap_support_enabled`] is the opt-in that trades that default back the
+//! other way (see below).
+//!
+//! ## Extensions: Snap Layouts, system menu, rounded corners, backdrop
+//!
+//! Everything above is unchanged. Layered on top:
+//!
+//! * **`WM_NCHITTEST`** — the subclass now answers it, returning `HTMAXBUTTON`
+//!   over the app-published maximize-button rect ([`set_maximize_button_rect`]).
+//!   That reply is the ONLY trigger for the Windows 11 **Snap Layouts** flyout.
+//!   `DwmDefWindowProc` is consulted FIRST for the caption-button message set,
+//!   per the MS custom-frame guidance, so DWM renders the flyout itself.
+//! * **Drag/resize ownership** — deliberately left with egui
+//!   ([`hit_test::HitTestMode::MaximizeButtonOnly`], the default): every point
+//!   except the maximize button answers `HTCLIENT`, so
+//!   `scribe-app/src/app/chrome.rs`'s `resize_dir_at` / `handle_frameless_resize`
+//!   and `ViewportCommand::StartDrag` keep working untouched. Two systems both
+//!   answering "is this a resize edge?" is a real bug source (the OS modal resize
+//!   loop eats the button-up egui's state machine waits for), so exactly one owns
+//!   it. [`hit_test::HitTestMode::FullNonClient`] is available for ports that
+//!   want the opposite split — an app selecting it MUST disable its egui-space
+//!   resize handler.
+//! * **`HTMAXBUTTON` consequence** — Windows then routes clicks over that rect as
+//!   `WM_NCLBUTTONDOWN`/`UP`, so egui never sees them. The subclass handles those
+//!   itself and posts `WM_SYSCOMMAND(SC_MAXIMIZE|SC_RESTORE)`, and tracks hover
+//!   for [`maximize_button_hovered`] so the app can still paint its hover state.
+//! * **System menu** — [`show_system_menu`] pops the real `GetSystemMenu` popup
+//!   with correct per-state greying ([`system_menu::menu_state`]).
+//! * **Rounded corners** — `DWMWA_WINDOW_CORNER_PREFERENCE = DWMWCP_ROUND`,
+//!   applied once from [`ensure_caption_stripped`]. Windows 10 rejects the
+//!   attribute with an `HRESULT` we ignore, so it degrades to today's square
+//!   window; it can never fail the app.
+//! * **Backdrop (Mica/Acrylic)** — [`set_backdrop`], DEFAULT-OFF. See its doc for
+//!   why it is opt-in rather than on.
 
 /// Ensure THIS process's main top-level window draws no system caption buttons
 /// over the custom titlebar, by clearing the caption-button window styles

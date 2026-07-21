@@ -39,6 +39,7 @@ use egui::{Color32, FontId, TextFormat, Ui};
 use ropey::Rope;
 
 mod tab_geometry;
+pub mod word_nav;
 use scribe_core::buffer::Buffer;
 use scribe_core::syntax::{Highlighter, HlSpan, IncrementalHighlightState};
 use tab_geometry::{col_to_rel_x, layout_line, rel_x_to_col};
