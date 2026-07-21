@@ -691,7 +691,7 @@ crash_reports = \"always\"
         assert_eq!(c.schema_version, 3, "fixture loads as a v3 config");
         // The integration section is absent → all-off default.
         assert!(!c.integration.register_file_types);
-        assert!(c.integration.claimed_types.is_empty());
+        assert!(c.integration.claimed_types.is_none(), "selection UNSET");
 
         assert!(c.migrate(), "a v3 config must migrate to v4 (additive)");
         assert_eq!(c.schema_version, CURRENT_SCHEMA_VERSION);
@@ -702,7 +702,10 @@ crash_reports = \"always\"
             !c.integration.register_file_types,
             "v3->v4 migrate must leave file-type registration OFF (opt-in only)"
         );
-        assert!(c.integration.claimed_types.is_empty());
+        assert!(
+            c.integration.claimed_types.is_none(),
+            "migrate must not invent a selection — it stays UNSET"
+        );
         // Prior values (incl. the opted-in reporting choice) survive untouched.
         assert_eq!(c.editor.tab_width, 3, "stored tab_width preserved");
         assert_eq!(

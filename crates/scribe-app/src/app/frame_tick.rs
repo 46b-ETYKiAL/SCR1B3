@@ -18,6 +18,96 @@ fn editor_ctx_cmd_id() -> egui::Id {
     egui::Id::new("scr1b3_editor_ctx_menu_cmd")
 }
 
+/// Which editor surface actually rendered the active buffer on the last frame.
+///
+/// SCR1B3 swaps the editor out from under the user in three situations — the
+/// automatic rope-editor swap past `rope_editor_auto_threshold_bytes` (16 MiB by
+/// default), the read-only browse past the hard size cap, and the folded
+/// preview. Each of those disables a large set of `TextEdit`-only features, and
+/// none of them used to produce a toast, a badge or a gutter marker: the user
+/// was simply dropped into a degraded editor with no explanation for why their
+/// features stopped working. The status bar renders this so the active mode is
+/// always visible.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum EditorMode {
+    /// egui `TextEdit` — the full-feature default. Deliberately badge-less: no
+    /// badge IS the "nothing is degraded" signal.
+    Standard,
+    /// The in-house rope editor (opt-in, or auto past the byte threshold).
+    Rope,
+    /// The rope editor still on a memory-mapped buffer (read-only banner only).
+    RopeMmap,
+    /// Read-only huge-file browse past the hard size cap.
+    ReadOnlyLarge,
+    /// The folded read-only preview.
+    Fold,
+}
+
+impl EditorMode {
+    /// Map the widget's own report of which buffer variant it walked. This is
+    /// the first non-test consumer of `RopeEditorResponse::buffer_mode`.
+    fn from_buffer_mode(mode: &scribe_render::BufferModeSeen) -> Self {
+        match mode {
+            scribe_render::BufferModeSeen::Rope => Self::Rope,
+            scribe_render::BufferModeSeen::Mmap => Self::RopeMmap,
+        }
+    }
+
+    /// Short status-bar badge, or `None` for the full-feature default.
+    pub(super) fn badge(self) -> Option<&'static str> {
+        match self {
+            Self::Standard => None,
+            Self::Rope => Some("ROPE"),
+            Self::RopeMmap => Some("MMAP"),
+            Self::ReadOnlyLarge => Some("READ-ONLY"),
+            Self::Fold => Some("FOLDED"),
+        }
+    }
+
+    /// The explanation shown on hover — names the trade-off, so the badge is
+    /// self-describing rather than an unexplained acronym.
+    pub(super) fn hover(self) -> &'static str {
+        match self {
+            Self::Standard => "Standard editor — all editing features available",
+            Self::Rope => {
+                "Large-file editor: this buffer is past the rope-editor size threshold, so it \
+                 renders through the in-house viewport-culled editor. Editing, undo and find \
+                 work; TextEdit-only conveniences (breadcrumbs, sticky scroll, spellcheck \
+                 overlay, completion popup) are unavailable."
+            }
+            Self::RopeMmap => {
+                "Large-file editor on a memory-mapped buffer — read-only until the file is \
+                 loaded into a rope."
+            }
+            Self::ReadOnlyLarge => {
+                "Read-only browse: this file is past the hard size cap, so it opens read-only \
+                 for O(viewport) navigation. Editing is disabled."
+            }
+            Self::Fold => "Folded preview — read-only projection. Exit folds to edit.",
+        }
+    }
+}
+
+/// ctx-data slot the active [`EditorMode`] is published into. The status bar
+/// renders BEFORE the central panel, so it reads the previous frame's value —
+/// a one-frame lag that is invisible, and always correct once steady.
+fn editor_mode_id() -> egui::Id {
+    egui::Id::new("scr1b3_active_editor_mode")
+}
+
+/// Publish the surface that just rendered. Every editor path calls this, so the
+/// badge can never go stale on a tab switch or a mode change.
+fn publish_editor_mode(ctx: &egui::Context, mode: EditorMode) {
+    ctx.data_mut(|d| d.insert_temp(editor_mode_id(), mode));
+}
+
+/// The surface that rendered last frame, defaulting to the full-feature editor
+/// before the first central-panel frame has run.
+pub(super) fn active_editor_mode(ctx: &egui::Context) -> EditorMode {
+    ctx.data(|d| d.get_temp(editor_mode_id()))
+        .unwrap_or(EditorMode::Standard)
+}
+
 impl ScribeApp {
     /// Apply the Wave-2 scroll knobs and drive middle-click autoscroll. Called
     /// at the very top of [`Self::frame_tick`], before any `ScrollArea` shows.
@@ -1442,6 +1532,25 @@ impl ScribeApp {
                                         .monospace(),
                                 );
                             }
+                            // Editor-mode badge. When the buffer crosses the rope
+                            // threshold the editor silently swaps to a degraded
+                            // surface and ~25 TextEdit-only conveniences stop working;
+                            // before this, the user was given no signal at all. The
+                            // full-feature Standard mode is deliberately badge-less —
+                            // no badge IS the "nothing is degraded" signal — and the
+                            // hover names the exact trade-off so the acronym is
+                            // self-describing. Reads last frame's published mode
+                            // (status bar renders before the central panel); the
+                            // one-frame lag is invisible and always correct at rest.
+                            if let Some(badge) = active_editor_mode(ctx).badge() {
+                                ui.label(
+                                    RichText::new(format!("[ {badge} ]"))
+                                        .color(warn)
+                                        .small()
+                                        .monospace(),
+                                )
+                                .on_hover_text(active_editor_mode(ctx).hover());
+                            }
                             if spell_on {
                                 let (txt, col) = if spell_misspellings == 0 {
                                     (format!("spell {}", egui_phosphor::thin::CHECK), accent)
@@ -1891,6 +2000,21 @@ impl ScribeApp {
             egui::CentralPanel::default().show(ctx, |ui| {
                 // Folded read-only preview is a distinct surface (no live editing).
                 if self.fold_view {
+                    // The fold preview builds its own `ScrollArea` (id_salt
+                    // "fold-scroll") inside `show_fold_view`, so a queued
+                    // find-navigate / go-to-line scroll had nothing to consume it
+                    // here. Bridge it through the persisted state the same way the
+                    // rope paths do.
+                    //
+                    // The drag assist and the minimap deliberately do NOT run for
+                    // this surface: the preview's `TextEdit` is `interactive(false)`
+                    // (no selection to extend), and its content height is the
+                    // projected galley's, which is not observable from outside the
+                    // widget — publishing a guessed height would make the minimap
+                    // lie, which is worse than leaving it alone.
+                    let fold_scroll = super::drag_scroll::embedded_scroll_id(ui, "fold-scroll");
+                    self.drive_embedded_scroll(ctx, fold_scroll);
+                    publish_editor_mode(ctx, EditorMode::Fold);
                     self.show_fold_view(ui, font.clone(), ext.as_deref());
                     return;
                 }
@@ -1904,6 +2028,22 @@ impl ScribeApp {
                 // syntax highlighting (F-030).
                 if read_only {
                     let rope = self.tabs[active].doc.rope().clone();
+                    // Exact content height: `RopeEditor` lays out through
+                    // `ScrollArea::show_rows(ui, line_h, total_lines, ..)`, so the
+                    // content is precisely `len_lines * gutter_row_h`. Captured
+                    // before the buffer is moved into the widget.
+                    let content_h = rope.len_lines() as f32 * gutter_row_h;
+                    let scroll_id = super::drag_scroll::embedded_scroll_id(
+                        ui,
+                        super::drag_scroll::DEFAULT_SCROLL_SALT,
+                    );
+                    let focus_id = super::drag_scroll::rope_editor_focus_id(ui);
+                    let viewport = ui.max_rect();
+                    // Consume a queued find-navigate / go-to-line scroll BEFORE the
+                    // widget renders — the read-only browse path owns no ScrollArea
+                    // builder of its own, so this bridge is what makes those jumps
+                    // move the viewport instead of silently doing nothing.
+                    self.drive_embedded_scroll(ctx, scroll_id);
                     let mut buf = scribe_core::buffer::Buffer::Rope(rope);
                     let fg = ui_color(&self.theme, "foreground", Rgba::new(0xc8, 0xd6, 0xdc, 255));
                     scribe_render::RopeEditor::new(&mut buf, font.clone(), gutter_row_h)
@@ -1912,6 +2052,8 @@ impl ScribeApp {
                         .with_line_numbers(show_line_numbers)
                         .with_syntax(&self.hl, ext.clone())
                         .show(ui);
+                    publish_editor_mode(ctx, EditorMode::ReadOnlyLarge);
+                    self.finish_embedded_scroll(ctx, scroll_id, focus_id, viewport, content_h);
                     return;
                 }
 
@@ -1941,6 +2083,17 @@ impl ScribeApp {
                     // mutable rope borrow as a disjoint-field borrow).
                     let render_whitespace = self.config.editor.render_whitespace;
                     let snippets_enabled = self.config.editor.snippets_enabled;
+                    // Scroll-surface handles for the shared assist. Taken from the
+                    // SAME `ui` the widget is handed, before the `&mut self.tabs`
+                    // borrow below, so the ids match the ones `RopeEditor` derives
+                    // internally.
+                    let scroll_id = super::drag_scroll::embedded_scroll_id(
+                        ui,
+                        super::drag_scroll::DEFAULT_SCROLL_SALT,
+                    );
+                    let focus_id = super::drag_scroll::rope_editor_focus_id(ui);
+                    let viewport = ui.max_rect();
+                    self.drive_embedded_scroll(ctx, scroll_id);
                     let snippets = &self.snippets;
                     let hl = &self.hl;
                     let tab = &mut self.tabs[active];
@@ -1977,6 +2130,27 @@ impl ScribeApp {
                         // Response, so bump the gen counter here for parity.
                         tab.edit_gen = tab.edit_gen.wrapping_add(1);
                     }
+                    // Exact content height for the minimap + the drag assist:
+                    // `RopeEditor` lays out via `show_rows(ui, line_h,
+                    // total_lines, ..)`, so it is `len_lines * gutter_row_h`.
+                    // Read while `tab` is still borrowed, used after it drops.
+                    let content_h = tab
+                        .rope_buf
+                        .as_ref()
+                        .and_then(scribe_core::buffer::Buffer::as_rope)
+                        .map_or(1.0, |r| r.len_lines() as f32 * gutter_row_h);
+                    // The FIRST non-test consumer of `RopeEditorResponse::buffer_mode`:
+                    // publish which buffer variant actually rendered so the status
+                    // bar can tell the user they are in the degraded editor
+                    // instead of silently swapping it in under them.
+                    publish_editor_mode(ctx, EditorMode::from_buffer_mode(&resp.buffer_mode));
+                    // Join the shared autoscroll + minimap-metrics implementation, the
+                    // same call the read-only-large path makes above. Without this the
+                    // editable rope path recorded no `scroll_metrics` (freezing the
+                    // minimap on the last TextEdit frame) and drag-select autoscroll
+                    // never ran here — the parity gap the frame-loop work exists to
+                    // close. `content_h` is the rope's real laid-out height.
+                    self.finish_embedded_scroll(ctx, scroll_id, focus_id, viewport, content_h);
                     if let Some(text) = clipboard {
                         // On Cut the selection is already removed from the buffer,
                         // so a clipboard failure here means the text is only
@@ -2305,6 +2479,35 @@ impl ScribeApp {
                         egui::ScrollArea::both()
                     })
                     .id_salt(("scr1b3-editor-scroll", self.tabs[active].doc_id));
+                    // ROOT CAUSE of "drag-select can't scroll the view" (P0-2).
+                    // egui's own TextEdit cursor-follow calls
+                    // `ui.scroll_to_rect(primary_cursor_rect, None)` on
+                    // `response.changed() || selection_changed`
+                    // (`text_edit/builder.rs`), which during a drag-select is
+                    // true nearly every frame. With the ScrollArea's default
+                    // `animated == true` that installs a persistent
+                    // `state.offset_target`, and `Prepared::begin` LERPS
+                    // `state.offset` toward it (`scroll_area.rs`) AFTER our
+                    // `vertical_scroll_offset` write below has landed but BEFORE
+                    // `add_contents` lays anything out. So every value
+                    // `drag_scroll_assist` computed was overwritten before it
+                    // could take effect, and because `scroll_metrics` is then
+                    // recorded from the CLOBBERED offset the assist re-based off
+                    // egui's value each frame and could never accumulate.
+                    //
+                    // With `animated(false)` the same cursor-follow instead
+                    // writes `state.offset[d] = target_offset` directly and
+                    // installs NO `offset_target`, so nothing survives into the
+                    // next frame to clobber our write.
+                    //
+                    // Gated STRICTLY on an active drag-select: turning animation
+                    // off unconditionally would also kill the user's
+                    // `animate_jumps` easing for goto-line / find-navigation.
+                    let drag_selecting = ctx.input(|i| i.pointer.primary_down())
+                        && ctx.memory(|m| m.has_focus(editor_id));
+                    if drag_selecting {
+                        sa = sa.animated(false);
+                    }
                     if let Some(off) = self.pending_scroll.take() {
                         sa = sa.vertical_scroll_offset(off);
                     }
@@ -2998,6 +3201,12 @@ impl ScribeApp {
                         sa_out.content_size.y.max(1.0),
                         sa_out.inner_rect.height().max(1.0),
                     );
+                    // This is the full-feature TextEdit path — publish Standard so the
+                    // status-bar mode badge CLEARS when the user returns to a small
+                    // file. Without this the badge would keep showing ROPE/MMAP from
+                    // whatever large file rendered last, which is exactly the "silent
+                    // and misleading" state the badge exists to prevent.
+                    publish_editor_mode(ctx, EditorMode::Standard);
                     // Hand the viewport rect to the post-render drag-scroll +
                     // caret-scroll-off assists (applied after the `hl` borrow).
                     editor_vp = sa_out.inner_rect;

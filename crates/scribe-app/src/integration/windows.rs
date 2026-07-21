@@ -4,7 +4,7 @@
 //! `OpenWithProgids` + `Capabilities` + `RegisteredApplications` (making SCR1B3 a
 //! first-class choice) and deep-link the user to the Default Apps UI to confirm.
 
-use super::windows_entries::{registry_entries, RegEntry};
+use super::windows_entries::{registry_entries, summarize, FailedWrite, RegEntry};
 use super::RegisterReport;
 use scribe_core::config::ClaimType;
 use std::os::windows::process::CommandExt;
@@ -61,43 +61,59 @@ pub(crate) fn register_under(
     app_name: &str,
 ) -> RegisterReport {
     let entries = registry_entries(types, exe, class_root, app_root, app_name);
-    let mut failed = Vec::new();
+    let mut failures: Vec<FailedWrite> = Vec::new();
     for e in &entries {
         if let Err(err) = apply_entry(e) {
-            failed.push((e.key.clone(), err));
+            failures.push(FailedWrite {
+                claim: e.claim,
+                key: e.key.clone(),
+                err,
+            });
         }
     }
-    let registered = if failed.is_empty() {
-        types.iter().map(|t| t.key().to_string()).collect()
-    } else {
-        Vec::new()
-    };
+    // The message + the registered set are DERIVED from what actually landed —
+    // never a hardcoded success string (see `summarize`).
+    let outcome = summarize(types, &failures);
     RegisterReport {
-        registered,
-        failed,
-        needs_user_action: true,
-        message: "SCR1B3 is registered. Windows requires you to pick it in the \
-                  Default Apps window — choose SCR1B3 for each file type. (Windows \
-                  doesn't let an app change the default for you.)"
-            .into(),
+        // Only ask the user to finish in the Default Apps UI if something
+        // actually registered; sending them there after a total failure would
+        // show them an app that isn't listed.
+        needs_user_action: !outcome.registered.is_empty(),
+        registered: outcome.registered,
+        failed: failures.into_iter().map(|f| (f.key, f.err)).collect(),
+        message: outcome.message,
     }
 }
 
-pub fn register(types: &[ClaimType]) -> RegisterReport {
+/// Register without opening the Default Apps window. Used by the startup
+/// re-registration, which must refresh the stale exe path silently — popping a
+/// Settings window on every launch after an update would be hostile.
+pub fn register_silent(types: &[ClaimType]) -> RegisterReport {
     let Some(exe) = current_exe_string() else {
         return RegisterReport {
+            failed: vec![(
+                "current_exe".into(),
+                "the running program path is unavailable".into(),
+            )],
             message: "Couldn't find the SCR1B3 program path to register.".into(),
             ..Default::default()
         };
     };
-    let report = register_under(
+    register_under(
         types,
         &exe,
         "Software\\Classes",
         "Software\\SCR1B3",
         "SCR1B3",
-    );
-    if report.failed.is_empty() {
+    )
+}
+
+pub fn register(types: &[ClaimType]) -> RegisterReport {
+    let report = register_silent(types);
+    // Deep-link only when there is something for the user to pick. `registered`
+    // is the honest signal (a shared-key failure empties it), so this no longer
+    // opens the window after a registration that did not land.
+    if !report.registered.is_empty() {
         open_default_apps_ui();
     }
     report

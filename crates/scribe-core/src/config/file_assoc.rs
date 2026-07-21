@@ -101,22 +101,25 @@ pub fn ensure_extension(path: &Path, default_ext: &str) -> PathBuf {
 /// checklist while each group still expands to the right per-OS identifiers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ClaimType {
-    /// `.txt` and the plain-text family.
+    /// `.txt` and the plain-text family (including logs).
     PlainText,
     /// Markdown notes (`.md`, `.markdown`).
     Markdown,
     /// JSON documents (`.json`).
     Json,
+    /// Config & tabular data formats (`.toml`, `.yaml`, `.ini`, `.csv`, `.xml`).
+    ConfigData,
     /// Source code across common languages.
     SourceCode,
 }
 
 impl ClaimType {
     /// Every claimable group, in display order.
-    pub const ALL: [ClaimType; 4] = [
+    pub const ALL: [ClaimType; 5] = [
         ClaimType::PlainText,
         ClaimType::Markdown,
         ClaimType::Json,
+        ClaimType::ConfigData,
         ClaimType::SourceCode,
     ];
 
@@ -127,6 +130,7 @@ impl ClaimType {
             ClaimType::PlainText => "plain_text",
             ClaimType::Markdown => "markdown",
             ClaimType::Json => "json",
+            ClaimType::ConfigData => "config_data",
             ClaimType::SourceCode => "source_code",
         }
     }
@@ -134,10 +138,31 @@ impl ClaimType {
     /// Human label for the Settings checklist.
     pub fn label(self) -> &'static str {
         match self {
-            ClaimType::PlainText => "Plain text (.txt)",
-            ClaimType::Markdown => "Markdown (.md)",
-            ClaimType::Json => "JSON (.json)",
-            ClaimType::SourceCode => "Source code (.rs, .py, .js, …)",
+            ClaimType::PlainText => "Plain text & logs",
+            ClaimType::Markdown => "Markdown",
+            ClaimType::Json => "JSON",
+            ClaimType::ConfigData => "Config & data",
+            ClaimType::SourceCode => "Source code",
+        }
+    }
+
+    /// A short, human-readable sample of the extensions this group claims, for
+    /// the Settings checklist's secondary line. Built from
+    /// [`windows_extensions`](Self::windows_extensions) so it can never drift
+    /// from the set actually registered: the first few, then "+N more".
+    pub fn extension_summary(self) -> String {
+        let exts = self.windows_extensions();
+        const SHOWN: usize = 4;
+        let head = exts
+            .iter()
+            .take(SHOWN)
+            .map(|e| format!(".{e}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        if exts.len() > SHOWN {
+            format!("{head} +{} more", exts.len() - SHOWN)
+        } else {
+            head
         }
     }
 
@@ -155,31 +180,59 @@ impl ClaimType {
             ClaimType::PlainText => "SCR1B3.txt",
             ClaimType::Markdown => "SCR1B3.md",
             ClaimType::Json => "SCR1B3.json",
+            ClaimType::ConfigData => "SCR1B3.config",
             ClaimType::SourceCode => "SCR1B3.source",
         }
     }
 
     /// File extensions (NO leading dot) this group claims on Windows.
+    ///
+    /// Every extension belongs to EXACTLY ONE group — the Default-Apps
+    /// `Capabilities\FileAssociations` key maps one `.ext` value name to one
+    /// ProgID, so a duplicate across groups would silently let the later group
+    /// overwrite the earlier one. `every_extension_belongs_to_exactly_one_group`
+    /// pins that invariant.
     pub fn windows_extensions(self) -> &'static [&'static str] {
         match self {
-            ClaimType::PlainText => &["txt", "text", "log"],
-            ClaimType::Markdown => &["md", "markdown", "mdown", "mkd"],
-            ClaimType::Json => &["json", "jsonc"],
+            ClaimType::PlainText => &["txt", "text", "log", "nfo"],
+            ClaimType::Markdown => &["md", "markdown", "mdown", "mkd", "mdx"],
+            ClaimType::Json => &["json", "jsonc", "json5"],
+            ClaimType::ConfigData => &[
+                "toml",
+                "yaml",
+                "yml",
+                "ini",
+                "cfg",
+                "conf",
+                "csv",
+                "tsv",
+                "xml",
+                "env",
+                "properties",
+                "editorconfig",
+            ],
             ClaimType::SourceCode => &[
-                "rs", "c", "h", "cpp", "cc", "cxx", "hpp", "py", "js", "mjs", "cjs", "ts", "tsx",
-                "jsx", "go", "java", "rb", "php", "sh", "bash", "zsh", "toml", "yaml", "yml",
-                "xml", "css", "scss", "html", "htm", "lua", "sql", "kt", "swift", "dart", "zig",
-                "ini", "cfg", "conf",
+                "rs", "c", "h", "cpp", "cc", "cxx", "hpp", "hh", "py", "pyi", "js", "mjs", "cjs",
+                "ts", "tsx", "jsx", "go", "java", "rb", "php", "sh", "bash", "zsh", "ps1", "bat",
+                "cmd", "css", "scss", "sass", "less", "html", "htm", "vue", "svelte", "lua", "sql",
+                "kt", "kts", "swift", "dart", "zig", "pl", "pm", "r", "jl", "ex", "exs", "erl",
+                "hs", "scala", "clj", "vim", "asm", "s", "cmake", "gradle", "tf", "proto",
             ],
         }
     }
 
     /// macOS Uniform Type Identifiers this group claims.
+    ///
+    /// System UTIs resolve through the conformance tree, so TOML/YAML/INI need
+    /// no UTI of their own — they conform to `public.plain-text`, already
+    /// claimed by [`PlainText`](Self::PlainText). Only the formats with a
+    /// distinct system UTI are named here.
     pub fn macos_utis(self) -> &'static [&'static str] {
         match self {
             ClaimType::PlainText => &["public.plain-text"],
             ClaimType::Markdown => &["net.daringfireball.markdown"],
             ClaimType::Json => &["public.json"],
+            ClaimType::ConfigData => &["public.xml", "public.comma-separated-values-text"],
             ClaimType::SourceCode => &["public.source-code"],
         }
     }
@@ -190,6 +243,15 @@ impl ClaimType {
             ClaimType::PlainText => &["text/plain"],
             ClaimType::Markdown => &["text/markdown"],
             ClaimType::Json => &["application/json"],
+            ClaimType::ConfigData => &[
+                "application/toml",
+                "application/yaml",
+                "text/x-yaml",
+                "application/xml",
+                "text/xml",
+                "text/csv",
+                "text/tab-separated-values",
+            ],
             ClaimType::SourceCode => &[
                 "text/x-csrc",
                 "text/x-c++src",
@@ -197,12 +259,13 @@ impl ClaimType {
                 "text/x-rust",
                 "text/x-python",
                 "application/javascript",
+                "application/typescript",
                 "text/x-go",
                 "text/x-java-source",
+                "text/x-php",
+                "text/x-ruby",
                 "application/x-shellscript",
-                "application/toml",
-                "text/x-yaml",
-                "application/xml",
+                "application/x-perl",
                 "text/css",
                 "text/html",
                 "text/x-lua",
@@ -210,6 +273,26 @@ impl ClaimType {
             ],
         }
     }
+}
+
+/// A stable fingerprint of "the registry writes a registration would make":
+/// the executable path plus the claimed group keys, in canonical order.
+///
+/// This is what makes the startup re-registration converge instead of
+/// re-running every launch. SCR1B3 ships an in-app updater and a portable zip,
+/// so the executable path legitimately MOVES — and every registered
+/// `shell\open\command` still points at the old location until it is rewritten.
+/// Comparing this fingerprint against the one stamped by the last SUCCESSFUL
+/// registration detects exactly the two cases that need a rewrite (the exe
+/// moved, or the user changed which types they claim) and nothing else.
+pub fn registration_fingerprint(exe: &str, types: &[ClaimType]) -> String {
+    let mut keys: Vec<&str> = ClaimType::ALL
+        .into_iter()
+        .filter(|c| types.contains(c))
+        .map(|c| c.key())
+        .collect();
+    keys.dedup();
+    format!("{}|{}", exe, keys.join(","))
 }
 
 /// OS-integration preferences (schema v4). DEFAULTS OFF — SCR1B3 never registers
@@ -227,10 +310,17 @@ pub struct IntegrationConfig {
     /// The user asked SCR1B3 to register as a default file-type handler. Until
     /// this is set true (via Settings), no registration is ever performed.
     pub register_file_types: bool,
-    /// Persisted [`ClaimType::key`] tokens the user opted to claim. An empty list
-    /// while `register_file_types` is on means "the default set" — see
-    /// [`claimed_types`](Self::claimed_types).
-    pub claimed_types: Vec<String>,
+    /// Persisted [`ClaimType::key`] tokens the user opted to claim.
+    ///
+    /// `None` means UNSET (never chosen) and resolves to the full default set.
+    /// `Some(vec![])` means the user explicitly cleared every box and resolves
+    /// to NOTHING. Those two states are genuinely different and a bare `Vec`
+    /// cannot tell them apart: while this was a `Vec<String>`, clearing the last
+    /// checkbox persisted an empty list, which
+    /// [`claimed_types`](Self::claimed_types) then resolved back to ALL — so the
+    /// boxes silently re-checked themselves on the next frame and the user could
+    /// not opt out of a group. See `clearing_every_box_means_none_not_all`.
+    pub claimed_types: Option<Vec<String>>,
     /// Unix seconds of the last successful registration (for the Settings status
     /// line). `None` until the first successful register.
     pub last_registration_unix: Option<u64>,
@@ -245,17 +335,31 @@ pub struct IntegrationConfig {
 
 impl IntegrationConfig {
     /// The resolved set of claim groups: the persisted keys parsed back to
-    /// [`ClaimType`]s, or — when none are stored — the full default set. Unknown
-    /// / stale keys are ignored (forward-compatible). Order follows
-    /// [`ClaimType::ALL`] and is de-duplicated.
+    /// [`ClaimType`]s, or — when the selection is UNSET (`None`) — the full
+    /// default set. An explicitly EMPTY selection resolves to an empty set, not
+    /// to everything. Unknown / stale keys are ignored (forward-compatible).
+    /// Order follows [`ClaimType::ALL`] and is de-duplicated.
     pub fn claimed_types(&self) -> Vec<ClaimType> {
-        if self.claimed_types.is_empty() {
+        let Some(keys) = self.claimed_types.as_ref() else {
             return ClaimType::ALL.to_vec();
-        }
+        };
         ClaimType::ALL
             .into_iter()
-            .filter(|c| self.claimed_types.iter().any(|k| k == c.key()))
+            .filter(|c| keys.iter().any(|k| k == c.key()))
             .collect()
+    }
+
+    /// Persist an explicit selection (canonical order, de-duplicated). Always
+    /// records `Some`, so clearing every box is stored as "none chosen" rather
+    /// than collapsing back to the unset-means-all default.
+    pub fn set_claimed_types(&mut self, types: &[ClaimType]) {
+        self.claimed_types = Some(
+            ClaimType::ALL
+                .into_iter()
+                .filter(|c| types.contains(c))
+                .map(|c| c.key().to_string())
+                .collect(),
+        );
     }
 }
 
@@ -298,17 +402,186 @@ mod tests {
     }
 
     #[test]
+    fn txt_is_claimed_and_reaches_the_plain_text_progid() {
+        // The user-reported symptom was ".txt is not available as a default".
+        // `.txt` must be claimed, by exactly one group, with a ProgID — this is
+        // the config-layer half of that contract (the registry-entry half is
+        // `plain_text_registration_covers_dot_txt` in windows_entries).
+        let owners: Vec<ClaimType> = ClaimType::ALL
+            .into_iter()
+            .filter(|c| c.windows_extensions().contains(&"txt"))
+            .collect();
+        assert_eq!(
+            owners,
+            vec![ClaimType::PlainText],
+            "`.txt` is claimed by exactly one group: PlainText"
+        );
+        assert_eq!(ClaimType::PlainText.windows_progid(), "SCR1B3.txt");
+    }
+
+    #[test]
+    fn every_extension_belongs_to_exactly_one_group() {
+        // `Capabilities\FileAssociations` maps ONE `.ext` value name to ONE
+        // ProgID. If two groups claimed the same extension the later write would
+        // silently clobber the earlier, and unchecking one group would strip an
+        // association the other group still believes it holds.
+        let mut seen: Vec<(&str, ClaimType)> = Vec::new();
+        for c in ClaimType::ALL {
+            for e in c.windows_extensions() {
+                if let Some((_, other)) = seen.iter().find(|(s, _)| s == e) {
+                    panic!("extension .{e} claimed by both {other:?} and {c:?}");
+                }
+                seen.push((e, c));
+            }
+        }
+        // Sanity: the roster genuinely grew past the original four-group set.
+        assert!(
+            seen.len() >= 60,
+            "expected a broad extension roster, got {}",
+            seen.len()
+        );
+    }
+
+    #[test]
+    fn every_linux_mime_belongs_to_exactly_one_group() {
+        let mut seen: Vec<(&str, ClaimType)> = Vec::new();
+        for c in ClaimType::ALL {
+            for m in c.linux_mimes() {
+                if let Some((_, other)) = seen.iter().find(|(s, _)| s == m) {
+                    panic!("mime {m} claimed by both {other:?} and {c:?}");
+                }
+                seen.push((m, c));
+            }
+        }
+    }
+
+    #[test]
+    fn the_requested_config_and_data_formats_are_all_claimed() {
+        // The concrete set the user asked for, each pinned to a real group.
+        for ext in [
+            "txt", "log", "md", "markdown", "json", "toml", "yaml", "yml", "ini", "csv", "xml",
+        ] {
+            assert!(
+                ClaimType::ALL
+                    .into_iter()
+                    .any(|c| c.windows_extensions().contains(&ext)),
+                ".{ext} is not claimed by any group"
+            );
+        }
+    }
+
+    #[test]
+    fn extension_summary_is_derived_from_the_real_extension_list() {
+        // Derived, never hand-written — so the Settings line cannot claim a set
+        // the registration does not write.
+        let s = ClaimType::PlainText.extension_summary();
+        assert!(s.starts_with(".txt"), "summary leads with .txt: {s}");
+        // PlainText has 4 extensions ⇒ shown in full, no "+N more".
+        assert!(!s.contains("more"), "no overflow for a short list: {s}");
+        // SourceCode is long ⇒ truncated with an honest remainder count.
+        let src = ClaimType::SourceCode.extension_summary();
+        let expected_more = ClaimType::SourceCode.windows_extensions().len() - 4;
+        assert!(
+            src.contains(&format!("+{expected_more} more")),
+            "summary reports the real remainder: {src}"
+        );
+    }
+
+    #[test]
+    fn registration_fingerprint_changes_with_the_exe_path_and_the_claim_set() {
+        let a = registration_fingerprint(r"C:\Old\scr1b3.exe", &[ClaimType::PlainText]);
+        // Same inputs ⇒ same fingerprint (so startup converges instead of
+        // re-registering every launch).
+        assert_eq!(
+            a,
+            registration_fingerprint(r"C:\Old\scr1b3.exe", &[ClaimType::PlainText])
+        );
+        // A MOVED exe (in-app update / portable-zip relocation) ⇒ different,
+        // which is what forces the stale `shell\open\command` to be rewritten.
+        assert_ne!(
+            a,
+            registration_fingerprint(r"C:\New\scr1b3.exe", &[ClaimType::PlainText])
+        );
+        // A changed claim set ⇒ different.
+        assert_ne!(
+            a,
+            registration_fingerprint(
+                r"C:\Old\scr1b3.exe",
+                &[ClaimType::PlainText, ClaimType::Markdown]
+            )
+        );
+        // Order-insensitive: the same set in any order is the same fingerprint.
+        assert_eq!(
+            registration_fingerprint(
+                r"C:\Old\scr1b3.exe",
+                &[ClaimType::Markdown, ClaimType::PlainText]
+            ),
+            registration_fingerprint(
+                r"C:\Old\scr1b3.exe",
+                &[ClaimType::PlainText, ClaimType::Markdown]
+            )
+        );
+    }
+
+    #[test]
     fn integration_config_defaults_off() {
         let c = IntegrationConfig::default();
         assert!(!c.register_file_types);
-        assert!(c.claimed_types.is_empty());
+        assert!(c.claimed_types.is_none(), "selection starts UNSET");
         assert!(c.last_registration_unix.is_none());
     }
 
     #[test]
-    fn empty_claim_list_resolves_to_the_full_default_set() {
+    fn unset_claim_list_resolves_to_the_full_default_set() {
         let c = IntegrationConfig::default();
+        assert_eq!(c.claimed_types.as_ref(), None);
         assert_eq!(c.claimed_types(), ClaimType::ALL.to_vec());
+    }
+
+    #[test]
+    fn clearing_every_box_means_none_not_all() {
+        // The bug this pins: unchecking every group used to persist an empty
+        // list, which resolved back to ALL — so the boxes silently re-checked
+        // themselves and the user could not opt out. UNSET (None) still means
+        // "the default set"; an explicit empty selection means NOTHING.
+        let mut c = IntegrationConfig::default();
+        c.set_claimed_types(&[]);
+        assert_eq!(
+            c.claimed_types,
+            Some(Vec::new()),
+            "an explicit empty selection persists as Some([]), not None"
+        );
+        assert!(
+            c.claimed_types().is_empty(),
+            "an explicitly empty selection resolves to NO groups, never to ALL"
+        );
+        // …and it survives the round-trip through TOML, which is where the
+        // silent re-check happened (the empty list read back as unset).
+        let back: IntegrationConfig = toml::from_str(&toml::to_string(&c).unwrap()).unwrap();
+        assert!(
+            back.claimed_types().is_empty(),
+            "empty stays empty on reload"
+        );
+    }
+
+    #[test]
+    fn set_claimed_types_normalises_to_canonical_order() {
+        let mut c = IntegrationConfig::default();
+        // Reverse order, with a duplicate.
+        c.set_claimed_types(&[
+            ClaimType::SourceCode,
+            ClaimType::PlainText,
+            ClaimType::PlainText,
+        ]);
+        assert_eq!(
+            c.claimed_types,
+            Some(vec!["plain_text".to_string(), "source_code".to_string()]),
+            "stored in ClaimType::ALL order, de-duplicated"
+        );
+        assert_eq!(
+            c.claimed_types(),
+            vec![ClaimType::PlainText, ClaimType::SourceCode]
+        );
     }
 
     #[test]
@@ -316,7 +589,7 @@ mod tests {
         let c = IntegrationConfig {
             register_file_types: true,
             // out of order + an unknown key
-            claimed_types: vec!["json".into(), "bogus".into(), "plain_text".into()],
+            claimed_types: Some(vec!["json".into(), "bogus".into(), "plain_text".into()]),
             last_registration_unix: None,
             default_save_format: DefaultSaveFormat::Markdown,
         };
@@ -331,7 +604,7 @@ mod tests {
     fn integration_config_toml_roundtrip() {
         let c = IntegrationConfig {
             register_file_types: true,
-            claimed_types: vec!["plain_text".into(), "markdown".into()],
+            claimed_types: Some(vec!["plain_text".into(), "markdown".into()]),
             last_registration_unix: Some(1_700_000_000),
             default_save_format: DefaultSaveFormat::PlainText,
         };

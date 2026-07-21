@@ -21,8 +21,11 @@
 //!
 //! [`ScribeApp::caret_scroll_off_assist`] is the keyboard-navigation companion
 //! (**P1-4**): it keeps the caret at least N lines from the viewport edge on an
-//! arrow / page / home / end move (Vim `scrolloff`), never fighting the wheel or
-//! an active drag.
+//! arrow / home / end move (Vim `scrolloff`), never fighting the wheel or an
+//! active drag. [`ScribeApp::page_key_assist`] is the third member of the set —
+//! it *implements* PageUp/PageDown for the `TextEdit` path (egui ships neither)
+//! and owns its own viewport pan, so page keys are deliberately outside the
+//! scroll-off assist's trigger set.
 //!
 //! Note on egui 0.34: this stack exposes `smooth_scroll_delta` (points, smoothed
 //! over frames) — there is NO `raw_scroll_delta`. Reusing the smoothed delta is
@@ -42,6 +45,18 @@ const EDGE_MARGIN: f32 = 28.0;
 /// per-frame `dt` normalisation. Tuned to feel like VS Code's drag autoscroll.
 const EDGE_MAX_SPEED: f32 = 1100.0;
 
+/// Keys after which [`ScribeApp::caret_scroll_off_assist`] re-frames the caret.
+///
+/// PageUp/PageDown are deliberately ABSENT — see the comment on the read site
+/// and [`tests::page_keys_are_not_caret_frame_nav_keys`], which pins that
+/// absence so a future edit cannot quietly restore the stale-geometry bug.
+const CARET_FRAME_NAV_KEYS: [egui::Key; 4] = [
+    egui::Key::ArrowUp,
+    egui::Key::ArrowDown,
+    egui::Key::Home,
+    egui::Key::End,
+];
+
 impl ScribeApp {
     /// Drive the editor viewport while a LEFT-drag selection is in progress so
     /// egui extends the selection past the visible region (P0-1 wheel + P0-2
@@ -55,6 +70,13 @@ impl ScribeApp {
         editor_id: egui::Id,
         viewport: egui::Rect,
     ) {
+        // PageUp/PageDown ride this per-frame hook because it is the one place
+        // in the `TextEdit` branch that already receives `(ctx, editor_id,
+        // viewport)` — the caret state, the widget to write it back to, and the
+        // height that defines a "page". It runs BEFORE the drag-autoscroll
+        // config gate below: paging is core navigation, not a scroll
+        // convenience, so disabling `drag_autoscroll` must not disable it.
+        self.page_key_assist(ctx, editor_id, viewport);
         if !self.config.scroll.drag_autoscroll {
             return;
         }
@@ -120,6 +142,125 @@ impl ScribeApp {
         }
     }
 
+    /// PageUp / PageDown for the `TextEdit` path.
+    ///
+    /// egui implements neither key: its keyboard cursor dispatch handles only
+    /// the arrows, Home and End, and `Key::PageUp` / `Key::PageDown` exist in
+    /// egui 0.34.3 purely as enum variants. So this moves the caret itself,
+    /// through the SAME [`scribe_render::rope_editor::page_nav`] target
+    /// function the rope editor path uses, and pans the viewport by the same
+    /// number of rows so the caret stays where it was on screen.
+    ///
+    /// Shift extends the selection; a read-only tab still pages (navigation is
+    /// not a mutation).
+    fn page_key_assist(&mut self, ctx: &egui::Context, editor_id: egui::Id, viewport: egui::Rect) {
+        if !ctx.memory(|m| m.has_focus(editor_id)) {
+            return;
+        }
+        let (up, down, shift) = ctx.input(|i| {
+            (
+                i.key_pressed(egui::Key::PageUp),
+                i.key_pressed(egui::Key::PageDown),
+                i.modifiers.shift,
+            )
+        });
+        // Both held in one frame is ambiguous — ignore rather than guess.
+        if up == down {
+            return;
+        }
+        let dir = if down { 1_isize } else { -1 };
+
+        let line_px = (self.config.fonts.clamped_editor_size()
+            * self.config.fonts.clamped_line_height())
+        .max(1.0);
+        // One row of overlap so a page keeps a line of context, matching the
+        // rope path's own step and every other editor.
+        let rows = ((viewport.height() / line_px).floor() as usize).saturating_sub(1);
+
+        let Some(mut state) = egui::TextEdit::load_state(ctx, editor_id) else {
+            return;
+        };
+        let Some(range) = state.cursor.char_range() else {
+            return;
+        };
+        let text = &self.tabs[self.active].text;
+        let moved =
+            scribe_render::rope_editor::page_nav::page_ccursor_range(text, range, dir, rows, shift);
+        if moved == range {
+            return; // already clamped at the document end — nothing to do
+        }
+        state.cursor.set_char_range(Some(moved));
+        state.store(ctx, editor_id);
+
+        // Pan by the same distance the caret travelled so the caret keeps its
+        // screen row. `scroll_metrics` is this frame's measurement, which is
+        // exactly what the user is looking at.
+        let (off_y, content_h, view_h) = self.scroll_metrics;
+        let max_off = (content_h - view_h).max(0.0);
+        if max_off > 0.0 {
+            let target = (off_y + dir as f32 * rows.max(1) as f32 * line_px).clamp(0.0, max_off);
+            if (target - off_y).abs() > f32::EPSILON {
+                self.pending_scroll = Some(target);
+            }
+        }
+        ctx.request_repaint();
+    }
+
+    /// Push a queued [`Self::pending_scroll`] into a scroll surface the app does
+    /// NOT build itself, BEFORE that surface renders.
+    ///
+    /// The `TextEdit` path owns its `ScrollArea` and can therefore consume
+    /// `pending_scroll` through the `vertical_scroll_offset` builder. The other
+    /// editor paths cannot: `scribe-render`'s `RopeEditor` (read-only browse and
+    /// the owned rope editor) builds its `ScrollArea` internally and hands back
+    /// only a `RopeEditorResponse`, and the fold preview's area is built inside
+    /// `show_fold_view`. Without this bridge, find-navigate and go-to-line set
+    /// `pending_scroll` and NOTHING ever consumed it on those paths — the match
+    /// was selected off-screen and the viewport never moved.
+    ///
+    /// egui persists a `ScrollArea`'s state under
+    /// `ui.make_persistent_id(id_salt)` (`ScrollArea::begin`), which is
+    /// [`embedded_scroll_id`]. `State::offset` is a public field, so writing it
+    /// before the widget runs is exactly equivalent to the builder call the
+    /// `TextEdit` path uses.
+    pub(super) fn drive_embedded_scroll(&mut self, ctx: &egui::Context, scroll_id: egui::Id) {
+        let Some(off) = self.pending_scroll.take() else {
+            return;
+        };
+        let mut state = egui::scroll_area::State::load(ctx, scroll_id).unwrap_or_default();
+        state.offset.y = off.max(0.0);
+        state.store(ctx, scroll_id);
+    }
+
+    /// Record [`Self::scroll_metrics`] for a widget-owned scroll surface and run
+    /// the drag-select autoscroll assist against it.
+    ///
+    /// This is the ONE place every non-`TextEdit` editor path joins the same
+    /// implementation the `TextEdit` path uses, so drag-autoscroll and the
+    /// minimap's viewport indicator behave identically on all of them. Before
+    /// this existed `scroll_metrics` was written ONLY in the `TextEdit` branch,
+    /// so opening a file large enough to swap in the rope editor left the
+    /// minimap frozen on the last `TextEdit` frame's numbers.
+    ///
+    /// `content_h` must be the surface's REAL content height — for a
+    /// `RopeEditor` that is exactly `total_lines * line_height`, because the
+    /// widget lays out through `ScrollArea::show_rows(ui, line_h, total_lines,
+    /// ..)`. Never pass a guess: a wrong content height makes the minimap lie.
+    pub(super) fn finish_embedded_scroll(
+        &mut self,
+        ctx: &egui::Context,
+        scroll_id: egui::Id,
+        focus_id: egui::Id,
+        viewport: egui::Rect,
+        content_h: f32,
+    ) {
+        let off_y = egui::scroll_area::State::load(ctx, scroll_id)
+            .map(|s| s.offset.y)
+            .unwrap_or(0.0);
+        self.scroll_metrics = (off_y, content_h.max(1.0), viewport.height().max(1.0));
+        self.drag_scroll_assist(ctx, focus_id, viewport);
+    }
+
     /// Keep the caret at least `scroll.caret_scroll_off` lines from the viewport
     /// top/bottom on a keyboard caret move (P1-4). `caret_bottom_y` is the
     /// caret's screen-space galley baseline; `line_px` is one line's height. Runs
@@ -136,13 +277,16 @@ impl ScribeApp {
         if off_lines == 0 || line_px <= 0.0 {
             return;
         }
+        // PageUp/PageDown are deliberately NOT in this set. `caret_bottom_y` is
+        // the caret's galley position from THIS frame's layout, which still
+        // reflects the caret's PREVIOUS offset — [`Self::page_key_assist`] has
+        // only just written the new one, and egui re-lays-out on the next
+        // frame. Framing a page move off that stale geometry nudged the
+        // viewport by a caret-scroll-off delta computed from where the caret
+        // used to be. `page_key_assist` moves the viewport by a whole page
+        // itself, so paging owns its own scroll and needs no framing pass.
         let (nav, primary_down) = ctx.input(|i| {
-            let pressed = i.key_pressed(egui::Key::ArrowUp)
-                || i.key_pressed(egui::Key::ArrowDown)
-                || i.key_pressed(egui::Key::PageUp)
-                || i.key_pressed(egui::Key::PageDown)
-                || i.key_pressed(egui::Key::Home)
-                || i.key_pressed(egui::Key::End);
+            let pressed = CARET_FRAME_NAV_KEYS.iter().any(|k| i.key_pressed(*k));
             (pressed, i.pointer.primary_down())
         });
         if !nav || primary_down {
@@ -162,6 +306,29 @@ impl ScribeApp {
             ctx.request_repaint();
         }
     }
+}
+
+/// The `egui::Id` under which a `ScrollArea` built on `ui` persists its
+/// [`egui::scroll_area::State`].
+///
+/// `ScrollArea::begin` computes `ui.make_persistent_id(id_salt)`, where an
+/// un-salted area's salt is `Id::new("scroll_area")` and a salted one's is
+/// `Id::new(salt)`. `make_persistent_id` is `ui.id().with(salt)`, so the id is
+/// reproducible from the same `ui` the widget was handed — the only handle the
+/// app has on a scroll surface owned by a child widget.
+pub(super) fn embedded_scroll_id(ui: &egui::Ui, salt: &str) -> egui::Id {
+    ui.id().with(egui::Id::new(salt))
+}
+
+/// Salt of an un-salted `ScrollArea` (what `scribe-render`'s `RopeEditor`
+/// builds). Mirrors `ScrollArea::begin`'s `id_salt.unwrap_or_else(|| Id::new("scroll_area"))`.
+pub(super) const DEFAULT_SCROLL_SALT: &str = "scroll_area";
+
+/// The focus id `RopeEditor::show_editable` claims for keyboard input
+/// (`ui.id().with("scr1b3-rope-editable")`). The drag assist must gate on the id
+/// that actually holds focus, not the app's `TextEdit` id.
+pub(super) fn rope_editor_focus_id(ui: &egui::Ui) -> egui::Id {
+    ui.id().with("scr1b3-rope-editable")
 }
 
 /// The clamped scroll OFFSET to move to this frame, or `None` when the viewport

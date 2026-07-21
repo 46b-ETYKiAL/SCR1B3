@@ -2741,7 +2741,10 @@ fn render_sections(
             "Choose which kinds of file SCR1B3 should handle.",
         );
 
-        // Checklist bound to the persisted claim set (empty ⇒ all selected).
+        // Checklist bound to the persisted claim set. The stored value is
+        // `Option<Vec<_>>`: UNSET means "all" (the first-run default), whereas an
+        // explicitly EMPTY selection means "none". Collapsing those two states was
+        // the bug where unticking every box silently re-ticked them next frame.
         let mut selected = config.integration.claimed_types();
         for ct in ClaimType::ALL {
             let mut on = selected.contains(&ct);
@@ -2753,13 +2756,11 @@ fn render_sections(
                 } else {
                     selected.retain(|c| *c != ct);
                 }
-                // Persist the EXPLICIT selection (resolved order) so a later load
-                // reflects exactly what the user picked.
-                config.integration.claimed_types = ClaimType::ALL
-                    .into_iter()
-                    .filter(|c| selected.contains(c))
-                    .map(|c| c.key().to_string())
-                    .collect();
+                // Persist the EXPLICIT selection so a later load reflects exactly
+                // what the user picked. `set_claimed_types` always records `Some`,
+                // so clearing every box stays cleared instead of resolving back to
+                // the unset-means-all default.
+                config.integration.set_claimed_types(&selected);
                 changed = true;
             }
         }

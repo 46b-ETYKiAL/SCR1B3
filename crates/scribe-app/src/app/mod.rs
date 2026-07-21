@@ -461,14 +461,62 @@ impl EditorTab {
     }
 
     /// Replace the editable text from an EXTERNAL source (reload, plugin,
-    /// find-replace, sort-lines) and invalidate the experimental rope cache so
-    /// the next frame rebuilds the persistent rope from the new content. The
-    /// rope editor itself writes `text` directly (it owns the rope) and must
-    /// NOT go through here, or it would discard its own live buffer.
+    /// find-replace, sort-lines, the line/comment commands) and invalidate
+    /// EVERY cache derived from the old content: the persistent rope buffer
+    /// (`rope_buf`, rebuilt next frame) and the rope editor's editing state
+    /// (`rope_state` — undo history + carets, see `invalidate_rope_state`).
+    /// `edit_gen` is bumped, which is what invalidates the gen-keyed
+    /// minimap / spellcheck / change-bar (`change_gen`) caches.
+    ///
+    /// EVERY external mutation of `text` MUST go through here. Writing
+    /// `tabs[i].text` directly leaves a stale `rope_buf` alive, and on the
+    /// rope path (`use_rope_editor`) the next content edit writes that stale
+    /// rope back over `text` — silently destroying the user's edit.
+    ///
+    /// The rope editor itself writes `text` directly (it owns the rope) and
+    /// must NOT go through here, or it would discard its own live buffer.
     fn set_text(&mut self, new: String) {
         self.text = new;
         self.rope_buf = None;
+        self.invalidate_rope_state();
         self.edit_gen = self.edit_gen.wrapping_add(1);
+    }
+
+    /// Invalidate the rope editor's per-tab editing state after `text` was
+    /// replaced from an EXTERNAL source.
+    ///
+    /// `rope_state` is derived from the buffer: its `History` holds snapshots
+    /// of the PREVIOUS content and its caret/selection are offsets into it.
+    /// Clearing `rope_buf` alone (so the rope is rebuilt from the new `text`)
+    /// left that state behind, so the first Undo after a command-palette or
+    /// find-replace edit restored a buffer the user never had — silent data
+    /// loss — and a caret past the new end pointed out of range.
+    ///
+    /// The history is dropped (those snapshots describe content that no longer
+    /// exists, so a no-op Undo is the only honest outcome) along with any
+    /// secondary carets, whose offsets a wholesale replacement invalidates.
+    /// The primary caret is kept, clamped into the new text, so an in-place
+    /// command (comment-toggle, move/duplicate/join line) does not throw the
+    /// user back to the top of the file.
+    ///
+    /// A tab whose `rope_state` is still `None` is left alone — the rope
+    /// editor has not claimed it yet, and the next frame creates the state
+    /// fresh from the new content.
+    fn invalidate_rope_state(&mut self) {
+        let Some(prev) = self.rope_state.as_ref() else {
+            return;
+        };
+        let cursor = prev.edit.cursor;
+        // `chars().count()` is O(n); skip it for the common caret-at-origin
+        // case so a large-buffer replacement pays nothing extra.
+        let clamped = if cursor == 0 {
+            0
+        } else {
+            cursor.min(self.text.chars().count())
+        };
+        let mut fresh = scribe_render::RopeEditorState::new();
+        fresh.edit = scribe_core::editing::EditState::at(clamped);
+        self.rope_state = Some(fresh);
     }
 
     /// Change-bar: record the current text as the saved baseline (called after
