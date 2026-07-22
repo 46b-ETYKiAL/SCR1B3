@@ -12,9 +12,19 @@ impl ScribeApp {
         if let Some(path) = super::dialogs::pick_file() {
             match EditorTab::from_path(path.clone()) {
                 Ok(t) => {
+                    // Advisory binary warning (see `open_path`): the buffer still
+                    // opens, but a binary sniff means the text is likely garbled.
+                    let binary = t.doc.looks_binary();
                     self.tabs.push(t);
                     self.active = self.tabs.len() - 1;
-                    self.status = format!("opened {}", path.display());
+                    if binary {
+                        self.toast = Some(format!(
+                            "{} looks like a binary file — the text shown may be garbled.",
+                            path.display()
+                        ));
+                    } else {
+                        self.status = format!("opened {}", path.display());
+                    }
                 }
                 Err(e) => {
                     tracing::warn!("open failed for {}: {e}", path.display());

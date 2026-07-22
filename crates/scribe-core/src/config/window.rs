@@ -3,9 +3,21 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Window translucency mode. `Opaque` is the default; the rest reveal what's
-/// behind the window to varying degrees (cross-platform `Transparent`; OS blur
-/// for `Glass`/`Mica`/`Vibrancy`, which degrade to transparent where absent).
+/// Window translucency mode. `Opaque` is the default.
+///
+/// **Back-compat aliases — NO OS blur.** `Transparent`, `Glass`, `Mica`, and
+/// `Vibrancy` are retained only so a config that stored one of them still
+/// deserializes; NONE of them selects an OS backdrop material. There is no DWM
+/// blur / acrylic / mica surface: applying a DWM material re-added the native
+/// caption buttons over the custom titlebar (the "double caption" bug) AND the
+/// materials were visually indistinguishable in practice, so every non-`Opaque`
+/// variant collapses onto the single [`WindowConfig::transparency_enabled`]
+/// toggle. The `mode` field is therefore VESTIGIAL —
+/// [`WindowConfig::effective_translucent`] reads only `transparency_enabled` and
+/// never consults `mode`. Selecting `Glass`/`Mica`/`Vibrancy` means exactly
+/// "plain translucency once the master toggle is on"; it promises no OS effect
+/// this app cannot deliver. That method is the single predicate every render
+/// path consults.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum WindowMode {
@@ -115,6 +127,48 @@ mod tests {
             ..Default::default()
         };
         assert!(w.effective_translucent());
+    }
+
+    /// The rustdoc promise, pinned behaviourally: `Glass`/`Mica`/`Vibrancy` (and
+    /// `Transparent`) are back-compat ALIASES that carry NO OS blur and do NOT
+    /// independently drive translucency — every mode collapses onto the single
+    /// `transparency_enabled` toggle. This is the guard on "the doc no longer
+    /// claims a capability that isn't there": if a future edit re-wired `mode`
+    /// into `effective_translucent` (re-introducing the OS-blur claim the doc
+    /// rejects), the master-OFF cases below would flip to `true` and fail.
+    #[test]
+    fn no_window_mode_independently_drives_translucency() {
+        for mode in [
+            WindowMode::Opaque,
+            WindowMode::Transparent,
+            WindowMode::Glass,
+            WindowMode::Mica,
+            WindowMode::Vibrancy,
+        ] {
+            // Master toggle OFF => opaque for EVERY mode, including the ones whose
+            // names hint at an OS backdrop. `mode` is vestigial.
+            let off = WindowConfig {
+                transparency_enabled: false,
+                mode,
+                ..Default::default()
+            };
+            assert!(
+                !off.effective_translucent(),
+                "mode {mode:?} must NOT enable translucency while the master toggle is OFF — \
+                 it is a back-compat alias, not an OS-blur lever"
+            );
+            // Master toggle ON => translucent for every mode; the single toggle is
+            // the sole lever, exactly as the rustdoc states.
+            let on = WindowConfig {
+                transparency_enabled: true,
+                mode,
+                ..Default::default()
+            };
+            assert!(
+                on.effective_translucent(),
+                "the single transparency toggle drives translucency for every mode ({mode:?})"
+            );
+        }
     }
 
     /// F-035: always_on_top defaults OFF and round-trips through TOML.

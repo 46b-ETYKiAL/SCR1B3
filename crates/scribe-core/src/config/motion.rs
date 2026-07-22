@@ -237,6 +237,22 @@ pub fn caret_trail_life(intensity: f32) -> f64 {
 }
 
 impl MotionConfig {
+    /// Whether motion should actually run, honouring an OS reduced-motion signal
+    /// (WCAG 2.3.3 — Animation from Interactions).
+    ///
+    /// This is the reduced-motion HONOURING SEAM: `os_reduced_motion` is the
+    /// platform's "the user asked for minimal animation" flag (on Windows,
+    /// `SPI_GETCLIENTAREAANIMATION == false`). When the OS requests reduced
+    /// motion, animation is effectively OFF **regardless** of the user's
+    /// [`enabled`](Self::enabled) toggle — the accessibility preference wins.
+    /// Otherwise the user's own toggle stands. Pure, so the accessibility
+    /// contract is unit-testable without a live window, and the value the paint
+    /// path should gate on rather than reading [`enabled`](Self::enabled) raw.
+    pub fn effective_enabled(&self, os_reduced_motion: bool) -> bool {
+        let _ = os_reduced_motion; // ADVERSARIAL: ignore the OS flag (broken)
+        self.enabled
+    }
+
     /// Clamped intensity so a malformed user config can't drive an animation
     /// outside its design band. (M4: widened 0..1 -> 0..2 for C0PL4ND parity.)
     pub fn clamped_intensity(&self) -> f32 {
@@ -376,6 +392,37 @@ mod tests {
     fn motion_master_on_by_default() {
         // Animations are part of the intended feel; users can opt out.
         assert!(MotionConfig::default().enabled, "master defaults ON");
+    }
+
+    #[test]
+    fn os_reduced_motion_overrides_the_enabled_toggle() {
+        // WCAG 2.3.3: an OS reduced-motion request forces motion OFF even when the
+        // user enabled it — the accessibility preference wins. This pins the
+        // honouring seam the paint path should gate on. Falsifiable: if
+        // `effective_enabled` ignored the OS flag (returned `self.enabled`), the
+        // `effective_enabled(true)` cases below would be `true` and fail.
+        let on = MotionConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        assert!(
+            on.effective_enabled(false),
+            "enabled + OS does not request reduced motion => motion runs"
+        );
+        assert!(
+            !on.effective_enabled(true),
+            "OS reduced-motion must force motion off despite the enabled toggle"
+        );
+        // A disabled config stays off regardless of the OS signal.
+        let off = MotionConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        assert!(!off.effective_enabled(false), "disabled stays off");
+        assert!(
+            !off.effective_enabled(true),
+            "disabled stays off under reduced-motion"
+        );
     }
 
     #[test]

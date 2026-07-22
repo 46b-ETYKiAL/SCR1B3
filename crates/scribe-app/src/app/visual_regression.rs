@@ -272,54 +272,107 @@ fn baseline_find_bar() {
 // ───────────────── prefers-reduced-motion resting frame ─────────────────
 //
 // WCAG 2.3.3: the zero-motion resting frame must itself be the canonical,
-// complete frame. SCR1B3 gates EVERY CRT overlay behind
-// `motion.enabled` (see `app/mod.rs` paint block) AND the painters
-// themselves early-return when their strength/alpha resolves to zero. With
-// motion disabled (`prefers-reduced-motion`), the overlays MUST contribute
-// nothing. These assertions are pure (no GPU): they prove the painters'
-// reduced-motion contract via their public early-return guards.
+// complete frame. SCR1B3 gates EVERY CRT overlay behind `motion.enabled` (see
+// the `frame_tick.rs` paint block) AND the painters themselves early-return when
+// their strength/alpha resolves to zero, and the reduced-motion HONOURING SEAM
+// (`MotionConfig::effective_enabled`) forces motion off under an OS reduced-motion
+// request. These assertions are pure (no GPU) and — unlike the earlier versions,
+// which were a `|| cfg!(test)` tautology and three panic-only calls that could
+// not fail — they are FALSIFIABLE: a painter that leaked a wash through at its
+// resting parameters, or a seam that ignored the OS reduced-motion flag, fails
+// here. Each "emits nothing at rest" check is paired with an "emits shapes when
+// active" check so it can never be vacuous (the painter provably CAN paint).
+
+/// Count the shapes a painter emits into a fresh, real-sized egui frame. A
+/// resting (reduced-motion) painter contributes zero shapes to the composited
+/// frame; an active painter contributes at least one.
+fn shapes_emitted(mut paint: impl FnMut(&egui::Context)) -> usize {
+    let ctx = egui::Context::default();
+    let input = egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(800.0, 600.0),
+        )),
+        ..Default::default()
+    };
+    ctx.run(input, |ctx| paint(ctx)).shapes.len()
+}
 
 #[test]
-fn motion_overlays_are_gated_off_in_test_harness() {
-    // The app-level paint block is `!cfg!(test) && motion.enabled` — in the
-    // test build the overlays never paint regardless of config, so the headless
-    // render IS the resting frame. Assert the config default also rests.
-    let cfg = Config::default();
-    // The canonical resting state: motion is a deliberate opt-in.
+fn os_reduced_motion_forces_the_resting_frame() {
+    // The reduced-motion resting frame is driven by the honouring seam: when the
+    // OS requests reduced motion, motion is effectively off regardless of config.
+    // (Replaces a prior `!enabled || cfg!(test)` assertion that was a tautology in
+    // the test build and could NEVER fail.)
+    let cfg = vr_config(); // motion.enabled == false already
     assert!(
-        !cfg.motion.enabled || cfg!(test),
-        "the headless/reduced-motion frame must not animate"
+        !cfg.motion.effective_enabled(false),
+        "the vr/reduced-motion config rests by default"
+    );
+    // A user who ENABLED motion is still overridden by an OS reduced-motion signal.
+    let mut animated = Config::default();
+    animated.motion.enabled = true;
+    assert!(
+        animated.motion.effective_enabled(false),
+        "precondition: enabled motion runs without an OS reduced-motion request"
+    );
+    assert!(
+        !animated.motion.effective_enabled(true),
+        "OS reduced-motion must force the resting frame even with motion enabled"
     );
 }
 
 #[test]
-fn flicker_painter_is_noop_at_zero_strength() {
-    // The reduced-motion resting frame disables flicker → strength 0 → the
-    // painter must early-return BEFORE allocating a layer, contributing nothing.
-    let ctx = egui::Context::default();
-    let _ = ctx.run(egui::RawInput::default(), |ctx| {
-        super::effects::paint_flicker(ctx, 0.0, 1.234, 1.0);
-    });
-    // A no-op painter leaves no "crt-flicker" layer shapes. We can't read layer
-    // internals, but a panic-free zero-strength call IS the contract; the
-    // strength clamp (<= 0.0 → return) is exercised here on every host.
+fn flicker_painter_emits_nothing_at_zero_strength_but_paints_when_active() {
+    let base = shapes_emitted(|_| {});
+    // Resting (reduced-motion) frame: zero strength → the painter early-returns
+    // and contributes NO shapes. If it leaked a wash through, this fails.
+    assert_eq!(
+        shapes_emitted(|ctx| super::effects::paint_flicker(ctx, 0.0, 1.234, 1.0)),
+        base,
+        "zero-strength flicker must contribute nothing to the resting frame"
+    );
+    // Discriminator: at a real strength and a time whose sine sum is non-zero the
+    // painter DOES emit a wash — so the "emits nothing" check above is meaningful.
+    assert!(
+        shapes_emitted(|ctx| super::effects::paint_flicker(ctx, 0.20, 0.1, 1.0)) > base,
+        "active flicker must paint a wash (else the rest-state assert is vacuous)"
+    );
 }
 
 #[test]
-fn scanlines_painter_is_noop_at_zero_darkness() {
-    let ctx = egui::Context::default();
-    let _ = ctx.run(egui::RawInput::default(), |ctx| {
-        super::effects::paint_crt_scanlines(ctx, 0.0, 0.0);
-    });
+fn scanlines_painter_emits_nothing_at_zero_darkness_but_paints_when_active() {
+    let base = shapes_emitted(|_| {});
+    assert_eq!(
+        shapes_emitted(|ctx| super::effects::paint_crt_scanlines(ctx, 0.0, 0.0)),
+        base,
+        "zero-darkness scanlines must contribute nothing to the resting frame"
+    );
+    assert!(
+        shapes_emitted(|ctx| super::effects::paint_crt_scanlines(ctx, 0.5, 0.0)) > base,
+        "active scanlines must paint bands (else the rest-state assert is vacuous)"
+    );
 }
 
 #[test]
-fn boot_glitch_resting_frame_is_outside_window() {
-    // Outside the [0, DUR] window the boot-glitch paints nothing — the resting
-    // (post-boot) frame is glitch-free. Negative + far-future elapsed both rest.
-    let ctx = egui::Context::default();
-    let _ = ctx.run(egui::RawInput::default(), |ctx| {
-        super::effects::paint_boot_glitch(ctx, -1.0);
-        super::effects::paint_boot_glitch(ctx, 999.0);
-    });
+fn boot_glitch_emits_nothing_outside_its_window_but_paints_inside() {
+    let base = shapes_emitted(|_| {});
+    // Outside [0, DUR] (negative and far-future) the resting/post-boot frame is
+    // glitch-free.
+    assert_eq!(
+        shapes_emitted(|ctx| super::effects::paint_boot_glitch(ctx, -1.0)),
+        base,
+        "a negative elapsed rests"
+    );
+    assert_eq!(
+        shapes_emitted(|ctx| super::effects::paint_boot_glitch(ctx, 999.0)),
+        base,
+        "a far-future elapsed rests"
+    );
+    // Inside the window the boot sweep DOES paint (proves the rest asserts aren't
+    // vacuous). Needs a content rect >= 160px wide, which the 800x600 frame gives.
+    assert!(
+        shapes_emitted(|ctx| super::effects::paint_boot_glitch(ctx, 0.1)) > base,
+        "the boot glitch must paint inside its window"
+    );
 }

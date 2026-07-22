@@ -18,6 +18,51 @@ use std::path::{Path, PathBuf};
 /// but well short of multi-GB logs we still want to *browse*.
 pub const LARGE_FILE_THRESHOLD: u64 = 256 * 1024 * 1024;
 
+/// Size of the prefix window sniffed to decide whether a file looks binary.
+/// 8 KiB is the same window `git` samples for its own text/binary heuristic —
+/// large enough to catch an early NUL or a run of control bytes, small enough
+/// to stay a fixed, O(1) cost regardless of file size.
+pub const BINARY_SNIFF_BYTES: usize = 8 * 1024;
+
+/// Heuristically classify a byte buffer as "looks binary".
+///
+/// This is a lightweight, non-destructive verdict a caller can act on
+/// ("this looks binary — open anyway?"); it never blocks a decode and never
+/// mutates the buffer. Only the first [`BINARY_SNIFF_BYTES`] are examined:
+///
+/// * **Any NUL byte** in the window ⇒ binary. A NUL is the canonical marker of
+///   non-text content (executables, images, compiled artefacts) and never
+///   appears in real UTF-8/legacy-encoded text.
+/// * Otherwise, count C0 control bytes that are NOT ordinary text whitespace
+///   (`\t \n \x0c \r` are allowed; `0x01–0x08`, `0x0b`, `0x0e–0x1f`, and `0x7f`
+///   are "non-text"). **> 30 %** of the sampled window being non-text ⇒ binary.
+///
+/// High bytes (`>= 0x80`) are treated as text, so valid UTF-8 (e.g. `café`) or
+/// legacy-encoded prose is never mis-flagged. An empty buffer is not binary.
+pub fn sniff_binary(bytes: &[u8]) -> bool {
+    let window = &bytes[..bytes.len().min(BINARY_SNIFF_BYTES)];
+    if window.is_empty() {
+        return false;
+    }
+    let mut non_text = 0usize;
+    for &b in window {
+        match b {
+            // A single NUL is decisive — real text never contains one.
+            0x00 => return true,
+            // Ordinary text whitespace / formatting controls: tab, LF, FF, CR.
+            0x09 | 0x0a | 0x0c | 0x0d => {}
+            // Remaining C0 control bytes + DEL are "non-text".
+            0x01..=0x08 | 0x0b | 0x0e..=0x1f | 0x7f => non_text += 1,
+            // Printable ASCII and any high byte (potential UTF-8) count as text.
+            _ => {}
+        }
+    }
+    // > 30 % of the sampled window is control noise ⇒ looks binary. Integer
+    // form of `non_text / window.len() > 0.30` (no float, no divide-by-zero:
+    // the empty case returned above).
+    non_text * 100 > window.len() * 30
+}
+
 #[derive(Debug)]
 pub struct Document {
     rope: Rope,
@@ -27,6 +72,11 @@ pub struct Document {
     dirty: bool,
     /// Opened read-only because the file exceeds `LARGE_FILE_THRESHOLD`.
     read_only_large: bool,
+    /// The on-open (or on-reload) binary sniff verdict for this file's first
+    /// [`BINARY_SNIFF_BYTES`]. Advisory only — the buffer is still decoded
+    /// lossily for display; the caller uses this to warn ("looks binary —
+    /// open anyway?"). A scratch buffer is never binary.
+    looks_binary: bool,
 }
 
 impl Default for Document {
@@ -38,6 +88,8 @@ impl Default for Document {
             eol: Eol::default(),
             dirty: false,
             read_only_large: false,
+            // An empty scratch buffer is never binary.
+            looks_binary: false,
         }
     }
 }
@@ -73,6 +125,8 @@ impl Document {
                 eol: detected_eol,
                 dirty: false,
                 read_only_large: true,
+                // Sniff the first bytes of the mmap window (not the whole file).
+                looks_binary: sniff_binary(&mmap),
             });
         }
 
@@ -87,6 +141,7 @@ impl Document {
             eol: detected_eol,
             dirty: false,
             read_only_large: false,
+            looks_binary: sniff_binary(&bytes),
         })
     }
 
@@ -134,6 +189,9 @@ impl Document {
         self.rope = Rope::from_str(&normalized);
         self.eol = detected_eol;
         self.dirty = false;
+        // Re-sniff: an external edit could have turned a text file binary (or
+        // vice-versa), so the advisory verdict must track the fresh bytes.
+        self.looks_binary = sniff_binary(&bytes);
         Ok(())
     }
 
@@ -253,6 +311,15 @@ impl Document {
         self.read_only_large
     }
 
+    /// Whether this file's first bytes looked BINARY on open/reload (a NUL, or
+    /// over 30% control-byte noise). Advisory: the buffer is still decoded lossily
+    /// so the user can inspect it, but the editor warns ("looks binary — mojibake
+    /// likely") rather than silently rendering garbage. `false` for a scratch
+    /// buffer or a genuinely-text file.
+    pub fn looks_binary(&self) -> bool {
+        self.looks_binary
+    }
+
     /// Best-effort language id from the file extension (used by syntax + spell).
     pub fn language_hint(&self) -> Option<String> {
         self.path
@@ -358,6 +425,38 @@ struct PersistError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sniff_binary_flags_nul_and_control_noise_but_not_text() {
+        // Plain UTF-8 text (incl. multibyte) is NOT binary.
+        assert!(!sniff_binary(b"fn main() {}\n"));
+        assert!(!sniff_binary("café — naïve\n".as_bytes()));
+        assert!(!sniff_binary(b""), "empty is not binary");
+        // A single NUL is decisive.
+        assert!(sniff_binary(b"MZ\x00\x00\x90\x00"));
+        assert!(sniff_binary(b"text then\x00a nul"));
+        // >30% C0 control noise (non-whitespace) reads as binary.
+        let noisy: Vec<u8> = (0..100u8)
+            .map(|i| if i % 2 == 0 { 0x01 } else { b'a' })
+            .collect();
+        assert!(sniff_binary(&noisy));
+        // Ordinary whitespace controls do NOT count as noise.
+        assert!(!sniff_binary(b"a\tb\nc\r\nd\x0c"));
+    }
+
+    /// Opening a real file with a NUL sets the advisory `looks_binary` flag; a
+    /// text file does not. Guards the sniff → field wire (the caller warns on it).
+    #[test]
+    fn open_sets_looks_binary_from_the_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("a.bin");
+        std::fs::write(&bin, b"\x7fELF\x00\x00binary\x00payload").unwrap();
+        let text = dir.path().join("a.txt");
+        std::fs::write(&text, b"just text\n").unwrap();
+        assert!(Document::open(&bin).unwrap().looks_binary());
+        assert!(!Document::open(&text).unwrap().looks_binary());
+        assert!(!Document::scratch().looks_binary());
+    }
 
     #[test]
     fn open_edit_save_roundtrip() {
@@ -604,6 +703,7 @@ mod tests {
             eol: Eol::Lf,
             dirty: true,
             read_only_large: true,
+            looks_binary: false,
         };
 
         // Bare save() is refused with the structured error.
@@ -709,6 +809,7 @@ mod tests {
             eol: Eol::Lf,
             dirty: true,
             read_only_large: false,
+            looks_binary: false,
         };
         doc.reload_from_disk().unwrap();
 
@@ -740,6 +841,7 @@ mod tests {
             eol: Eol::Lf,
             dirty: false,
             read_only_large: true,
+            looks_binary: false,
         };
         assert!(
             matches!(
@@ -780,6 +882,7 @@ mod tests {
             eol: Eol::Lf,
             dirty: false,
             read_only_large: true,
+            looks_binary: false,
         };
         assert!(
             doc.is_read_only_large(),

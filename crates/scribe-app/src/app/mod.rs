@@ -1528,9 +1528,21 @@ impl ScribeApp {
         }
         match EditorTab::from_path(path.clone()) {
             Ok(t) => {
+                // Binary-file advisory: the buffer is still decoded lossily so the
+                // user can inspect it, but a NUL / high control-byte ratio means the
+                // display is likely mojibake — warn rather than silently rendering
+                // garbage (which is what opening a `.exe` did before the sniff).
+                let binary = t.doc.looks_binary();
                 self.tabs.push(t);
                 self.active = self.tabs.len() - 1;
-                self.status = format!("opened {}", path.display());
+                if binary {
+                    self.toast = Some(format!(
+                        "{} looks like a binary file — the text shown may be garbled.",
+                        path.display()
+                    ));
+                } else {
+                    self.status = format!("opened {}", path.display());
+                }
                 // F-021 — restore the prior per-file scroll position
                 // (best-effort; the picker accepts a 1-frame lag).
                 let key = path.display().to_string();
