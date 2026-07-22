@@ -249,8 +249,9 @@ impl MotionConfig {
     /// contract is unit-testable without a live window, and the value the paint
     /// path should gate on rather than reading [`enabled`](Self::enabled) raw.
     pub fn effective_enabled(&self, os_reduced_motion: bool) -> bool {
-        let _ = os_reduced_motion; // ADVERSARIAL: ignore the OS flag (broken)
-        self.enabled
+        // The OS accessibility preference wins: reduced-motion forces animation
+        // off even when the user's own toggle is on. Otherwise the toggle stands.
+        self.enabled && !os_reduced_motion
     }
 
     /// Clamped intensity so a malformed user config can't drive an animation
