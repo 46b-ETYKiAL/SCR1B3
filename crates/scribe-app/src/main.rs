@@ -202,22 +202,29 @@ fn main() -> ExitCode {
         ..Default::default()
     };
 
-    // Re-parse here so we can hand the path to ScribeApp::new. (Parsing is
-    // pure and idempotent — same args, same Action.)
-    let cli_paths: Vec<String> = match cli::parse(std::env::args().skip(1)) {
-        cli::Action::Launch { paths, .. } => paths
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect(),
-        _ => Vec::new(),
-    };
+    // Re-parse here so we can hand the paths AND the `PATH:LINE:COLUMN` jump
+    // target to ScribeApp::new. (Parsing is pure and idempotent — same args,
+    // same Action.) The prior code discarded `jump` with `..`, so `scr1b3
+    // file:42:10` always opened at line 1 — the editor never received the
+    // position. Capture it here and thread it through `new`.
+    let (cli_paths, cli_jump): (Vec<String>, Option<(usize, Option<usize>)>) =
+        match cli::parse(std::env::args().skip(1)) {
+            cli::Action::Launch { paths, jump } => (
+                paths
+                    .iter()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .collect(),
+                jump,
+            ),
+            _ => (Vec::new(), None),
+        };
 
     let result = eframe::run_native(
         scribe_core::PRODUCT_NAME,
         native_options,
         Box::new(move |cc| {
             Ok(Box::new(app::ScribeApp::new(
-                cc, config, config_err, cli_paths,
+                cc, config, config_err, cli_paths, cli_jump,
             )))
         }),
     );

@@ -30,6 +30,34 @@ impl ScribeApp {
         self.status = format!("go to line {line_1based}");
     }
 
+    /// Apply an optional CLI `PATH:LINE[:COLUMN]` jump target (from `scr1b3
+    /// file:42:10`) to the first opened tab.
+    ///
+    /// Scrolls the requested 1-based line into view on the first rendered frame
+    /// by reusing the same [`goto_line`](Self::goto_line) scroll pipe the
+    /// go-to-line command, bookmark navigation, and find-in-files "open result"
+    /// all drive. The column is surfaced in the status hint; the app's jump
+    /// convention across every existing surface is line-scroll (the caret is
+    /// owned by the egui text widget and settles on the first frame), so line
+    /// placement is exactly what "open at line N" means here. A `None` jump (no
+    /// target, or a non-`Launch` action) is a no-op — the load-bearing negative
+    /// that proves the wire fires only when a jump was parsed.
+    pub(super) fn apply_cli_jump(&mut self, jump: Option<(usize, Option<usize>)>) {
+        let Some((line, col)) = jump else {
+            return;
+        };
+        // A 1-based line of 0 is not a real position (e.g. `file:0`); ignore it
+        // rather than scrolling to a phantom line above the first.
+        if line == 0 || self.tabs.is_empty() {
+            return;
+        }
+        self.active = 0;
+        self.goto_line(line);
+        if let Some(c) = col {
+            self.status = format!("go to line {line}:{c}");
+        }
+    }
+
     /// #R6 — all matches of the current find query in the active buffer (empty
     /// when there is no query / no buffer / the regex is invalid).
     ///

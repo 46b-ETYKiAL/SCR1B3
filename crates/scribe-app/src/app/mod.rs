@@ -992,8 +992,14 @@ impl ScribeApp {
         config: Config,
         config_err: Option<String>,
         cli_paths: Vec<String>,
+        cli_jump: Option<(usize, Option<usize>)>,
     ) -> Self {
         let mut app = Self::build(config, config_err, cli_paths, true);
+        // Apply a `PATH:LINE[:COLUMN]` jump target (from `scr1b3 file:42:10`) to
+        // the first opened tab, so the editor opens scrolled to the requested
+        // line rather than at line 1. Runs after `build` (which opened the CLI
+        // tabs) so the first tab exists to jump within.
+        app.apply_cli_jump(cli_jump);
         // W1TN3SS opt-in crash reporting: drain the local spool of any reports
         // captured by a prior session's panic hook. PRODUCTION-only — `new_test`
         // never calls this, so a unit test that builds the app never touches the
@@ -2175,6 +2181,9 @@ mod restore_dedup_tests;
 
 #[cfg(test)]
 mod find_nav_tests;
+
+#[cfg(test)]
+mod cli_jump_tests;
 
 #[cfg(test)]
 mod resize_tests;
