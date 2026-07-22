@@ -85,6 +85,14 @@ fn main() -> ExitCode {
     // opt-in crash-report posture (default OFF). Load is pure + idempotent.
     let (config, config_err) = scribe_core::Config::load_or_default();
 
+    // Refresh the Windows file associations at startup when the user has opted in.
+    // The absolute exe path is baked into the association keys, and SCR1B3 ships an
+    // in-app updater + a portable zip, so a relocated exe silently breaks every
+    // registered "open with SCR1B3" command until this re-runs. Silent (no Settings
+    // window), best-effort (a failure is logged, never fatal), and a no-op unless
+    // `integration.register_file_types` is set. No-op on non-Windows.
+    integration::reregister_on_startup(&config.integration);
+
     // Content-free panic hook (privacy). A panic must never leak document text
     // or a user's file path to stderr. We surface ONLY a static `&str` payload
     // (a source-code literal — e.g. an `expect("…")` message, never runtime

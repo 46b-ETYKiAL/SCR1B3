@@ -71,6 +71,59 @@ pub fn register(types: &[ClaimType]) -> RegisterReport {
     }
 }
 
+/// Pure decision for [`reregister_on_startup`]: refresh the associations only when
+/// the user opted in AND there is at least one claimed type. Extracted so the
+/// opt-in contract is unit-testable without a real registry — the reviewer's exact
+/// complaint was that `register_file_types` was written but read by no production
+/// code, so this pins that it IS read and honoured.
+fn startup_reregister_types(opted_in: bool, claimed: &[ClaimType]) -> bool {
+    opted_in && !claimed.is_empty()
+}
+
+/// Re-register the file associations at STARTUP, silently, when the user has
+/// previously opted in (`config.integration.register_file_types`). This is the
+/// call site the opt-in flag exists for: without it the flag was written by the
+/// Settings toggle and never read, so a user who opted in got nothing on the next
+/// launch — and, because Windows bakes the absolute exe path into the association
+/// keys, an in-app update or a portable-zip move left every registered command
+/// pointing at the OLD path. Re-running silently on each launch refreshes that
+/// path. Never opens a Settings window (that would be hostile on every start) and
+/// never blocks startup — a backend failure is logged, not raised.
+///
+/// Windows-only in effect: on Linux the associations live in the package-managed
+/// `.desktop` file and on macOS in the app bundle's `Info.plist`, neither of which
+/// a per-launch call should churn, so this is a no-op there.
+pub fn reregister_on_startup(config: &scribe_core::config::IntegrationConfig) {
+    let types = config.claimed_types();
+    if !startup_reregister_types(config.register_file_types, &types) {
+        return;
+    }
+    #[cfg(windows)]
+    {
+        let report = windows::register_silent(&types);
+        if report.failed.is_empty() {
+            tracing::debug!(
+                target: "scribe::integration",
+                count = report.registered.len(),
+                "refreshed file associations at startup"
+            );
+        } else {
+            // A failed silent re-register is not fatal — the user can re-run it
+            // from Settings. Record it so a persistent failure is diagnosable
+            // rather than silently swallowed.
+            tracing::warn!(
+                target: "scribe::integration",
+                failures = report.failed.len(),
+                "startup file-association refresh had failures"
+            );
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = types;
+    }
+}
+
 /// macOS: the document types are declared in the app bundle's `Info.plist`, so
 /// SCR1B3 already appears in Finder's "Open With". Setting the default is a
 /// one-time manual step (Get Info ▸ Open With ▸ Change All) — we return the
@@ -86,6 +139,34 @@ fn macos_register(types: &[ClaimType]) -> RegisterReport {
                   default, select a file in Finder, press ⌘I, expand \"Open \
                   with\", choose SCR1B3, and click \"Change All…\"."
             .into(),
+    }
+}
+
+#[cfg(test)]
+mod startup_reregister_tests {
+    use super::startup_reregister_types;
+    use scribe_core::config::ClaimType;
+
+    /// The opt-in flag MUST gate the startup refresh. The reviewer found
+    /// `register_file_types` was written by Settings but read by no production
+    /// code; this pins that it is now consulted — opted-out never refreshes.
+    #[test]
+    fn opted_out_never_reregisters() {
+        assert!(!startup_reregister_types(false, &[ClaimType::PlainText]));
+        assert!(!startup_reregister_types(false, &ClaimType::ALL));
+    }
+
+    /// Opted in with at least one claimed type DOES refresh.
+    #[test]
+    fn opted_in_with_types_reregisters() {
+        assert!(startup_reregister_types(true, &[ClaimType::PlainText]));
+        assert!(startup_reregister_types(true, &ClaimType::ALL));
+    }
+
+    /// Opted in but with an empty claim set is a no-op — nothing to register.
+    #[test]
+    fn opted_in_but_no_types_is_a_noop() {
+        assert!(!startup_reregister_types(true, &[]));
     }
 }
 
