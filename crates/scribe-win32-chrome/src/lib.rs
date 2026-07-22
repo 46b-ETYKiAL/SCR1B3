@@ -182,6 +182,25 @@ pub fn set_main_hwnd(hwnd: isize) {
 #[cfg(not(windows))]
 pub fn set_main_hwnd(_hwnd: isize) {}
 
+/// Whether the OS is currently requesting REDUCED MOTION (WCAG 2.3.3). On Windows
+/// this reads `SPI_GETCLIENTAREAANIMATION`: when the user has disabled animations
+/// in Settings ▸ Accessibility ▸ Visual effects (or "Show animations in Windows"),
+/// the flag is `FALSE`, which we report as reduced-motion `true`. The app gates
+/// its animations through `MotionConfig::effective_enabled(this)`, so the OS
+/// accessibility preference overrides the in-app toggle. Fast (a registry-cached
+/// read); safe to call per frame.
+#[cfg(windows)]
+pub fn os_reduced_motion() -> bool {
+    imp::os_reduced_motion()
+}
+
+/// Non-Windows: no OS signal is consulted, so motion follows the in-app toggle
+/// only (reduced-motion `false` means "the OS is not forcing motion off").
+#[cfg(not(windows))]
+pub fn os_reduced_motion() -> bool {
+    false
+}
+
 /// Hand THIS process's foreground right to any process about to be spawned, so a
 /// just-launched child (the self-updater's relaunched binary, or the elevated
 /// `setup.exe` started via PowerShell) is permitted to call
@@ -433,6 +452,27 @@ mod imp {
     use crate::hit_test::{self, HitTestGeometry, HitTestMode, HitZone, RectPx};
     use crate::system_menu::{menu_state, WindowState};
     use crate::Backdrop;
+
+    /// Query `SPI_GETCLIENTAREAANIMATION`. The BOOL out-param is `TRUE` when
+    /// animations are ON; reduced-motion is the negation. A failed call (returns
+    /// 0) is treated as "not reduced" so a query error never suppresses motion.
+    pub(super) fn os_reduced_motion() -> bool {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            SystemParametersInfoW, SPI_GETCLIENTAREAANIMATION,
+        };
+        let mut animations_on: BOOL = 1;
+        // SAFETY: SPI_GETCLIENTAREAANIMATION writes a single BOOL into the pointer
+        // we pass; no ownership transfer, no aliasing. Read-only system query.
+        let ok = unsafe {
+            SystemParametersInfoW(
+                SPI_GETCLIENTAREAANIMATION,
+                0,
+                (&mut animations_on as *mut BOOL).cast(),
+                0,
+            )
+        };
+        ok != 0 && animations_on == 0
+    }
 
     /// The window-style bits that make DWM draw the native min/max/close caption
     /// buttons. winit leaves `WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX` set on
@@ -1216,6 +1256,15 @@ mod imp {
     #[cfg(all(windows, test))]
     mod tests {
         use super::*;
+
+        /// Smoke: the reduced-motion query completes and returns a bool without
+        /// panicking against the real OS (the value depends on the host's
+        /// accessibility setting, so we assert it runs, not which way it lands).
+        #[test]
+        fn os_reduced_motion_query_runs() {
+            let v = os_reduced_motion();
+            assert!(v == v, "returns a definite bool");
+        }
 
         fn rect(left: i32, top: i32, right: i32, bottom: i32) -> RECT {
             RECT {

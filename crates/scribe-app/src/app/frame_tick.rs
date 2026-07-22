@@ -240,7 +240,26 @@ impl ScribeApp {
     /// `egui_kittest` E2E tests can drive it through `Context::run` without an
     /// `eframe::Frame`. Drives every top-level panel via the deprecated-but-
     /// functional `Panel::show(ctx, …)` path.
+    /// Whether animations should actually run this frame — the user's `[motion]`
+    /// toggle GATED by the OS reduced-motion preference (WCAG 2.3.3). All animated
+    /// paint (caret trail, cursor blink, CRT scanlines) reads THIS rather than
+    /// `config.motion.enabled` raw, so Windows' "show animations" accessibility
+    /// setting overrides the in-app toggle. The OS query is a cheap cached
+    /// user32 read; on non-Windows it is a `false` constant so motion follows the
+    /// toggle only.
+    fn motion_active(&self) -> bool {
+        self.config
+            .motion
+            .effective_enabled(scribe_win32_chrome::os_reduced_motion())
+    }
+
     pub(crate) fn frame_tick(&mut self, ctx: &egui::Context) {
+        // Resolve the effective motion gate ONCE per frame (the OS reduced-motion
+        // preference AND the in-app toggle), before any borrow of `self` fields —
+        // the animated paint sites below read this Copy `bool` rather than calling
+        // the `&self` helper mid-borrow. Querying once also costs one OS read, not
+        // one per animated element.
+        let motion_on = self.motion_active();
         // Font-switch step 2 (see step 1 at the `ctx.set_fonts` call below):
         // `set_fonts` took effect at the START of this frame, so the NEW atlas is
         // now live. Drop the galley caches that were (re)baked against the OLD
@@ -2939,7 +2958,7 @@ impl ScribeApp {
                             self.last_selection_chars =
                                 range.primary.index.abs_diff(range.secondary.index);
                             // Wave-6 motion: feed the caret-trail when the caret moves.
-                            if self.config.motion.enabled && self.config.motion.caret_trail {
+                            if motion_on && self.config.motion.caret_trail {
                                 let t = ui.input(|i| i.time);
                                 let caret_rect = egui::Rect::from_min_max(
                                     out.galley_pos + rect.min.to_vec2(),
@@ -3087,8 +3106,7 @@ impl ScribeApp {
                                 && out.response.has_focus()
                             {
                                 let now = ui.ctx().input(|i| i.time);
-                                let blink =
-                                    self.config.motion.enabled && self.config.motion.cursor_blink;
+                                let blink = motion_on && self.config.motion.cursor_blink;
                                 let visible = if blink {
                                     (now / 1.06).rem_euclid(1.0) < 0.6
                                 } else {
@@ -3384,7 +3402,7 @@ impl ScribeApp {
         // retro overlay; only when motion AND scanlines are both enabled. Drives
         // a modest ~30 fps repaint while on so the bands drift (no busy-spin), and
         // never paints in the headless test harness (no real window to overlay).
-        if !cfg!(test) && self.config.motion.enabled && self.config.motion.crt_scanlines {
+        if !cfg!(test) && motion_on && self.config.motion.crt_scanlines {
             let t = ctx.input(|i| i.time);
             paint_crt_scanlines(ctx, self.config.motion.scanline_darkness, t);
             ctx.request_repaint_after(std::time::Duration::from_millis(33));
@@ -3392,7 +3410,7 @@ impl ScribeApp {
         // Wave-6 motion overlays (master-gated; never in the headless harness).
         // Each is a calm post-effect; while any is active we drive a ~30 fps
         // repaint so it animates. The resting (motion-off) frame is unchanged.
-        if !cfg!(test) && self.config.motion.enabled {
+        if !cfg!(test) && motion_on {
             let t = ctx.input(|i| i.time);
             let accent = ui_color(&self.theme, "accent", Rgba::new(0x4c, 0xc2, 0xff, 255));
             let mut animating = false;
