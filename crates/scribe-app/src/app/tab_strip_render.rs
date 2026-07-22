@@ -305,10 +305,15 @@ impl ScribeApp {
                         } else {
                             egui_phosphor::thin::PUSH_PIN
                         };
-                        if ui
-                            .add(egui::Button::new(glyph).frame(false).small())
-                            .on_hover_text(pin_label)
-                            .clicked()
+                        if super::chrome::tab_glyph_button(
+                            ui,
+                            glyph,
+                            muted,
+                            Color32::WHITE,
+                            accent.linear_multiply(0.22),
+                        )
+                        .on_hover_text(pin_label)
+                        .clicked()
                         {
                             toggle_pin = Some(i);
                         }
@@ -690,10 +695,15 @@ impl ScribeApp {
                         } else {
                             egui_phosphor::thin::PUSH_PIN
                         };
-                        if ui
-                            .add(egui::Button::new(glyph).frame(false).small())
-                            .on_hover_text(pin_label)
-                            .clicked()
+                        if super::chrome::tab_glyph_button(
+                            ui,
+                            glyph,
+                            muted,
+                            Color32::WHITE,
+                            accent.linear_multiply(0.22),
+                        )
+                        .on_hover_text(pin_label)
+                        .clicked()
                         {
                             toggle_pin = Some(i);
                         }

@@ -62,6 +62,13 @@ thread_local! {
     /// wire cut. `None` = never published this thread; an EMPTY rect = retracted.
     pub(crate) static TEST_PUBLISHED_MAX_RECT:
         std::cell::Cell<Option<scribe_win32_chrome::RectPx>> = const { std::cell::Cell::new(None) };
+    /// Test hook: when `true`, [`tab_glyph_button`] forces its `hovered` branch so
+    /// a deterministic offscreen visual-QA render can capture the HOVER state (the
+    /// veil fill + hot glyph colour) without a live pointer, exactly like
+    /// `TEST_FORCE_SIDE_TAB_DRAG` forces the drop indicator. Never set outside a
+    /// test — the real hover path is `Response::hovered()` / `rect_contains_pointer`.
+    pub(super) static TEST_FORCE_GLYPH_HOVER:
+        std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Hand the maximize/restore button's rect to `scribe-win32-chrome` so
@@ -345,6 +352,65 @@ pub(super) fn caption_btn(
         CaptionIcon::Settings => "Open settings",
     };
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, name));
+    resp
+}
+
+/// Minimum hit-target edge (logical px) for a small in-strip glyph control — a
+/// tab's pin toggle or close ✕. WCAG 2.5.8 target-size floor (24×24) + Fitts'
+/// law: the glyph itself stays small, but the interactive BOX is allocated at
+/// this size so the control is easy to hit and reads as a real button.
+pub(super) const GLYPH_CONTROL_HIT: f32 = 24.0;
+
+/// Paint a flat, frameless glyph control (a tab's pin / close ✕) whose hover
+/// feedback is pre-resolved, and return its click [`egui::Response`].
+///
+/// `egui::Button::new(glyph).frame(false)` paints NO fill or stroke in ANY state
+/// (egui 0.34 `button.rs`) and bakes its glyph colour at construction, so a plain
+/// flow button can never light up on hover — which is exactly why a tab's pin/×
+/// read as dead controls before this. This helper instead:
+///
+/// 1. allocates a fixed [`GLYPH_CONTROL_HIT`]-square interactive rect. Using
+///    `allocate_exact_size` keeps it layout-agnostic — the cursor advances
+///    correctly whether the caller is in a horizontal row (`draw_tab_strip`) or a
+///    vertical column (`draw_rotated_side_tabs`), so ONE helper serves every tab
+///    orientation;
+/// 2. resolves `hovered` from the SENSED response OR a pointer-in-rect test (so
+///    the veil still shows while an adjacent widget holds the drag) BEFORE any
+///    paint — the pre-check a `Button` cannot do;
+/// 3. picks the glyph colour (`rest` → `hot`) and paints the veil `hover_fill`
+///    only while hovered.
+///
+/// The accessible name is set to `glyph` so an AccessKit `get_by_label(glyph)`
+/// query still reaches the control — the tab/caption e2e tests rely on the pin/×
+/// being reachable by their phosphor glyph.
+pub(super) fn tab_glyph_button(
+    ui: &mut egui::Ui,
+    glyph: &'static str,
+    rest: Color32,
+    hot: Color32,
+    hover_fill: Color32,
+) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(
+        egui::vec2(GLYPH_CONTROL_HIT, GLYPH_CONTROL_HIT),
+        egui::Sense::click(),
+    );
+    #[allow(unused_mut)]
+    let mut hovered = resp.hovered() || ui.rect_contains_pointer(rect);
+    // Test-only: force the hover branch so an offscreen render can capture the
+    // HOVER frame deterministically (no live pointer). Never set in production.
+    #[cfg(test)]
+    if TEST_FORCE_GLYPH_HOVER.with(std::cell::Cell::get) {
+        hovered = true;
+    }
+    // Resolve the font before borrowing the painter (both borrow `ui`).
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let painter = ui.painter();
+    if hovered {
+        painter.rect_filled(rect, 3.0, hover_fill);
+    }
+    let col = if hovered { hot } else { rest };
+    painter.text(rect.center(), egui::Align2::CENTER_CENTER, glyph, font, col);
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, glyph));
     resp
 }
 
