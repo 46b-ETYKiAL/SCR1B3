@@ -713,6 +713,17 @@ pub struct ScribeApp {
     config_error_banner: Option<String>,
     status: String,
     toast: Option<String>,
+    /// Note-app (PKM) index of the configured vault: one [`notes_ui::NoteDoc`] per
+    /// markdown note, holding its title, tags, `[[wiki-links]]` and body. Rebuilt
+    /// by `notes_ensure_index` when the vault path changes; empty until a vault is
+    /// configured. `note_index_root` records which vault the index was built for so
+    /// a path change triggers a rescan.
+    note_index: Vec<notes_ui::NoteDoc>,
+    note_index_root: Option<std::path::PathBuf>,
+    /// Whether the note-list side pane is shown (toggled by its command/keybind).
+    notes_pane_open: bool,
+    /// The note-list filter query (`tag:` / `path:` / `title:` / quoted / -negation).
+    notes_filter: String,
     /// Plugin/mod host (Rhai easy-mode); loaded from the plugins dir on start.
     plugins: PluginHost,
     /// #R6 — ids of discovered plugins held back at load because the user has
@@ -1304,6 +1315,12 @@ impl ScribeApp {
                 scribe_core::PRODUCT_TAGLINE
             ),
             toast,
+            // Note-app index is empty until a vault is configured; `notes_ensure_index`
+            // fills it lazily on the first frame the pane is shown.
+            note_index: Vec::new(),
+            note_index_root: None,
+            notes_pane_open: false,
+            notes_filter: String::new(),
             plugins,
             pending_plugins,
             plugin_cmds,
@@ -2108,6 +2125,7 @@ mod keyboard_input;
 mod keymap;
 mod modals;
 mod multi_cursor_glue;
+mod notes_ui;
 mod render_support;
 // Re-export the rendering & text-geometry leaf helpers so existing bare-name
 // call sites in mod.rs, the `use super::*` siblings (frame_tick, editor_overlays,

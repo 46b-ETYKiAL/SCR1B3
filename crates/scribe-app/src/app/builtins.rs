@@ -82,6 +82,9 @@ impl ScribeApp {
             BuiltinCommand::ToggleDiffView => {
                 self.diff_view_open = !self.diff_view_open;
             }
+            BuiltinCommand::ToggleNotesPane => {
+                self.notes_pane_open = !self.notes_pane_open;
+            }
             BuiltinCommand::ToggleSpellcheck => {
                 self.config.spellcheck.enabled = !self.config.spellcheck.enabled;
                 self.save_config();

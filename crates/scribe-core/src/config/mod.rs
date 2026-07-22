@@ -11,6 +11,7 @@ mod editor;
 mod file_assoc;
 mod keybindings;
 mod motion;
+mod notes;
 mod reporting;
 mod system;
 mod window;
@@ -20,6 +21,7 @@ pub use editor::*;
 pub use file_assoc::*;
 pub use keybindings::*;
 pub use motion::*;
+pub use notes::*;
 pub use reporting::*;
 pub use system::*;
 pub use window::*;
@@ -110,6 +112,11 @@ pub struct Config {
     /// whole section as the all-off default.
     #[serde(default)]
     pub integration: IntegrationConfig,
+    /// First-party notes / PKM vault settings. Purely additive and default-empty
+    /// (`vault_dir == None`) — a config written before this section deserializes
+    /// it to "no vault", and SCR1B3 never scans a folder the user did not choose.
+    #[serde(default)]
+    pub notes: NotesConfig,
 }
 
 impl Default for Config {
@@ -134,6 +141,7 @@ impl Default for Config {
             scroll: ScrollConfig::default(),
             reporting: ReportingConfig::default(),
             integration: IntegrationConfig::default(),
+            notes: NotesConfig::default(),
         }
     }
 }

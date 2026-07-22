@@ -1716,6 +1716,14 @@ impl ScribeApp {
             }
         }
 
+        // ---- Notes (PKM) side pane ----
+        // Self-guarded: renders its own left SidePanel only when `notes_pane_open`
+        // is set (toggled by BuiltinCommand::ToggleNotesPane), lazily (re)building
+        // the vault index. This is the single live call site that makes the whole
+        // note-app surface reachable — the vault scan, the operator search, the
+        // wiki-link open/create, and the backlinks pane.
+        self.render_notes_pane(ctx, panel, accent, muted);
+
         let active = self.active.min(self.tabs.len().saturating_sub(1));
         self.active = active;
         let font = FontId::monospace(self.config.fonts.clamped_editor_size());

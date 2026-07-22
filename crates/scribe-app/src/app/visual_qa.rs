@@ -60,6 +60,44 @@ fn qa_config() -> Config {
 
 const SAMPLE: &str = "fn main() {\n    let x = 1;\n    let y = 2;\n    println!(\"{x} {y}\");\n}\n";
 
+/// Notes (PKM) side pane OPEN over a small temp vault. Writes three markdown
+/// notes — one carrying `[[Ideas]]` wiki-links and `#project/alpha` tags, plus
+/// the linked `Ideas.md` (so the backlinks pane has something), and a `daily.md`.
+/// Points the config vault at that dir, opens the linking note as the active tab,
+/// and toggles `notes_pane_open`. Read the PNG: the left "NOTES" pane must show
+/// the vault path, the three-note list, and the "links out" / "backlinks"
+/// sections populated from the active note.
+#[test]
+#[ignore = "GPU render; run with --ignored on a host with a wgpu adapter"]
+fn scene_notes_pane() {
+    let vault = out_dir().join("qa-vault");
+    let _ = std::fs::create_dir_all(&vault);
+    std::fs::write(
+        vault.join("Home.md"),
+        "# Home\n\nSee [[Ideas]] and [[daily]]. #project/alpha #inbox\n",
+    )
+    .expect("write Home.md");
+    std::fs::write(
+        vault.join("Ideas.md"),
+        "# Ideas\n\nA linked note. Back to [[Home]]. #project/alpha\n",
+    )
+    .expect("write Ideas.md");
+    std::fs::write(vault.join("daily.md"), "# 2026-07-22\n\nDaily note.\n")
+        .expect("write daily.md");
+
+    let mut cfg = qa_config();
+    cfg.notes.vault_dir = Some(vault.clone());
+    let mut app = ScribeApp::new_test(cfg);
+    app.tabs.clear();
+    // Active tab = the linking note, so "links out" (Ideas/daily) and its own
+    // backlink (from Ideas) both populate.
+    let t = EditorTab::from_path(vault.join("Home.md")).expect("open Home.md");
+    app.tabs.push(t);
+    app.active = 0;
+    app.notes_pane_open = true;
+    render_scene("notes_pane", 1100.0, 720.0, app);
+}
+
 #[test]
 #[ignore = "GPU render; run with --ignored on a host with a wgpu adapter"]
 fn scene_default() {

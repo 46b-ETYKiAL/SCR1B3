@@ -334,6 +334,7 @@ pub(crate) enum BuiltinCommand {
     ToggleZen,
     ToggleMarkdownPreview,
     ToggleDiffView,
+    ToggleNotesPane,
     ToggleSpellcheck,
     ToggleWordWrap,
     ToggleLineNumbers,
@@ -691,6 +692,12 @@ pub(crate) const BUILTIN_COMMANDS: &[BuiltinEntry] = &[
         shortcut: "Ctrl+Shift+V",
         action: BuiltinCommand::ToggleMarkdownPreview,
         bindings: &[action::TOGGLE_MD_PREVIEW],
+    },
+    BuiltinEntry {
+        label: "Toggle notes pane",
+        shortcut: "",
+        action: BuiltinCommand::ToggleNotesPane,
+        bindings: &[],
     },
     BuiltinEntry {
         label: "Toggle minimap",
