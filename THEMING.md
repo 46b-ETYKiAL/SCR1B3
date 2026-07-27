@@ -284,6 +284,32 @@ variable = "text"
 
 A light theme is as simple as setting `appearance = "light"` and choosing lighter `background` / darker `foreground` values.
 
-## CRT effects (not implemented)
+## CRT effects (shipped as painter overlays, not a GPU shader)
 
-A CRT / retro post-process pass (scanline, phosphor glow, bloom, vignette, curvature, chromatic aberration) was scaffolded early but **not shipped** — there is no GPU shader behind it, so it carries no `[effects]` config table. The aesthetic is expressed through the color themes themselves (e.g. `phosphor-amber`, `terminal-lock`) rather than a screen-space filter. If a post-process pass lands later it will be a separate, opt-in feature documented here and in [CONFIG.md](CONFIG.md).
+CRT / retro ambience **is shipped**, but as CPU-side painter overlays rather than
+the wgpu fragment-shader post-process pass envisioned in
+[ADR-0001](docs/adr/0001-stack-and-architecture.md) and
+[ADR-0006](docs/adr/0006-ui-framework-ratify-egui.md). What that means in practice:
+
+| Effect | Config key (`[motion]`) | Default |
+|---|---|---|
+| CRT scanline overlay | `crt_scanlines` (+ `scanline_darkness`) | off |
+| CRT flicker | `flicker` (+ `flicker_strength`, `flicker_speed`) | off |
+| VHS tracking band | `vhs_tracking` (+ `vhs_speed`) | off |
+| Wired ambient mesh | `wired_ambient` | off |
+
+Each is drawn with `ctx.layer_painter()` compositing over the finished frame — so
+there is no `.wgsl` shader, no render-target ping-pong, and none of the effects
+that genuinely require a fragment pass (phosphor **glow**, **bloom**,
+**curvature**, **chromatic aberration**) exist. Those remain unimplemented; the
+list above is the complete shipped set.
+
+The effects live under **`[motion]`, not a separate `[effects]` table** — the
+`[effects]` table described in early design notes was never created. Every effect
+is **off by default**, gated behind the `[motion]` master switch, and additionally
+suppressed when the OS reports a reduced-motion preference (WCAG 2.3.3 — see
+`MotionConfig::effective_enabled`), so the resting frame is always the flat theme.
+
+The retro *aesthetic* is therefore carried mainly by the color themes themselves
+(e.g. `phosphor-amber`, `terminal-lock`), with these overlays as opt-in ambience
+on top. Full key reference: [CONFIG.md](CONFIG.md#motion--animation-and-crt-ambience).
