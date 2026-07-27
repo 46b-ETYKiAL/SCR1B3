@@ -1053,6 +1053,12 @@ impl ScribeApp {
                         self.find_open = false;
                     }
                 });
+                // Matching-mode row: regex / match-case / whole-word toggles plus
+                // the inline invalid-regex error. THIS CALL IS THE WIRE the
+                // toggles ride — `find_query_flags` reads the very fields these
+                // checkboxes bind, so cutting this line makes the modes
+                // unreachable from the UI (which `find_toggle_tests` detects).
+                self.find_bar_options_ui(ui);
                 // Second row: replace field + actions.
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("with").color(accent).monospace());
@@ -1068,6 +1074,9 @@ impl ScribeApp {
                         self.replace_in_active(true);
                     }
                 });
+                // Third row: regex / match-case / whole-word toggles + the
+                // inline invalid-regex error (see `find_replace.rs`).
+                // CUT
             });
         }
 
@@ -1119,6 +1128,8 @@ impl ScribeApp {
                     }
                     ui.horizontal(|ui| {
                         ui.checkbox(&mut self.find_in_files_regex, "regex");
+                        ui.checkbox(&mut self.find_in_files_case_sensitive, "match case");
+                        ui.checkbox(&mut self.find_in_files_whole_word, "whole word");
                         let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                         if enter || ui.button("search").clicked() {
                             self.run_find_in_files(ctx);
@@ -1349,6 +1360,14 @@ impl ScribeApp {
                 ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(level));
                 self.save_config();
             }
+        } else {
+            // Settings is closed — by its own ✕, by Esc, by a command, or by any
+            // other route — so no chord capture can be in flight. Clearing here
+            // (rather than only on the ✕ path) is what keeps a capture the user
+            // walked away from from surviving into the next time Settings opens,
+            // where it would stand the editor's shortcut layer down for keys the
+            // user never meant to rebind.
+            crate::app::settings_keys::clear_capture(ctx);
         }
 
         // ---- Keyboard cheatsheet (F1) ----

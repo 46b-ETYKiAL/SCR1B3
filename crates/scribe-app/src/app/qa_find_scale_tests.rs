@@ -529,23 +529,23 @@ fn scenario6_replace_all_at_scale_count_text_and_cache_invalidation() {
 }
 
 // ===========================================================================
-// Scenario 7 — EDGE: case-sensitivity + whole-word toggles.
+// Scenario 7 — EDGE: the DEFAULT (toggles off) matching semantics at scale.
 //
-// DISCOVERED FROM SOURCE: the in-buffer find BAR (`find_replace.rs` /
-// `find_nav.rs`) and the find-in-files panel expose NO case-sensitivity and NO
-// whole-word UI control — `find_matches_active`/`replace_in_active` build a
-// `Query` with `..Default::default()` (case_sensitive=false, whole_word=false),
-// and `run_find_in_files` hard-codes `case_sensitive: false, whole_word: false`
-// (only a `regex` checkbox is surfaced). There is therefore no user-facing
-// toggle to drive. Rather than skip-with-comment only, we PIN the actual
-// behaviour the absent toggle implies: search is case-INSENSITIVE and
-// NOT whole-word-bounded, so the scale corpus's case variants and substrings all
-// match. This is a regression guard on the documented default, not a fabricated
-// control.
+// The find bar and the find-in-files panel now BOTH expose regex / match-case /
+// whole-word checkboxes wired through `find_query_flags` and
+// `run_find_in_files` (the earlier hard-coded `case_sensitive: false,
+// whole_word: false` is gone). Those toggles are driven through the real UI in
+// `find_toggle_tests.rs` — that is where the wiring is proven.
+//
+// This scenario keeps its original job: pinning the DEFAULT (all toggles off)
+// semantics against the scale corpus — search is case-INSENSITIVE and NOT
+// whole-word-bounded, so case variants and substrings all match. It is the
+// regression guard on the default, and its find-in-files leg now reads the
+// panel's LIVE default flags rather than restating a hard-coded literal.
 // ===========================================================================
 
 #[test]
-fn scenario7_no_case_or_wholeword_toggle_default_is_case_insensitive_substring() {
+fn scenario7_default_toggles_off_is_case_insensitive_substring() {
     // Build a buffer with mixed-case + substring-embedded occurrences of a token,
     // open it, and confirm the find bar's default (toggle-less) semantics match
     // all of them. The synthetic corpus uses lowercase tokens; we open a real
@@ -562,25 +562,32 @@ fn scenario7_no_case_or_wholeword_toggle_default_is_case_insensitive_substring()
     app.tabs[active].edit_gen = app.tabs[active].edit_gen.wrapping_add(1);
 
     app.find_query = "alpha".to_string();
+    // Guard the premise: this scenario measures the DEFAULT, so every toggle
+    // must still be off on a fresh app. A default flipped to `true` somewhere
+    // would otherwise quietly change what "5" means here.
+    assert!(
+        !app.find_regex && !app.find_case_sensitive && !app.find_whole_word,
+        "scenario 7 measures the default: all find-bar toggles start off"
+    );
     let matches = app.find_matches_active();
     // Case-INSENSITIVE: alpha, ALPHA, Alpha all match. NOT whole-word: the
     // `alpha` inside `alphabet` and `betaalpha` also match. => 5 total.
     assert_eq!(
         matches.len(),
         5,
-        "the toggle-less find bar is case-insensitive AND substring (not \
+        "the default find bar is case-insensitive AND substring (not \
          whole-word): alpha/ALPHA/Alpha + alphabet + betaalpha == 5 (got {})",
         matches.len()
     );
 
-    // Confirm the SAME default holds on the find-in-files Query construction by
-    // reading the documented hard-coded flags through an independent scan (the
-    // panel builds `case_sensitive: false, whole_word: false`).
+    // Confirm the SAME default holds on the find-in-files panel, reading its
+    // LIVE flags off the app rather than restating literals — so if a panel
+    // default ever changes, this leg moves with it instead of lying.
     let panel_default = scribe_core::search::Query {
         pattern: "alpha".to_string(),
-        regex: false,
-        case_sensitive: false,
-        whole_word: false,
+        regex: app.find_in_files_regex,
+        case_sensitive: app.find_in_files_case_sensitive,
+        whole_word: app.find_in_files_whole_word,
     };
     let scan = scribe_core::search::find_all(&app.tabs[active].text, &panel_default).unwrap();
     assert_eq!(

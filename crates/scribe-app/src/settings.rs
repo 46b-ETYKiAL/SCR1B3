@@ -26,6 +26,7 @@ const CATEGORIES: &[&str] = &[
     "Window",
     "Toolbar",
     "Editor",
+    "Keyboard",
     "Spellcheck",
     "Plugins",
     "Default app",
@@ -147,7 +148,11 @@ fn section_visible(selected: &str, q: &str, category: &str, labels: &[&str]) -> 
 }
 
 /// Whether an individual row should render given the active search query.
-fn row_visible(q: &str, label: &str) -> bool {
+///
+/// `pub(crate)` because the Keyboard page (`app::settings_keys`) filters its 35
+/// binding rows with the SAME predicate — a second copy would drift and make the
+/// search behave differently on one page.
+pub(crate) fn row_visible(q: &str, label: &str) -> bool {
     q.is_empty() || label.to_lowercase().contains(q)
 }
 
@@ -2277,6 +2282,27 @@ fn render_sections(
             }
         });
         space(ui);
+    }
+
+    // ---- Keyboard ----
+    //
+    // Delegated to `app::settings_keys`: the page reads the same token <-> key
+    // table and action consts the LIVE matcher uses, which are `pub(in
+    // crate::app)`. Rendering it there (rather than copying those tables here)
+    // is what guarantees the chord Settings shows is the chord the editor fires.
+    // Its own row labels feed `section_visible`, so a cross-category search for
+    // "duplicate line" surfaces this page.
+    {
+        let key_labels = crate::app::settings_keys::labels();
+        if section_visible(sel, q, "Keyboard", &key_labels) {
+            head(
+                ui,
+                "Keyboard",
+                "Every rebindable shortcut. Click a chord, press the keys you want.",
+            );
+            changed |= crate::app::settings_keys::show(ui, config, q);
+            space(ui);
+        }
     }
 
     // ---- Spellcheck ----
@@ -4599,6 +4625,7 @@ mod pane_render {
             ("Toolbar", "Quick-access toolbar"),
             ("Motion", "Motion"),
             ("Editor", "Editor"),
+            ("Keyboard", "Keyboard"),
             ("Spellcheck", "Spellcheck (offline)"),
             ("Plugins", "Plugins"),
             ("Updates", "Updates"),

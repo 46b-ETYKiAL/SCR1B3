@@ -168,6 +168,63 @@ pub(super) fn platform_chord_text(text: &str) -> String {
     }
 }
 
+/// The config combo string for a physical press of `key` with `mods` held.
+///
+/// The INVERSE of the token -> [`egui::Key`] step [`Keymap::resolve`] performs,
+/// and the whole reason the settings keyboard page can capture a chord by
+/// listening rather than making the user type `"mod+shift+openbracket"` by hand.
+///
+/// The key is spelled with the variant-name form (`"arrowup"`, `"num0"`,
+/// `"openbracket"`) — the spelling [`key_from_token`] accepts and the shipped
+/// defaults use — and the modifiers are emitted in [`Chord::canonical`] order, so
+/// a captured combo is byte-identical to how the same chord would be written by
+/// hand and collides with an alias-written twin the way `Keybindings::validate`
+/// expects. `a_captured_chord_round_trips_back_to_the_key_that_was_pressed` pins
+/// the round-trip over egui's ENTIRE key table.
+///
+/// `mods.command` (not `ctrl`) is read because that is the flag
+/// [`Keymap::pressed`] matches against — capturing Cmd on macOS and Ctrl
+/// elsewhere, exactly like `mod`.
+pub(super) fn combo_from_press(key: egui::Key, mods: egui::Modifiers) -> String {
+    let mut out = String::new();
+    if mods.command {
+        out.push_str("mod+");
+    }
+    if mods.alt {
+        out.push_str("alt+");
+    }
+    if mods.shift {
+        out.push_str("shift+");
+    }
+    out.push_str(&format!("{key:?}").to_ascii_lowercase());
+    out
+}
+
+/// How the stored combo string `combo` reads on this platform, e.g.
+/// `"Ctrl+Shift+F"`.
+///
+/// `None` exactly when the combo cannot fire — blank, unparseable, or naming a
+/// key that is not on the keyboard. The settings page renders that as an explicit
+/// "won't fire" warning instead of a plausible-looking chord, which is the whole
+/// point: a rebinding UI that pretty-prints a dead binding is worse than none.
+///
+/// Shares [`Chord::parse`] + [`key_from_token`] + [`ResolvedChord::display`] with
+/// the live matcher, so what Settings shows and what the editor fires can never
+/// be two different answers.
+pub(super) fn display_combo(combo: &str) -> Option<String> {
+    let c = Chord::parse(combo)?;
+    let key = key_from_token(&c.key)?;
+    Some(
+        ResolvedChord {
+            cmd: c.cmd,
+            shift: c.shift,
+            alt: c.alt,
+            key,
+        }
+        .display(),
+    )
+}
+
 /// A chord resolved all the way to an [`egui::Key`] plus its required modifiers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct ResolvedChord {
@@ -673,6 +730,108 @@ mod tests {
         assert_eq!(key_from_token("n"), Some(egui::Key::N));
         assert_eq!(key_from_token("nope"), None);
         assert_eq!(key_from_token(""), None);
+    }
+
+    // ---- chord CAPTURE (the settings-page inverse of `resolve`) ----
+
+    #[test]
+    fn a_captured_chord_round_trips_back_to_the_key_that_was_pressed() {
+        // The load-bearing property of `combo_from_press`: whatever the user
+        // physically pressed must come back out of the config string. Run it over
+        // egui's ENTIRE key table so a key whose Debug spelling `key_from_token`
+        // cannot resolve (now or after an egui bump) fails HERE — instead of
+        // shipping a rebind UI that silently writes a dead binding.
+        for key in egui::Key::ALL {
+            let combo = combo_from_press(*key, egui::Modifiers::NONE);
+            let chord = Chord::parse(&combo)
+                .unwrap_or_else(|| panic!("captured '{combo}' must parse back into a chord"));
+            assert_eq!(
+                key_from_token(&chord.key),
+                Some(*key),
+                "captured '{combo}' must resolve back to the key that was pressed"
+            );
+        }
+    }
+
+    #[test]
+    fn a_captured_chord_records_exactly_the_modifiers_that_were_held() {
+        // Modifier fidelity in BOTH directions: a held modifier must appear, and
+        // an unheld one must not. A capture that dropped Shift would rebind
+        // `mod+shift+f` as `mod+f` and collide with Find.
+        assert_eq!(combo_from_press(egui::Key::F, CMD | SHIFT), "mod+shift+f");
+        assert_eq!(combo_from_press(egui::Key::F, CMD), "mod+f");
+        assert_eq!(combo_from_press(egui::Key::F, SHIFT), "shift+f");
+        assert_eq!(combo_from_press(egui::Key::F, ALT), "alt+f");
+        assert_eq!(
+            combo_from_press(egui::Key::F11, egui::Modifiers::NONE),
+            "f11"
+        );
+        // Canonical ORDER (mod, alt, shift), so a captured chord is byte-equal to
+        // the same chord written by hand and conflict detection sees one combo.
+        let captured = combo_from_press(egui::Key::K, CMD | ALT | SHIFT);
+        assert_eq!(captured, "mod+alt+shift+k");
+        assert_eq!(
+            Chord::parse(&captured).unwrap().canonical(),
+            captured,
+            "a captured combo must already BE canonical"
+        );
+    }
+
+    #[test]
+    fn a_captured_chord_fires_the_action_it_was_bound_to() {
+        // Capture -> store -> resolve -> match, end to end through the real
+        // matcher: pressing Ctrl+Alt+K after binding SAVE to a capture of
+        // Ctrl+Alt+K must fire save, and the OLD default must not.
+        let combo = combo_from_press(egui::Key::K, CMD | ALT);
+        let km = Keymap::resolve(&Keybindings {
+            save: combo,
+            ..Default::default()
+        });
+        assert!(
+            fired(&km, action::SAVE, egui::Key::K, CMD | ALT),
+            "the captured chord must fire the action it was captured for"
+        );
+        assert!(
+            !fired(&km, action::SAVE, egui::Key::S, CMD),
+            "the replaced default must stop firing"
+        );
+    }
+
+    // ---- combo DISPLAY (what the settings row and the cheatsheet show) ----
+
+    #[test]
+    fn display_combo_renders_a_stored_binding_the_way_the_cheatsheet_does() {
+        // Settings and the cheatsheet must agree, or the two surfaces teach
+        // different keys for one action.
+        let km = Keymap::resolve(&Keybindings::default());
+        for action in [action::SAVE, action::TOGGLE_GRID, action::MOVE_LINE_UP] {
+            let stored = Keybindings::default()
+                .get(action)
+                .expect("a default binding")
+                .to_string();
+            assert_eq!(
+                display_combo(&stored).as_deref(),
+                km.display_for(&[action]).as_deref(),
+                "'{action}' must read the same in Settings and the cheatsheet"
+            );
+        }
+    }
+
+    #[test]
+    fn display_combo_refuses_to_pretty_print_a_binding_that_cannot_fire() {
+        // The three ways a binding is dead. Each must yield None so the settings
+        // row can warn, rather than rendering a chord the editor will never match.
+        assert_eq!(display_combo(""), None, "blank");
+        assert_eq!(display_combo("   "), None, "whitespace-only");
+        assert_eq!(display_combo("mod"), None, "modifiers with no key");
+        assert_eq!(display_combo("a+b"), None, "two non-modifier keys");
+        assert_eq!(
+            display_combo("mod+nosuchkey"),
+            None,
+            "not a key on the keyboard"
+        );
+        // …and a live one still renders.
+        assert!(display_combo("mod+s").is_some());
     }
 
     #[test]

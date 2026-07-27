@@ -11,7 +11,7 @@
 //!
 //! # Fix
 //!
-//! Memoize the match list keyed by `(query, edit_gen, doc_id)` — the SAME
+//! Memoize the match list keyed by `(query, flags, edit_gen, doc_id)` — the SAME
 //! generation-keyed idiom the spell-check and change-bar caches already use
 //! (`edit_gen` is bumped on every edit; `doc_id` disambiguates tabs that happen
 //! to share an `edit_gen` in the single-slot cache). The matches are recomputed
@@ -25,12 +25,19 @@
 use scribe_core::search::Match;
 
 /// The identity of a cached find result. Two keys are equal iff the cached
-/// match list is still valid: same query text, same per-tab edit generation,
-/// same document id. Any change to one of these invalidates the memo.
+/// match list is still valid: same query text, same matching MODE, same per-tab
+/// edit generation, same document id. Any change to one of these invalidates
+/// the memo.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FindCacheKey {
     /// The find-bar query string the matches were computed for.
     pub query: String,
+    /// The find bar's `(regex, case_sensitive, whole_word)` toggles at compute
+    /// time. The SAME pattern denotes a different match set under a different
+    /// mode, so the mode is part of the cache identity: without it, flipping
+    /// "match case" would return the stale case-insensitive memo and the toggle
+    /// would appear dead until the user also edited the query or the buffer.
+    pub flags: (bool, bool, bool),
     /// The active tab's monotonic edit generation at compute time. Bumped on
     /// every edit, so an edit invalidates the cache.
     pub edit_gen: u64,
@@ -40,10 +47,12 @@ pub struct FindCacheKey {
 }
 
 impl FindCacheKey {
-    /// Build a key from the live find/tab state.
-    pub fn new(query: &str, edit_gen: u64, doc_id: u64) -> Self {
+    /// Build a key from the live find/tab state. `flags` is
+    /// `(regex, case_sensitive, whole_word)`.
+    pub fn new(query: &str, flags: (bool, bool, bool), edit_gen: u64, doc_id: u64) -> Self {
         Self {
             query: query.to_string(),
+            flags,
             edit_gen,
             doc_id,
         }
@@ -80,7 +89,7 @@ mod tests {
 
     #[test]
     fn no_entry_recomputes() {
-        let key = FindCacheKey::new("foo", 0, 0);
+        let key = FindCacheKey::new("foo", (false, false, false), 0, 0);
         assert!(
             should_recompute(None, &key),
             "an empty cache must recompute"
@@ -91,7 +100,7 @@ mod tests {
     fn identical_key_does_not_recompute() {
         // The core P-01 proof at the predicate level: same query, same
         // edit_gen, same doc -> NO recompute across idle frames.
-        let key = FindCacheKey::new("foo", 7, 3);
+        let key = FindCacheKey::new("foo", (false, false, false), 7, 3);
         let cached = key.clone();
         assert!(
             !should_recompute(Some(&cached), &key),
@@ -101,8 +110,8 @@ mod tests {
 
     #[test]
     fn query_change_invalidates() {
-        let cached = FindCacheKey::new("foo", 7, 3);
-        let key = FindCacheKey::new("bar", 7, 3);
+        let cached = FindCacheKey::new("foo", (false, false, false), 7, 3);
+        let key = FindCacheKey::new("bar", (false, false, false), 7, 3);
         assert!(
             should_recompute(Some(&cached), &key),
             "changing the query must recompute"
@@ -113,8 +122,8 @@ mod tests {
     fn edit_gen_bump_invalidates() {
         // An edit bumps edit_gen -> the cache must recompute even though the
         // query string is identical.
-        let cached = FindCacheKey::new("foo", 7, 3);
-        let key = FindCacheKey::new("foo", 8, 3);
+        let cached = FindCacheKey::new("foo", (false, false, false), 7, 3);
+        let key = FindCacheKey::new("foo", (false, false, false), 8, 3);
         assert!(
             should_recompute(Some(&cached), &key),
             "an edit (edit_gen bump) must recompute"
@@ -125,8 +134,8 @@ mod tests {
     fn tab_switch_invalidates() {
         // Two tabs can share an edit_gen; the doc_id is what disambiguates the
         // single-slot cache on a tab switch.
-        let cached = FindCacheKey::new("foo", 7, 3);
-        let key = FindCacheKey::new("foo", 7, 4);
+        let cached = FindCacheKey::new("foo", (false, false, false), 7, 3);
+        let key = FindCacheKey::new("foo", (false, false, false), 7, 4);
         assert!(
             should_recompute(Some(&cached), &key),
             "switching tabs (doc_id change) must recompute"
@@ -134,9 +143,29 @@ mod tests {
     }
 
     #[test]
+    fn each_mode_toggle_invalidates() {
+        // The find bar's regex / match-case / whole-word toggles change WHICH
+        // spans the same pattern denotes, so each one must move the key on its
+        // own. If any flag were dropped from the key, flipping that toggle
+        // would hand back the stale memo and the toggle would look dead.
+        let base = FindCacheKey::new("foo", (false, false, false), 7, 3);
+        for flags in [
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            let key = FindCacheKey::new("foo", flags, 7, 3);
+            assert!(
+                should_recompute(Some(&base), &key),
+                "flipping {flags:?} must invalidate the find cache"
+            );
+        }
+    }
+
+    #[test]
     fn entry_round_trips_matches() {
         // Sanity: the entry carries both the key and the matches it cached.
-        let key = FindCacheKey::new("foo", 1, 2);
+        let key = FindCacheKey::new("foo", (false, false, false), 1, 2);
         let entry = FindCacheEntry {
             key: key.clone(),
             matches: vec![m(0, 3), m(10, 13)],

@@ -38,6 +38,19 @@ impl ScribeApp {
         act: &mut Pending,
         find_nav: &mut Option<bool>,
     ) {
+        // The Settings → Keyboard page is waiting for a chord: stand down for
+        // this frame. Otherwise pressing Ctrl+S to REBIND save would also save
+        // the file, and the Escape that cancels a capture would also close every
+        // overlay — the rebind UI would fire the very actions it is rebinding.
+        //
+        // Gated on the Settings window being OPEN as well as the capture flag, so
+        // a capture the user walked away from can never leave the editor's whole
+        // shortcut layer suppressed (the flag is also cleared when the window
+        // closes; this is the belt to that suspenders).
+        if self.settings_open && crate::app::settings_keys::capture_active(ctx) {
+            return;
+        }
+
         // Config live-reloads, so re-resolve when (and only when) the user's
         // bindings actually changed. `Keymap` owns its data, which keeps
         // `self` free to be mutated inside the `ctx.input` closure below.

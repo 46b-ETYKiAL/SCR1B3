@@ -638,6 +638,12 @@ pub struct ScribeApp {
     find_in_files_open: bool,
     find_in_files_query: String,
     find_in_files_regex: bool,
+    /// Project-search match-case / whole-word toggles. `run_find_in_files`
+    /// previously hard-coded `case_sensitive: false, whole_word: false` next to
+    /// the live `regex` flag, so the panel could not express two of the three
+    /// modes the engine already supported. Session state, like the find bar's.
+    find_in_files_case_sensitive: bool,
+    find_in_files_whole_word: bool,
     find_in_files_results: Vec<crate::find_in_files::FileMatch>,
     find_in_files_error: Option<String>,
     focus_find_in_files: bool,
@@ -706,6 +712,27 @@ pub struct ScribeApp {
     /// One-shot focus request for the replace field when the user opens
     /// the bar via Ctrl+H specifically (as opposed to Ctrl+F).
     focus_replace: bool,
+    /// Find-bar matching mode toggles. These are the SINGLE source of the
+    /// `scribe_core::search::Query` flags for every find-bar-owned surface —
+    /// the highlight/counter scan (`find_matches_active`), navigation, and
+    /// both Replace buttons (`replace_in_active`) all build their query from
+    /// [`Self::find_query_flags`], so a toggle moves all of them together.
+    /// Before this existed the bar hard-coded `..Default::default()` (literal,
+    /// case-insensitive, not whole-word) and the README's "full regex" claim
+    /// was unreachable from the UI.
+    ///
+    /// Session state, deliberately not persisted to config: a sticky
+    /// case-sensitive/regex mode across restarts is a well-known footgun (the
+    /// next search silently behaves differently than the user remembers).
+    find_regex: bool,
+    find_case_sensitive: bool,
+    find_whole_word: bool,
+    /// The find bar's inline error line: `Some(msg)` when the current query is
+    /// an invalid regex. Set by [`Self::find_matches_active`] (hence the
+    /// interior mutability — it runs behind `&self` on the render path) and
+    /// rendered under the query field. A bad pattern must show THIS instead of
+    /// silently degrading to a substring search or panicking.
+    find_error: std::cell::RefCell<Option<String>>,
     /// F-038 from docs/audits/overlooked-surfaces-2026-05-29.md: persistent
     /// banner rendered above the editor whenever the config file failed to
     /// parse on launch. Offers "Open config" / "Restore default" / "Dismiss"
@@ -1293,6 +1320,8 @@ impl ScribeApp {
             find_in_files_open: false,
             find_in_files_query: String::new(),
             find_in_files_regex: false,
+            find_in_files_case_sensitive: false,
+            find_in_files_whole_word: false,
             find_in_files_results: Vec::new(),
             find_in_files_error: None,
             focus_find_in_files: false,
@@ -1314,6 +1343,10 @@ impl ScribeApp {
             find_last_query: String::new(),
             replace_query: String::new(),
             focus_replace: false,
+            find_regex: false,
+            find_case_sensitive: false,
+            find_whole_word: false,
+            find_error: std::cell::RefCell::new(None),
             config_error_banner,
             status: format!(
                 "{} — {}",
@@ -2156,7 +2189,12 @@ pub(crate) use render_support::{
     panel_fill, pick_bookmark, spawn_config_watcher, use_rope_editor,
 };
 mod session_io;
+// The Settings → Keyboard page. It lives under `app/` (not beside `settings.rs`)
+// because it reads `keymap`'s token <-> key table and action consts, which are
+// `pub(in crate::app)` — the same tables the live matcher uses, so Settings and
+// the editor can never disagree about what a chord means.
 mod session_persist;
+pub(crate) mod settings_keys;
 mod tab_strip_render;
 mod tabs;
 mod text_analysis;
@@ -2193,6 +2231,9 @@ mod restore_dedup_tests;
 
 #[cfg(test)]
 mod find_nav_tests;
+
+#[cfg(test)]
+mod find_toggle_tests;
 
 #[cfg(test)]
 mod cli_jump_tests;
