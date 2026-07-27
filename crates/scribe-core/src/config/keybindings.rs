@@ -311,6 +311,81 @@ impl Keybindings {
         ]
     }
 
+    /// Every (action-name, MUTABLE combo) pair, in the SAME declaration order as
+    /// [`Keybindings::entries`].
+    ///
+    /// The write half of `entries`, and the reason the settings UI can render one
+    /// row per binding generically instead of hand-listing 35 fields (a list that
+    /// would silently fall behind the schema). `entries_mut_matches_entries` pins
+    /// the two orders together, so a binding added to one and not the other fails
+    /// the suite rather than becoming a row the user can never edit.
+    pub fn entries_mut(&mut self) -> [(&'static str, &mut String); 35] {
+        [
+            ("new_file", &mut self.new_file),
+            ("open_file", &mut self.open_file),
+            ("save", &mut self.save),
+            ("find", &mut self.find),
+            ("find_in_files", &mut self.find_in_files),
+            ("replace", &mut self.replace),
+            ("command_palette", &mut self.command_palette),
+            ("fuzzy_finder", &mut self.fuzzy_finder),
+            ("goto_line", &mut self.goto_line),
+            ("goto_symbol", &mut self.goto_symbol),
+            ("recent_files", &mut self.recent_files),
+            ("close_tab", &mut self.close_tab),
+            ("next_tab", &mut self.next_tab),
+            ("prev_tab", &mut self.prev_tab),
+            ("reopen_tab", &mut self.reopen_tab),
+            ("toggle_grid", &mut self.toggle_grid),
+            ("toggle_comment", &mut self.toggle_comment),
+            ("jump_bracket", &mut self.jump_bracket),
+            ("toggle_fullscreen", &mut self.toggle_fullscreen),
+            ("toggle_zen", &mut self.toggle_zen),
+            ("cycle_theme", &mut self.cycle_theme),
+            ("toggle_minimap", &mut self.toggle_minimap),
+            ("toggle_md_preview", &mut self.toggle_md_preview),
+            ("fold_all", &mut self.fold_all),
+            ("expand_all", &mut self.expand_all),
+            ("increase_font", &mut self.increase_font),
+            ("decrease_font", &mut self.decrease_font),
+            ("reset_font", &mut self.reset_font),
+            ("move_line_up", &mut self.move_line_up),
+            ("move_line_down", &mut self.move_line_down),
+            ("duplicate_line", &mut self.duplicate_line),
+            ("join_lines", &mut self.join_lines),
+            ("toggle_bookmark", &mut self.toggle_bookmark),
+            ("next_bookmark", &mut self.next_bookmark),
+            ("prev_bookmark", &mut self.prev_bookmark),
+        ]
+    }
+
+    /// The combo currently bound to `action`, or `None` when `action` is not a
+    /// binding in this schema.
+    pub fn get(&self, action: &str) -> Option<&str> {
+        self.entries()
+            .into_iter()
+            .find(|(name, _)| *name == action)
+            .map(|(_, combo)| combo)
+    }
+
+    /// Bind `action` to `combo`. Returns `false` (changing nothing) when `action`
+    /// is not a binding in this schema, so a caller can never silently write a
+    /// rebind into a field that does not exist.
+    pub fn set(&mut self, action: &str, combo: &str) -> bool {
+        match self
+            .entries_mut()
+            .into_iter()
+            .find(|(name, _)| *name == action)
+        {
+            Some((_, slot)) => {
+                slot.clear();
+                slot.push_str(combo);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Detect keybinding issues: blank bindings, unparseable combos (both make an
     /// action unreachable), and combos bound to more than one action (collisions).
     /// Returns an empty Vec when the set is clean — the default set is clean by
@@ -375,6 +450,71 @@ mod tests {
             "the default keymap must be conflict-free: {:?}",
             Keybindings::default().validate()
         );
+    }
+
+    #[test]
+    fn entries_mut_matches_entries() {
+        // The read and write halves must agree on NAMES and ORDER, or a settings
+        // row renders one action's label over another action's combo. Compare the
+        // full (name, value) projection: a mis-paired field (e.g. `("save", &mut
+        // self.find)`) changes the value at that index and fails here.
+        let mut kb = Keybindings::default();
+        let read: Vec<(String, String)> = kb
+            .entries()
+            .iter()
+            .map(|(n, c)| ((*n).to_string(), (*c).to_string()))
+            .collect();
+        let write: Vec<(String, String)> = kb
+            .entries_mut()
+            .into_iter()
+            .map(|(n, c)| (n.to_string(), c.clone()))
+            .collect();
+        assert_eq!(read, write, "entries_mut must mirror entries");
+    }
+
+    #[test]
+    fn set_writes_the_binding_that_get_reads_back() {
+        // The round-trip the settings UI depends on: whatever `set` writes for an
+        // action is what `get` (and therefore `entries`, and therefore the input
+        // layer) reads for that action — and no OTHER binding moves.
+        let mut kb = Keybindings::default();
+        let untouched = kb.find.clone();
+        assert!(kb.set("save", "mod+alt+k"), "'save' is a real binding");
+        assert_eq!(kb.get("save"), Some("mod+alt+k"));
+        assert_eq!(kb.save, "mod+alt+k", "the field itself is what changed");
+        assert_eq!(kb.find, untouched, "no other binding may move");
+        // Rebinding twice replaces, never appends.
+        assert!(kb.set("save", "mod+q"));
+        assert_eq!(kb.get("save"), Some("mod+q"));
+        // Unbinding is a legitimate write.
+        assert!(kb.set("save", ""));
+        assert_eq!(kb.get("save"), Some(""));
+    }
+
+    #[test]
+    fn set_and_get_reject_an_action_that_is_not_in_the_schema() {
+        // A typo'd action name must NOT silently write into some other field (or
+        // report success); it is a no-op that says so.
+        let mut kb = Keybindings::default();
+        let before = kb.clone();
+        assert!(!kb.set("sav", "mod+k"), "a typo is not a binding");
+        assert_eq!(kb, before, "a rejected set must change nothing");
+        assert_eq!(kb.get("sav"), None);
+        assert_eq!(kb.get(""), None);
+    }
+
+    #[test]
+    fn get_reads_every_binding_in_the_schema() {
+        // `get` must resolve for EVERY action, not just the first — a `find` that
+        // stopped scanning early would leave later rows uneditable.
+        let kb = Keybindings::default();
+        for (action, combo) in kb.entries() {
+            assert_eq!(
+                kb.get(action),
+                Some(combo),
+                "get('{action}') must read that binding"
+            );
+        }
     }
 
     #[test]
