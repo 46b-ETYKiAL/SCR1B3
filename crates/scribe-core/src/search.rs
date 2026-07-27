@@ -75,23 +75,61 @@ pub fn find_all(text: &str, q: &Query) -> Result<Vec<Match>> {
 }
 
 /// Replace all **non-empty** matches. For regex queries, `$1` capture refs in
-/// `replacement` are honored (regex crate semantics).
+/// `replacement` are honored (regex crate semantics); for LITERAL queries the
+/// replacement is substituted verbatim (a `$1` in the replacement text stays
+/// `$1` — see [`replace_n`]).
+///
+/// Zero-width matches are skipped per the module-level empty-match policy, so
+/// the replacement is never injected between characters.
+pub fn replace_all(text: &str, q: &Query, replacement: &str) -> Result<String> {
+    replace_n(text, q, replacement, None)
+}
+
+/// Replace at most `max` **non-empty** matches (`None` = every match), left to
+/// right. `Some(1)` is the "Replace next" semantics the find bar's single-step
+/// replace button drives; `None` is [`replace_all`].
+///
+/// # Capture expansion is gated on `q.regex`
+///
+/// For a **regex** query, `$1` / `${name}` refs in `replacement` expand with the
+/// regex crate's normal semantics — this is what makes capture-group replacement
+/// (`(\w+)@(\w+)` -> `$2.$1`) work from the find bar.
+///
+/// For a **literal** query the user did not opt into regex syntax, so a `$` in
+/// the replacement must land verbatim: replacing `a` with `$1` in a literal
+/// search must produce the two characters `$1`, not an empty expansion of a
+/// non-existent capture group. The `$` is therefore escaped (`$` -> `$$`, the
+/// regex crate's literal-dollar form) before expansion. Without this gate a
+/// literal replace silently ate `$`-bearing replacement text.
 ///
 /// Zero-width matches are skipped per the module-level empty-match policy, so
 /// the replacement is never injected between characters. The substitution is
 /// driven manually (rather than via [`regex::Regex::replace_all`]) so each
-/// match can be filtered on its span before deciding whether to substitute;
-/// `Captures::expand` provides the same `$N` / `${name}` expansion semantics as
-/// the built-in replacer.
-pub fn replace_all(text: &str, q: &Query, replacement: &str) -> Result<String> {
-    if q.pattern.is_empty() {
+/// match can be filtered on its span — and counted against `max` — before
+/// deciding whether to substitute; `Captures::expand` provides the same
+/// `$N` / `${name}` expansion semantics as the built-in replacer.
+pub fn replace_n(text: &str, q: &Query, replacement: &str, max: Option<usize>) -> Result<String> {
+    if q.pattern.is_empty() || max == Some(0) {
         return Ok(text.to_string());
     }
     let re = build_regex(q)?;
+    // Literal queries never expand capture refs — escape `$` so `expand` emits
+    // the replacement verbatim.
+    let owned;
+    let replacement: &str = if q.regex {
+        replacement
+    } else {
+        owned = replacement.replace('$', "$$");
+        &owned
+    };
 
     let mut out = String::with_capacity(text.len());
     let mut last_end = 0usize;
+    let mut done = 0usize;
     for caps in re.captures_iter(text) {
+        if max.is_some_and(|m| done >= m) {
+            break;
+        }
         // The overall match is group 0; it always exists for a successful
         // capture, so the `unwrap`-free `get(0)` is guaranteed `Some`.
         let m = caps
@@ -108,6 +146,7 @@ pub fn replace_all(text: &str, q: &Query, replacement: &str) -> Result<String> {
         out.push_str(&text[last_end..m.start()]);
         caps.expand(replacement, &mut out);
         last_end = m.end();
+        done += 1;
     }
     out.push_str(&text[last_end..]);
     Ok(out)
@@ -329,6 +368,82 @@ mod tests {
         };
         let out = replace_all("a@b c@d", &query, "$2.$1").unwrap();
         assert_eq!(out, "b.a d.c");
+    }
+
+    // --- `replace_n` bound + literal-`$` gating -----------------------------
+
+    #[test]
+    fn replace_n_one_substitutes_only_the_first_match() {
+        // "Replace next" semantics: exactly one substitution, the rest verbatim.
+        let out = replace_n("alpha alpha alpha", &q("alpha"), "beta", Some(1)).unwrap();
+        assert_eq!(out, "beta alpha alpha");
+    }
+
+    #[test]
+    fn replace_n_none_is_replace_all() {
+        assert_eq!(
+            replace_n("alpha alpha", &q("alpha"), "beta", None).unwrap(),
+            replace_all("alpha alpha", &q("alpha"), "beta").unwrap()
+        );
+    }
+
+    #[test]
+    fn replace_n_zero_is_identity() {
+        assert_eq!(
+            replace_n("alpha alpha", &q("alpha"), "beta", Some(0)).unwrap(),
+            "alpha alpha"
+        );
+    }
+
+    #[test]
+    fn replace_n_cap_above_match_count_replaces_everything() {
+        assert_eq!(replace_n("a a a", &q("a"), "b", Some(99)).unwrap(), "b b b");
+    }
+
+    #[test]
+    fn replace_n_one_skips_zero_width_before_counting() {
+        // `a*` matches empty at offset 0 of "ba"; the empty hit must not consume
+        // the single-replacement budget — the real "a" run must still be hit.
+        let out = replace_n("ba", &rq("a*"), "X", Some(1)).unwrap();
+        assert_eq!(out, "bX");
+    }
+
+    #[test]
+    fn replace_n_first_match_under_regex_expands_captures() {
+        let query = Query {
+            pattern: r"(\w+)@(\w+)".into(),
+            regex: true,
+            ..Default::default()
+        };
+        let out = replace_n("a@b c@d", &query, "$2.$1", Some(1)).unwrap();
+        assert_eq!(out, "b.a c@d");
+    }
+
+    #[test]
+    fn literal_query_does_not_expand_dollar_refs() {
+        // A LITERAL search must splice the replacement verbatim: `$1` is two
+        // characters, not an expansion of a non-existent capture group. Before
+        // the `q.regex` gate this silently produced "X" (the group-1 expansion
+        // of nothing) and ate the user's text.
+        let out = replace_all("a", &q("a"), "$1").unwrap();
+        assert_eq!(out, "$1", "a literal replacement must not expand `$1`");
+        let out2 = replace_all("cost", &q("cost"), "$5.00").unwrap();
+        assert_eq!(out2, "$5.00", "a literal `$5.00` must survive intact");
+    }
+
+    #[test]
+    fn regex_query_still_expands_dollar_refs() {
+        // The gate must not disable capture expansion for real regex queries.
+        let query = Query {
+            pattern: r"(\w+)@(\w+)".into(),
+            regex: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            replace_all("a@b", &query, "$2.$1").unwrap(),
+            "b.a",
+            "regex mode must still expand capture refs"
+        );
     }
 
     #[test]
