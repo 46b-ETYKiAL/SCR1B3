@@ -268,4 +268,46 @@ mod tests {
     fn adjacent_links_no_gap() {
         assert_eq!(targets("[[A]][[B]]"), vec!["A", "B"]);
     }
+
+    #[test]
+    fn an_open_bracket_in_the_final_byte_is_not_scanned_past() {
+        // The outer scan must stop at the last index that still HAS a following
+        // byte: `i + 1 < n`. Widening that bound (`<=`) or neutering the `+ 1`
+        // (`i * 1`) lets `i` reach `n - 1`, where `bytes[i + 1]` reads one past
+        // the end. A trailing `[` is the only input that reaches the
+        // short-circuited second half of the opener test at that index, so it
+        // is the exact boundary that distinguishes the correct bound.
+        assert!(extract_wikilinks("dangling [").is_empty());
+        assert_eq!(targets("[[A]] then dangling ["), vec!["A"]);
+    }
+
+    #[test]
+    fn a_single_open_bracket_does_not_open_a_link() {
+        // Only a DOUBLE `[[` opens a link. The opener test must read TWO
+        // distinct bytes (`bytes[i]` and `bytes[i + 1]`); comparing `bytes[i]`
+        // against itself twice would accept this lone `[` and invent a link
+        // whose target is the text up to the stray `]]`.
+        assert!(extract_wikilinks("[not a link]] here").is_empty());
+    }
+
+    #[test]
+    fn an_unclosed_link_ending_in_one_bracket_is_not_a_link() {
+        // Same one-past-the-end boundary as above, but inside `find_close`:
+        // its `j + 1 < bytes.len()` bound must not be widened. A body that ends
+        // in a SINGLE `]` (never closed) is the only shape that reaches the
+        // second half of the `]]` test at the final index.
+        assert!(extract_wikilinks("[[unclosed]").is_empty());
+    }
+
+    #[test]
+    fn a_lone_closing_bracket_inside_the_body_does_not_close_the_link() {
+        // Documented grammar: "A lone `]` does not close the link." `find_close`
+        // must compare two DIFFERENT bytes (`bytes[j]` and `bytes[j + 1]`);
+        // comparing `bytes[j]` against itself would close at the first single
+        // `]` and silently truncate the target from `a]b` to `a`.
+        let links = extract_wikilinks("[[a]b]]");
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].target, "a]b");
+        assert_eq!(&"[[a]b]]"[links[0].start..links[0].end], "[[a]b]]");
+    }
 }
