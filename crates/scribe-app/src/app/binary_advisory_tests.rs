@@ -49,7 +49,10 @@ fn open_path_toasts_the_binary_advisory_for_a_nul_bearing_file() {
     std::fs::write(&bin, b"\x7fELF\x00\x00binary\x00payload").unwrap();
 
     let mut app = test_app();
-    assert!(app.toast.is_none(), "precondition: no toast before the open");
+    assert!(
+        app.toast.is_none(),
+        "precondition: no toast before the open"
+    );
     app.open_path(bin.clone());
 
     let toast = app

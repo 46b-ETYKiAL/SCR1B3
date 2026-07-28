@@ -311,7 +311,9 @@ impl ScribeApp {
     /// OS preference entirely. Gating only the overlay painters is not
     /// "end-to-end"; every consumer must resolve through here.
     pub(super) fn motion_active(&self) -> bool {
-        self.config.motion.effective_enabled(os_reduced_motion_now())
+        self.config
+            .motion
+            .effective_enabled(os_reduced_motion_now())
     }
 
     pub(crate) fn frame_tick(&mut self, ctx: &egui::Context) {
