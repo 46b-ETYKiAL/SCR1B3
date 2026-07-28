@@ -547,4 +547,260 @@ mod tests {
             "with no border the top-left corner is just caption"
         );
     }
+
+    // ---------------------------------------------------------------------
+    // Boundary + arithmetic pinning.
+    //
+    // The tests above prove the ZONES are right; the ones below prove the
+    // ARITHMETIC that produces them is right. Every case here was written to
+    // kill a specific surviving mutant reported by `cargo mutants`: each one
+    // sat on a line the tests above already executed, but at a coordinate no
+    // assertion could tell apart from its neighbour. They are deliberately
+    // "one pixel" tests — that is exactly the class of bug an off-by-one in a
+    // hit test produces, and the only class a coordinate in the middle of a
+    // band can never catch.
+    // ---------------------------------------------------------------------
+
+    /// [`geo`] with a NON-ZERO client origin.
+    ///
+    /// `GetClientRect` always reports 0,0 in production, so every existing case
+    /// runs with `client.left == client.top == 0` — and at that origin
+    /// `x - client.left` and `x + client.left` are the same number. Moving the
+    /// origin is the only thing that pins [`resize_zone`]'s coordinates as
+    /// RELATIVE to the client rect, which is the entire reason those
+    /// subtractions are there.
+    fn offset_geo() -> HitTestGeometry {
+        HitTestGeometry {
+            client: RectPx::new(100, 50, 1100, 750),
+            max_button: None,
+            ..geo()
+        }
+    }
+
+    #[test]
+    fn a_rect_degenerate_in_only_one_axis_is_still_empty() {
+        // `right <= left || bottom <= top`. Every rect the tests above feed to
+        // `is_empty` is degenerate in BOTH axes (0,0,0,0 and the fully inverted
+        // 500,500,100,100), and both disjuncts are then true — which cannot tell
+        // `||` from `&&`. A rect with area in exactly one axis can.
+        assert!(
+            RectPx::new(0, 0, 0, 10).is_empty(),
+            "zero WIDTH alone makes a rect unhittable"
+        );
+        assert!(
+            RectPx::new(0, 0, 10, 0).is_empty(),
+            "zero HEIGHT alone makes a rect unhittable"
+        );
+        assert!(
+            RectPx::new(0, 0, -5, 10).is_empty(),
+            "an inverted horizontal pair alone is empty"
+        );
+        assert!(
+            RectPx::new(0, 0, 10, -5).is_empty(),
+            "an inverted vertical pair alone is empty"
+        );
+        assert!(
+            !RectPx::new(0, 0, 10, 10).is_empty(),
+            "a rect with area in both axes is NOT empty"
+        );
+    }
+
+    #[test]
+    fn a_point_far_outside_a_healthy_client_rect_is_rejected_by_the_guard() {
+        // `client.is_empty() || !client.contains(x, y)`. The existing
+        // outside-the-rect points ((-5,10), (1000,10), …) all sit within a
+        // border's reach of an edge, so even with the guard disabled they land
+        // in a resize band that answers Client anyway — identical verdict, dead
+        // assertion. A point far outside, in FullNonClient (where a band is NOT
+        // rewritten to Client), separates the two: with `&&` the guard stops
+        // firing and the point is classified as a resize corner.
+        let g = geo();
+        assert_eq!(
+            classify(HitTestMode::FullNonClient, &g, 1500, 1500),
+            HitZone::Client,
+            "far past the bottom-right corner is not a resize corner"
+        );
+        assert_eq!(
+            classify(HitTestMode::FullNonClient, &g, -500, -500),
+            HitZone::Client,
+            "far past the top-left corner is not a resize corner"
+        );
+    }
+
+    #[test]
+    fn the_caption_strip_ends_exactly_at_caption_height() {
+        // `y < client.top + caption_height` — exclusive. `geo()`'s strip is
+        // 34px tall at top 0, so row 33 is the last caption row and row 34 is
+        // the first client row. `<=` would steal one row from the editor.
+        let g = geo();
+        assert_eq!(
+            classify(HitTestMode::FullNonClient, &g, 400, 33),
+            HitZone::Caption,
+            "y = caption_height - 1 is the LAST caption row"
+        );
+        assert_eq!(
+            classify(HitTestMode::FullNonClient, &g, 400, 34),
+            HitZone::Client,
+            "y = caption_height is the FIRST client row"
+        );
+    }
+
+    #[test]
+    fn resize_bands_are_measured_relative_to_the_client_origin() {
+        // client = (100,50)..(1100,750). Each point below is 4px inside an edge
+        // OF THAT RECT. Adding the origin instead of subtracting it puts every
+        // one of them ~100-200px inside the window — nowhere near a band — so
+        // the whole window would stop being resizable on an offset client rect.
+        let g = offset_geo();
+        assert_eq!(
+            classify(HitTestMode::FullNonClient, &g, 104, 350),
+            HitZone::Left,
+            "4px inside the offset LEFT edge"
+        );
+        assert_eq!(
+            classify(HitTestMode::FullNonClient, &g, 500, 54),
+            HitZone::Top,
+            "4px inside the offset TOP edge"
+        );
+        assert_eq!(
+            classify(HitTestMode::FullNonClient, &g, 1095, 350),
+            HitZone::Right,
+            "4px inside the offset RIGHT edge"
+        );
+        assert_eq!(
+            classify(HitTestMode::FullNonClient, &g, 500, 745),
+            HitZone::Bottom,
+            "4px inside the offset BOTTOM edge"
+        );
+    }
+
+    #[test]
+    fn the_right_and_bottom_bands_start_at_the_exact_pixel_the_width_implies() {
+        // `client.right - 1 - x` is a distance from the LAST pixel (999), not
+        // from the exclusive edge (1000). With border 8 the right band is
+        // therefore x = 992..=999 and the bottom band y = 692..=699. The
+        // existing cases (997, 697) sit two pixels deep, where every off-by-one
+        // form of that expression still answers "in the band". 992/692 is the
+        // first pixel of each band and 991/691 the last pixel before it, so an
+        // off-by-one in either direction moves the answer.
+        let g = geo();
+        assert_eq!(
+            classify(HitTestMode::FullNonClient, &g, 992, 350),
+            HitZone::Right,
+            "x = 992 is the FIRST pixel of the right band"
+        );
+        assert_eq!(
+            classify(HitTestMode::FullNonClient, &g, 991, 350),
+            HitZone::Client,
+            "x = 991 is one pixel BEFORE the right band"
+        );
+        assert_eq!(
+            classify(HitTestMode::FullNonClient, &g, 500, 692),
+            HitZone::Bottom,
+            "y = 692 is the FIRST pixel of the bottom band"
+        );
+        assert_eq!(
+            classify(HitTestMode::FullNonClient, &g, 500, 691),
+            HitZone::Client,
+            "y = 691 is one pixel BEFORE the bottom band"
+        );
+    }
+
+    #[test]
+    fn the_left_band_ends_exactly_at_border() {
+        // `l < border` — exclusive. With border 8 the left band is x = 0..=7.
+        let g = geo();
+        assert_eq!(
+            classify(HitTestMode::FullNonClient, &g, 7, 350),
+            HitZone::Left,
+            "x = border - 1 is the LAST left-band pixel"
+        );
+        assert_eq!(
+            classify(HitTestMode::FullNonClient, &g, 8, 350),
+            HitZone::Client,
+            "x = border is already client area"
+        );
+    }
+
+    #[test]
+    fn the_corner_squares_end_exactly_at_corner() {
+        // `l < corner` (and its r/t/b siblings) — exclusive. With corner 12 the
+        // corner square covers 0..=11 along each axis; at exactly 12 the point
+        // is a straight EDGE, not a corner. `corners_beat_edges` brackets this
+        // at 10 and 20, which leaves the actual boundary (11 vs 12) untested in
+        // all four directions.
+        let g = geo();
+        assert_eq!(
+            classify(HitTestMode::FullNonClient, &g, 11, 3),
+            HitZone::TopLeft,
+            "l = corner - 1 is still inside the top-left square"
+        );
+        assert_eq!(
+            classify(HitTestMode::FullNonClient, &g, 12, 3),
+            HitZone::Top,
+            "l = corner is past the top-left square"
+        );
+        assert_eq!(
+            classify(HitTestMode::FullNonClient, &g, 988, 3),
+            HitZone::TopRight,
+            "r = corner - 1 is still inside the top-right square"
+        );
+        assert_eq!(
+            classify(HitTestMode::FullNonClient, &g, 987, 3),
+            HitZone::Top,
+            "r = corner is past the top-right square"
+        );
+        assert_eq!(
+            classify(HitTestMode::FullNonClient, &g, 3, 11),
+            HitZone::TopLeft,
+            "t = corner - 1 is still inside the top-left square"
+        );
+        assert_eq!(
+            classify(HitTestMode::FullNonClient, &g, 3, 12),
+            HitZone::Left,
+            "t = corner is past the top-left square"
+        );
+        assert_eq!(
+            classify(HitTestMode::FullNonClient, &g, 3, 688),
+            HitZone::BottomLeft,
+            "b = corner - 1 is still inside the bottom-left square"
+        );
+        assert_eq!(
+            classify(HitTestMode::FullNonClient, &g, 3, 687),
+            HitZone::Left,
+            "b = corner is past the bottom-left square"
+        );
+    }
+
+    #[test]
+    fn each_corner_is_reachable_from_either_of_its_two_arms() {
+        // Each corner is `(edge_a && within_corner_b) || (edge_b &&
+        // within_corner_a)` — an L, not a square, and the two arms are NOT
+        // interchangeable. Every existing corner case satisfies BOTH arms (the
+        // exact corner pixels 0,0 / 999,0 / …), which cannot tell `||` from
+        // `&&`. Each point below satisfies exactly ONE arm: it is inside one
+        // band and only inside the OTHER axis's corner square, so `&&` demotes
+        // it from a corner to a plain edge.
+        let g = geo();
+        assert_eq!(
+            classify(HitTestMode::FullNonClient, &g, 989, 3),
+            HitZone::TopRight,
+            "on the top band, within the corner square horizontally only"
+        );
+        assert_eq!(
+            classify(HitTestMode::FullNonClient, &g, 3, 689),
+            HitZone::BottomLeft,
+            "on the left band, within the corner square vertically only"
+        );
+        assert_eq!(
+            classify(HitTestMode::FullNonClient, &g, 989, 694),
+            HitZone::BottomRight,
+            "on the bottom band, within the corner square horizontally only"
+        );
+        assert_eq!(
+            classify(HitTestMode::FullNonClient, &g, 10, 3),
+            HitZone::TopLeft,
+            "on the top band, within the corner square horizontally only"
+        );
+    }
 }

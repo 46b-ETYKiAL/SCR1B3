@@ -355,14 +355,29 @@ jobs:
         # the suite still green. Fix the test, or document the mutant as
         # equivalent (see apply.rs for the precedent) — do not silence the job.
         #
-        # The one `--exclude` below is NOT a silencing: `integration/windows.rs`
-        # is `#[cfg(windows)]`, so it is not compiled on this ubuntu runner and
-        # 100% of its mutants are vacuous MISSES that no test could ever kill.
-        # Adding a file here to make a REAL survivor go away is silencing; see
-        # the job comment above, and the test that pins this one's premise.
+        # The two `--exclude`s below are NOT silencing. Each names a file that is
+        # reached ONLY through a `#[cfg(windows)]` declaration, so on this ubuntu
+        # runner none of its lines are compiled: mutating them changes nothing
+        # that builds, no test can fail, and 100% of their mutants are vacuous
+        # MISSES no test could ever kill. Adding a file here to make a REAL
+        # survivor go away is silencing; see the job comment above, and the test
+        # that pins each one's premise.
+        #
+        #  * `integration/windows.rs`        — pinned by
+        #    `windows_module_is_cfg_gated_so_the_mutation_exclusion_stays_honest`
+        #  * `scribe-win32-chrome/src/imp.rs` — pinned by
+        #    `the_windows_only_module_is_cfg_gated_so_the_mutation_exclusion_stays_honest`
+        #
+        # `imp.rs` was extracted out of `scribe-win32-chrome/src/lib.rs` for
+        # exactly this reason: the Win32 body lived inline as a `#[cfg(windows)]
+        # mod imp { … }` spanning ~1,100 lines, so it could not be excluded
+        # without also excluding the handful of `#[cfg(not(windows))]` stubs in
+        # the same file — which DO compile here and whose mutants ARE real. The
+        # split keeps every compiled line of `lib.rs` under mutation.
         run: >
           cargo mutants --in-diff pr.diff --test-tool nextest --timeout 300 --in-place
           --exclude '**/src/integration/windows.rs'
+          --exclude '**/scribe-win32-chrome/src/imp.rs'
 
   mutation:
     # Mutation testing (cargo-mutants) over scribe-core — too slow to gate every
