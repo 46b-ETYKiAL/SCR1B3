@@ -56,7 +56,7 @@ mod tests {
         // A vault path set on the root Config survives a TOML round-trip, and a
         // config that predates the section backfills to "no vault".
         let mut c = Config::default();
-        c.notes.vault_dir = Some(PathBuf::from("/home/user/notes"));
+        c.notes.vault_dir = Some(PathBuf::from("/vault/notes"));
         let back = Config::from_toml_str(&c.to_toml_string()).unwrap();
         assert_eq!(back.notes.vault_dir, c.notes.vault_dir);
 
