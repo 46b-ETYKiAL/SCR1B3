@@ -487,4 +487,488 @@ mod tests {
         // Caret comfortably centred -> no nudge.
         assert_eq!(caret_edge_nudge(300.0, vp(), margin, line), 0.0);
     }
+
+    // ---------------------------------------------------------------------
+    // Exact-boundary probes for the two edge-band predicates.
+    //
+    // `>` vs `>=` and `<` vs `<=` differ ONLY at the exact boundary value, and
+    // on a TALL viewport (`vp()`, 400px) the boundary case degenerates to
+    // "depth 0 -> 0.0" either way. A pane SHORTER than two margins makes the
+    // two bands overlap, which is where the choice of predicate is really
+    // load-bearing — and is a real layout (a 40px editor strip).
+    // ---------------------------------------------------------------------
+
+    /// A 40px-tall pane: shorter than `2 * EDGE_MARGIN`, so the top and bottom
+    /// autoscroll bands overlap.
+    fn short_vp() -> egui::Rect {
+        egui::Rect::from_min_max(egui::pos2(0.0, 100.0), egui::pos2(400.0, 140.0))
+    }
+
+    #[test]
+    fn edge_step_at_the_exact_bottom_boundary_still_pans_up_on_a_short_pane() {
+        // y == bottom - EDGE_MARGIN => over_bottom == 0.0 EXACTLY. The real `>`
+        // rejects the bottom band and falls through to the top band, which on a
+        // 40px pane is still 16px deep -> a real UPWARD pan. The `>= 0.0`
+        // mutant takes the bottom branch at depth 0 and returns 0.0, so the
+        // drag would stop auto-panning inside a short pane.
+        let dt = 1.0 / 60.0;
+        let y = short_vp().bottom() - EDGE_MARGIN; // 112.0
+        let got = edge_autoscroll_step(y, short_vp(), dt);
+        let depth = (short_vp().top() + EDGE_MARGIN) - y; // 16.0
+        let want = -(depth / EDGE_MARGIN) * (depth / EDGE_MARGIN) * EDGE_MAX_SPEED * dt;
+        assert!(
+            got < 0.0,
+            "must still pan UP at the overlapped boundary, got {got}"
+        );
+        assert!((got - want).abs() < 1e-3, "got {got}, want {want}");
+    }
+
+    #[test]
+    fn edge_step_neutral_band_returns_positive_zero_not_a_direction_branch_zero() {
+        // At y == top + EDGE_MARGIN, `over_top` is exactly 0.0: the real `>`
+        // rejects BOTH bands and returns the literal `0.0`. The `>= 0.0` mutant
+        // ENTERS the top branch with depth 0 and computes
+        // `-1.0 * 0.0 * 0.0 * SPEED * dt`, which is `-0.0`. `-0.0 == 0.0`, so
+        // the branch actually taken is observable only through the sign bit.
+        let got = edge_autoscroll_step(vp().top() + EDGE_MARGIN, vp(), 1.0 / 60.0);
+        assert_eq!(got, 0.0);
+        assert!(
+            got.is_sign_positive(),
+            "the neutral band returns the literal +0.0, never a signed zero \
+             produced by entering a direction branch at zero depth"
+        );
+    }
+
+    #[test]
+    fn caret_nudge_at_the_exact_top_limit_falls_through_to_the_bottom_rule() {
+        // On a short pane the keep-away bands overlap (top_limit > bot_limit).
+        // At caret == top_limit the real `<` is FALSE, so the bottom rule
+        // applies and pushes the view down by (caret - bot_limit). The `<=`
+        // mutant takes the top branch and returns 0.0 — the caret would never
+        // be framed out of the bottom margin on a short pane.
+        let (margin, line) = (16.0, 16.0);
+        let top_limit = short_vp().top() + margin + line; // 132.0
+        let bot_limit = short_vp().bottom() - margin; // 124.0
+        assert!(
+            top_limit > bot_limit,
+            "fixture must overlap the bands (top {top_limit}, bot {bot_limit})"
+        );
+        assert_eq!(
+            caret_edge_nudge(top_limit, short_vp(), margin, line),
+            top_limit - bot_limit
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // `page_key_assist` — PageUp / PageDown for the `TextEdit` path.
+    // ---------------------------------------------------------------------
+
+    /// A config whose editor line is EXACTLY 40px (20.0 x 2.0), so `line_px`,
+    /// the derived row count, and the pan distance are all exact integers and
+    /// the `*`->`+` (22px) / `*`->`/` (10px) mutants land on visibly different
+    /// row counts. Both values are inside the config clamps ([6, 96], [0.8, 4]).
+    fn page_config() -> scribe_core::config::Config {
+        let mut cfg = scribe_core::config::Config::default();
+        cfg.editor.first_run_completed = true;
+        cfg.fonts.editor_size = 20.0;
+        cfg.fonts.line_height = 2.0;
+        cfg
+    }
+
+    /// 400px tall => `rows = floor(400 / 40) - 1 = 9` (one row of overlap).
+    fn page_viewport() -> egui::Rect {
+        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(600.0, 400.0))
+    }
+
+    const PAGE_ROWS: f32 = 9.0;
+    const PAGE_LINE_PX: f32 = 40.0;
+
+    /// 30 single-word lines, so a 9-row page always has somewhere to go.
+    fn page_text() -> String {
+        (0..30)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Char index of the first char of `line` in [`page_text`].
+    fn line_start(line: usize) -> usize {
+        page_text()
+            .split('\n')
+            .take(line)
+            .map(|l| l.chars().count() + 1)
+            .sum()
+    }
+
+    fn page_app(ctx: &egui::Context, id: egui::Id, caret_line: usize) -> ScribeApp {
+        let mut app = ScribeApp::new_test(page_config());
+        app.tabs[app.active].text = page_text();
+        set_caret(ctx, id, line_start(caret_line));
+        app
+    }
+
+    /// Store a collapsed caret at char index `at` under `editor_id`.
+    fn set_caret(ctx: &egui::Context, editor_id: egui::Id, at: usize) {
+        let mut st = egui::TextEdit::load_state(ctx, editor_id).unwrap_or_default();
+        st.cursor.set_char_range(Some(egui::text::CCursorRange::one(
+            egui::text::CCursor::new(at),
+        )));
+        st.store(ctx, editor_id);
+    }
+
+    /// `(anchor, head)` of the stored caret range.
+    fn caret_of(ctx: &egui::Context, editor_id: egui::Id) -> (usize, usize) {
+        let st = egui::TextEdit::load_state(ctx, editor_id).expect("TextEditState stored");
+        let r = st.cursor.char_range().expect("a char range");
+        (r.secondary.index, r.primary.index)
+    }
+
+    /// Drive exactly ONE egui pass in which `editor_id` (optionally) holds
+    /// focus, `keys` are pressed, and `page_key_assist` runs — the focus
+    /// request and the key event must be live in the SAME pass the assist reads.
+    fn run_page_keys(
+        app: &mut ScribeApp,
+        ctx: &egui::Context,
+        editor_id: egui::Id,
+        keys: &[egui::Key],
+        shift: bool,
+        focus: bool,
+    ) {
+        let modifiers = egui::Modifiers {
+            shift,
+            ..Default::default()
+        };
+        let input = egui::RawInput {
+            modifiers,
+            events: keys
+                .iter()
+                .map(|k| egui::Event::Key {
+                    key: *k,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let vp = page_viewport();
+        let mut passes = 0_u32;
+        let _ = ctx.run(input, |ctx| {
+            passes += 1;
+            if focus {
+                ctx.memory_mut(|m| m.request_focus(editor_id));
+            }
+            app.page_key_assist(ctx, editor_id, vp);
+        });
+        assert_eq!(passes, 1, "the harness must drive exactly one egui pass");
+    }
+
+    #[test]
+    fn page_down_moves_the_caret_one_page_and_pans_by_the_same_rows() {
+        let ctx = egui::Context::default();
+        let id = egui::Id::new("page-editor");
+        let mut app = page_app(&ctx, id, 0);
+        app.scroll_metrics = (100.0, 4000.0, 400.0); // max_off = 3600
+        run_page_keys(&mut app, &ctx, id, &[egui::Key::PageDown], false, true);
+
+        let (anchor, head) = caret_of(&ctx, id);
+        assert_eq!(head, line_start(9), "caret pages down exactly 9 rows");
+        assert_eq!(anchor, head, "an unshifted page collapses the selection");
+        // Pan by the SAME distance the caret travelled, so it keeps its row.
+        assert_eq!(
+            app.pending_scroll,
+            Some(100.0 + PAGE_ROWS * PAGE_LINE_PX),
+            "viewport pans by rows x line_px"
+        );
+    }
+
+    #[test]
+    fn shift_page_down_extends_the_selection_from_the_anchor() {
+        let ctx = egui::Context::default();
+        let id = egui::Id::new("page-editor");
+        let mut app = page_app(&ctx, id, 3);
+        app.scroll_metrics = (0.0, 4000.0, 400.0);
+        run_page_keys(&mut app, &ctx, id, &[egui::Key::PageDown], true, true);
+
+        let (anchor, head) = caret_of(&ctx, id);
+        assert_eq!(anchor, line_start(3), "the anchor stays put under Shift");
+        assert_eq!(head, line_start(12), "the head pages down 9 rows");
+    }
+
+    #[test]
+    fn page_up_moves_the_caret_up_a_page_and_pans_back() {
+        let ctx = egui::Context::default();
+        let id = egui::Id::new("page-editor");
+        let mut app = page_app(&ctx, id, 20);
+        app.scroll_metrics = (1000.0, 4000.0, 400.0);
+        run_page_keys(&mut app, &ctx, id, &[egui::Key::PageUp], false, true);
+
+        assert_eq!(caret_of(&ctx, id).1, line_start(11), "up 9 rows, not down");
+        assert_eq!(
+            app.pending_scroll,
+            Some(1000.0 - PAGE_ROWS * PAGE_LINE_PX),
+            "PageUp pans toward the document START (dir == -1)"
+        );
+    }
+
+    #[test]
+    fn both_page_keys_in_one_frame_are_ignored() {
+        let ctx = egui::Context::default();
+        let id = egui::Id::new("page-editor");
+        let mut app = page_app(&ctx, id, 10);
+        app.scroll_metrics = (500.0, 4000.0, 400.0);
+        run_page_keys(
+            &mut app,
+            &ctx,
+            id,
+            &[egui::Key::PageUp, egui::Key::PageDown],
+            false,
+            true,
+        );
+        assert_eq!(app.pending_scroll, None, "ambiguous frame pans nothing");
+        assert_eq!(
+            caret_of(&ctx, id).1,
+            line_start(10),
+            "ambiguous frame moves no caret"
+        );
+    }
+
+    #[test]
+    fn page_keys_do_nothing_without_editor_focus() {
+        let ctx = egui::Context::default();
+        let id = egui::Id::new("page-editor");
+        let mut app = page_app(&ctx, id, 4);
+        app.scroll_metrics = (200.0, 4000.0, 400.0);
+        run_page_keys(&mut app, &ctx, id, &[egui::Key::PageDown], false, false);
+        assert_eq!(app.pending_scroll, None, "unfocused editor never pages");
+        assert_eq!(caret_of(&ctx, id).1, line_start(4), "caret untouched");
+    }
+
+    #[test]
+    fn a_page_already_at_the_document_end_moves_the_caret_but_queues_no_pan() {
+        // max_off == 500 and off_y == 500: the pan target CLAMPS back onto the
+        // current offset, so there is nothing to scroll. The caret must still
+        // page (navigation is not gated on the viewport having room).
+        let ctx = egui::Context::default();
+        let id = egui::Id::new("page-editor");
+        let mut app = page_app(&ctx, id, 0);
+        app.scroll_metrics = (500.0, 900.0, 400.0);
+        run_page_keys(&mut app, &ctx, id, &[egui::Key::PageDown], false, true);
+        assert_eq!(caret_of(&ctx, id).1, line_start(9), "the caret still pages");
+        assert_eq!(
+            app.pending_scroll, None,
+            "clamped onto the current offset -> no pan queued"
+        );
+    }
+
+    #[test]
+    fn a_page_never_pans_when_the_content_fits_the_viewport() {
+        // content_h == view_h -> max_off == 0. A stale non-zero `off_y` must NOT
+        // be "corrected" to 0 by the page pan (`> 0.0` -> `>= 0.0` would queue
+        // Some(0.0) and yank an already-correct viewport to the top).
+        let ctx = egui::Context::default();
+        let id = egui::Id::new("page-editor");
+        let mut app = page_app(&ctx, id, 0);
+        app.scroll_metrics = (50.0, 400.0, 400.0);
+        run_page_keys(&mut app, &ctx, id, &[egui::Key::PageDown], false, true);
+        assert_eq!(caret_of(&ctx, id).1, line_start(9), "the caret still pages");
+        assert_eq!(app.pending_scroll, None, "content fits -> nothing to pan");
+    }
+
+    #[test]
+    fn a_sub_epsilon_page_pan_is_below_the_denoise_threshold() {
+        // max_off is EXACTLY f32::EPSILON (1.0 + EPSILON is representable and
+        // (1.0 + EPSILON) - 1.0 == EPSILON), so the clamped target sits one ULP
+        // from off_y == 0 — the `> f32::EPSILON` boundary. `>=` would queue a
+        // one-ULP pan every page keypress.
+        let ctx = egui::Context::default();
+        let id = egui::Id::new("page-editor");
+        let mut app = page_app(&ctx, id, 0);
+        app.scroll_metrics = (0.0, 1.0 + f32::EPSILON, 1.0);
+        assert_eq!(
+            (1.0f32 + f32::EPSILON) - 1.0,
+            f32::EPSILON,
+            "fixture: max_off must be exactly one ULP"
+        );
+        run_page_keys(&mut app, &ctx, id, &[egui::Key::PageDown], false, true);
+        assert_eq!(caret_of(&ctx, id).1, line_start(9), "the caret still pages");
+        assert_eq!(app.pending_scroll, None, "a one-ULP move is not motion");
+    }
+
+    #[test]
+    fn page_keys_are_not_caret_frame_nav_keys() {
+        // Pins the deliberate ABSENCE of PageUp/PageDown from the scroll-off
+        // assist's trigger set: `page_key_assist` owns its own pan, and framing
+        // a page move off this frame's STALE galley geometry re-introduces the
+        // "page then jitter" bug.
+        assert!(!CARET_FRAME_NAV_KEYS.contains(&egui::Key::PageUp));
+        assert!(!CARET_FRAME_NAV_KEYS.contains(&egui::Key::PageDown));
+        assert!(CARET_FRAME_NAV_KEYS.contains(&egui::Key::ArrowUp));
+        assert!(CARET_FRAME_NAV_KEYS.contains(&egui::Key::ArrowDown));
+        assert!(CARET_FRAME_NAV_KEYS.contains(&egui::Key::Home));
+        assert!(CARET_FRAME_NAV_KEYS.contains(&egui::Key::End));
+    }
+
+    // ---------------------------------------------------------------------
+    // The embedded-scroll bridge (`drive_embedded_scroll` /
+    // `finish_embedded_scroll` / the two id derivations).
+    // ---------------------------------------------------------------------
+
+    /// A headless `RawInput` with a real screen rect, so panels get a size.
+    fn ui_input() -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(800.0, 600.0),
+            )),
+            ..Default::default()
+        }
+    }
+
+    /// Run `f` inside a real `Ui` for exactly one egui pass.
+    fn with_ui<R>(ctx: &egui::Context, mut f: impl FnMut(&mut egui::Ui) -> R) -> R {
+        let mut out = None;
+        let _ = ctx.run(ui_input(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                out = Some(f(ui));
+            });
+        });
+        out.expect("the CentralPanel body ran")
+    }
+
+    #[test]
+    fn a_queued_scroll_is_pushed_into_a_widget_owned_scroll_area() {
+        // The end-to-end contract: `pending_scroll` + `embedded_scroll_id` must
+        // land on the SAME state key an un-salted `ScrollArea` persists under,
+        // so a find-navigate / go-to-line really moves a `RopeEditor` viewport.
+        let ctx = egui::Context::default();
+        let mut app = ScribeApp::new_test(page_config());
+
+        let id = with_ui(&ctx, |ui| {
+            let id = embedded_scroll_id(ui, DEFAULT_SCROLL_SALT);
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                ui.allocate_space(egui::vec2(10.0, 5000.0));
+            });
+            id
+        });
+
+        app.pending_scroll = Some(321.0);
+        app.drive_embedded_scroll(&ctx, id);
+        assert!(
+            app.pending_scroll.is_none(),
+            "the queued offset is CONSUMED, not re-applied every frame"
+        );
+        let st = egui::scroll_area::State::load(&ctx, id).expect("scroll state written");
+        assert_eq!(st.offset.y, 321.0);
+
+        // …and the real widget adopts it on its next pass.
+        let seen = with_ui(&ctx, |ui| {
+            egui::ScrollArea::vertical()
+                .show(ui, |ui| {
+                    ui.allocate_space(egui::vec2(10.0, 5000.0));
+                })
+                .state
+                .offset
+                .y
+        });
+        assert!(
+            (seen - 321.0).abs() < 1.0,
+            "the ScrollArea really moved to the queued offset, got {seen}"
+        );
+    }
+
+    #[test]
+    fn drive_embedded_scroll_clamps_a_negative_queued_offset_to_zero() {
+        let ctx = egui::Context::default();
+        let mut app = ScribeApp::new_test(page_config());
+        let id = egui::Id::new("emb-scroll-neg");
+        app.pending_scroll = Some(-50.0);
+        app.drive_embedded_scroll(&ctx, id);
+        let st = egui::scroll_area::State::load(&ctx, id).expect("scroll state written");
+        assert_eq!(st.offset.y, 0.0, "a negative offset is clamped, not stored");
+    }
+
+    #[test]
+    fn drive_embedded_scroll_is_a_no_op_with_nothing_queued() {
+        let ctx = egui::Context::default();
+        let mut app = ScribeApp::new_test(page_config());
+        let id = egui::Id::new("emb-scroll-empty");
+        app.pending_scroll = None;
+        app.drive_embedded_scroll(&ctx, id);
+        assert!(
+            egui::scroll_area::State::load(&ctx, id).is_none(),
+            "no queued offset must not fabricate a scroll state"
+        );
+    }
+
+    #[test]
+    fn finish_embedded_scroll_records_the_metrics_the_minimap_reads() {
+        let ctx = egui::Context::default();
+        let mut app = ScribeApp::new_test(page_config());
+        let scroll_id = egui::Id::new("emb-metrics");
+        let focus_id = egui::Id::new("emb-focus");
+        let mut st = egui::scroll_area::State::default();
+        st.offset.y = 137.0;
+        st.store(&ctx, scroll_id);
+
+        let viewport = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(300.0, 450.0));
+        app.scroll_metrics = (0.0, 1.0, 1.0);
+        app.finish_embedded_scroll(&ctx, scroll_id, focus_id, viewport, 2400.0);
+        assert_eq!(
+            app.scroll_metrics,
+            (137.0, 2400.0, 450.0),
+            "(live offset, real content height, viewport height)"
+        );
+    }
+
+    #[test]
+    fn finish_embedded_scroll_floors_content_and_view_height_at_one() {
+        // A zero content height would make the minimap divide by zero.
+        let ctx = egui::Context::default();
+        let mut app = ScribeApp::new_test(page_config());
+        let scroll_id = egui::Id::new("emb-metrics-zero");
+        let empty = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(0.0, 0.0));
+        app.finish_embedded_scroll(&ctx, scroll_id, egui::Id::new("f"), empty, 0.0);
+        assert_eq!(app.scroll_metrics, (0.0, 1.0, 1.0));
+    }
+
+    #[test]
+    fn the_two_embedded_ids_are_derived_from_the_ui_not_constants() {
+        let ctx = egui::Context::default();
+        let (scroll_a, focus_a, other_salt, panel_id) = with_ui(&ctx, |ui| {
+            (
+                embedded_scroll_id(ui, DEFAULT_SCROLL_SALT),
+                rope_editor_focus_id(ui),
+                embedded_scroll_id(ui, "some-other-salt"),
+                ui.id(),
+            )
+        });
+        // Mirrors `ScrollArea::begin`'s `ui.make_persistent_id(id_salt)` and
+        // `RopeEditor::show_editable`'s `ui.id().with("scr1b3-rope-editable")`.
+        assert_eq!(scroll_a, panel_id.with(egui::Id::new(DEFAULT_SCROLL_SALT)));
+        assert_eq!(focus_a, panel_id.with("scr1b3-rope-editable"));
+        // Distinct salts / roles never collide…
+        assert_ne!(scroll_a, other_salt);
+        assert_ne!(scroll_a, focus_a);
+        assert_ne!(focus_a, panel_id);
+
+        // …and both are a function of the Ui: a DIFFERENT ui yields different
+        // ids (a constant would collide across every scroll surface, so every
+        // embedded editor would fight over one scroll state).
+        let (scroll_b, focus_b) = {
+            let mut out = None;
+            let _ = ctx.run(ui_input(), |ctx| {
+                egui::SidePanel::left("other-panel").show(ctx, |ui| {
+                    out = Some((
+                        embedded_scroll_id(ui, DEFAULT_SCROLL_SALT),
+                        rope_editor_focus_id(ui),
+                    ));
+                });
+            });
+            out.expect("the SidePanel body ran")
+        };
+        assert_ne!(scroll_a, scroll_b, "scroll ids are per-Ui, not global");
+        assert_ne!(focus_a, focus_b, "focus ids are per-Ui, not global");
+    }
 }
