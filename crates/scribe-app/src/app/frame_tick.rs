@@ -10,6 +10,63 @@
 
 use super::*;
 
+/// The OS reduced-motion preference, with a test-only override seam.
+///
+/// The real query is a `user32` call that reports whatever the HOST machine's
+/// "Show animations in Windows" setting happens to be — so a test could neither
+/// force it on nor force it off, and the entire OS-gating wire was therefore
+/// unprotected: cutting it left the whole suite green (that is exactly how an
+/// earlier deliberate break survived into a commit here). This seam lets a test
+/// pin the OS answer and assert the gate really consumes it.
+pub(super) fn os_reduced_motion_now() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = motion_test_hook::get_override() {
+        return forced;
+    }
+    scribe_win32_chrome::os_reduced_motion()
+}
+
+/// Test-only override for [`os_reduced_motion_now`]. Thread-local, so parallel
+/// tests cannot clobber each other's setting.
+#[cfg(test)]
+pub(super) mod motion_test_hook {
+    use std::cell::Cell;
+
+    thread_local! {
+        static FORCED: Cell<Option<bool>> = const { Cell::new(None) };
+    }
+
+    /// Force the OS answer for the current thread. `None` restores the real query.
+    pub(in crate::app) fn set_override(v: Option<bool>) {
+        FORCED.with(|c| c.set(v));
+    }
+
+    pub(super) fn get_override() -> Option<bool> {
+        FORCED.with(Cell::get)
+    }
+
+    /// RAII guard so a panicking test cannot leak its override into the next
+    /// test on the same thread.
+    pub(in crate::app) struct ForcedOsReducedMotion;
+
+    impl ForcedOsReducedMotion {
+        pub(in crate::app) fn on() -> Self {
+            set_override(Some(true));
+            Self
+        }
+        pub(in crate::app) fn off() -> Self {
+            set_override(Some(false));
+            Self
+        }
+    }
+
+    impl Drop for ForcedOsReducedMotion {
+        fn drop(&mut self) {
+            set_override(None);
+        }
+    }
+}
+
 /// ctx-data slot the editor right-click context menu stashes its chosen
 /// [`crate::app::commands::BuiltinCommand`] into, to be drained + dispatched a
 /// frame later where `self` is mutable (the menu closure runs while the
@@ -247,10 +304,14 @@ impl ScribeApp {
     /// setting overrides the in-app toggle. The OS query is a cheap cached
     /// user32 read; on non-Windows it is a `false` constant so motion follows the
     /// toggle only.
-    fn motion_active(&self) -> bool {
-        self.config
-            .motion
-            .effective_enabled(scribe_win32_chrome::os_reduced_motion())
+    /// `pub(super)` so SIBLING modules gate on it too. It was private, and
+    /// `theme_visuals::apply_motion_style` — which drives egui's `animation_time`
+    /// and the NATIVE caret blink, i.e. the widget-layer half of the whole Motion
+    /// feature — therefore still read `config.motion.enabled` raw and ignored the
+    /// OS preference entirely. Gating only the overlay painters is not
+    /// "end-to-end"; every consumer must resolve through here.
+    pub(super) fn motion_active(&self) -> bool {
+        self.config.motion.effective_enabled(os_reduced_motion_now())
     }
 
     pub(crate) fn frame_tick(&mut self, ctx: &egui::Context) {
