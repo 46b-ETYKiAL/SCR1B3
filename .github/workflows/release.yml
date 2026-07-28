@@ -39,7 +39,7 @@ jobs:
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
         with:
           egress-policy: audit
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
@@ -180,12 +180,12 @@ jobs:
         with:
           egress-policy: audit
       - name: Checkout SCR1B3 (assets + licenses)
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: app
           persist-credentials: false
       - name: Checkout installer framework (F0RG3-W1R3)
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: 46b-ETYKiAL/Itasha.Corp_F0RG3-W1R3
           path: framework
@@ -267,7 +267,7 @@ jobs:
         with:
           egress-policy: audit
       - name: Checkout SCR1B3 (packaging + assets)
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: app
           persist-credentials: false
@@ -368,7 +368,7 @@ jobs:
         with:
           egress-policy: audit
       - name: Checkout SCR1B3 (packaging + assets)
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: app
           persist-credentials: false
@@ -453,7 +453,7 @@ jobs:
       # embedded minisign public key from `verify.rs` and verify every signed
       # asset against exactly what the shipped binary's updater will accept.
       - name: Checkout source (for embedded-key self-verify)
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: src
           persist-credentials: false
