@@ -136,14 +136,8 @@ fn build_doc(vault: &Path, path: &Path) -> Option<NoteDoc> {
         .map(|l| l.target)
         .collect();
     let mut body = content;
-    if body.len() > MAX_BODY_KEPT {
-        // Truncate on a char boundary so the retained prefix is valid UTF-8.
-        let mut end = MAX_BODY_KEPT;
-        while end > 0 && !body.is_char_boundary(end) {
-            end -= 1;
-        }
-        body.truncate(end);
-    }
+    let cut = body_cap_end(&body, MAX_BODY_KEPT);
+    body.truncate(cut);
     Some(NoteDoc {
         path: path.to_path_buf(),
         rel_display,
@@ -152,6 +146,26 @@ fn build_doc(vault: &Path, path: &Path) -> Option<NoteDoc> {
         links,
         body,
     })
+}
+
+/// The byte index at which to cut `body` so the kept prefix is at most `max`
+/// bytes AND ends on a `char` boundary (never mid-UTF-8). Returns `body.len()`
+/// when the body already fits, so the caller's `truncate` is then a no-op.
+///
+/// Pure + unit-tested, and deliberately expressed as a reverse boundary SEARCH
+/// rather than a hand-rolled `end -= 1` loop: the loop form has an index-walk
+/// whose off-by-one/step mutations are either unobservable or non-terminating,
+/// so the cut index could regress with nothing to catch it. A wrong answer here
+/// is not cosmetic — `String::truncate` PANICS on a non-boundary index.
+pub(crate) fn body_cap_end(body: &str, max: usize) -> usize {
+    if body.len() <= max {
+        return body.len();
+    }
+    // Index 0 is always a char boundary, so the search always finds one.
+    (0..=max)
+        .rev()
+        .find(|&i| body.is_char_boundary(i))
+        .unwrap_or(0)
 }
 
 /// The vault-relative, `/`-separated display path for `path`. Falls back to the
@@ -201,18 +215,69 @@ fn paths_equal(a: &Path, b: &Path) -> bool {
     scribe_core::path_norm::paths_equal_for_compare(a, b)
 }
 
+/// The backlink rows (path + title) to list for the active note, or an empty
+/// list when either the vault or the active note's path is unknown.
+///
+/// Split out of the pane render so the "no vault OR no file-backed active tab ⇒
+/// no backlinks" rule is pure and unit-testable — inside the render closure its
+/// only evidence would be painted pixels.
+pub(crate) fn backlink_rows(
+    docs: &[NoteDoc],
+    vault: Option<&Path>,
+    active_path: Option<&Path>,
+) -> Vec<(PathBuf, String)> {
+    match (vault, active_path) {
+        (Some(v), Some(ap)) => collect_backlinks(docs, v, ap)
+            .into_iter()
+            .map(|d| (d.path.clone(), d.title.clone()))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Fraction of the pane's remaining height the note LIST scroll area may take,
+/// leaving the rest for the links-out / backlinks sections below it.
+const NOTES_LIST_HEIGHT_FRACTION: f32 = 0.55;
+
+/// Max height of the note-list scroll area given the pane's `available` height.
+/// Extracted so the split is a tested number rather than an inline literal whose
+/// only witness is a rendered frame.
+pub(crate) fn notes_list_height(available: f32) -> f32 {
+    available * NOTES_LIST_HEIGHT_FRACTION
+}
+
+/// Whether the note list should show its "no notes match" hint: only once a
+/// vault IS configured (with no vault the pane already shows the
+/// choose-a-folder prompt, and "no notes match" would misdescribe it) AND the
+/// filter selected nothing.
+pub(crate) fn show_no_match_hint(vault_configured: bool, filtered_len: usize) -> bool {
+    vault_configured && filtered_len == 0
+}
+
+/// Whether the note-list row for `row_path` is the note currently open in the
+/// active tab (drawn selected).
+pub(crate) fn is_active_row(active_path: Option<&Path>, row_path: &Path) -> bool {
+    active_path == Some(row_path)
+}
+
 impl ScribeApp {
     /// Rescan the configured vault into `self.note_index`, recording which vault
     /// the index is for. A no-op (clears the index) when no vault is configured.
+    ///
+    /// There is deliberately no `vault.is_dir()` pre-check: [`scan_vault`] on a
+    /// path that is not a readable directory already yields an empty index and
+    /// the root is recorded either way, so a guard would produce byte-identical
+    /// state on both arms — an untestable branch that only looks like a safety
+    /// net.
     pub(super) fn notes_refresh_index(&mut self) {
         match self.config.notes.vault_dir.clone() {
-            Some(vault) if vault.is_dir() => {
+            Some(vault) => {
                 self.note_index = scan_vault(&vault);
                 self.note_index_root = Some(vault);
             }
-            other => {
+            None => {
                 self.note_index.clear();
-                self.note_index_root = other;
+                self.note_index_root = None;
             }
         }
     }
@@ -303,13 +368,8 @@ impl ScribeApp {
             .get(active)
             .and_then(|t| t.doc.path().map(Path::to_path_buf));
         let outgoing = dedup_link_targets(&active_text);
-        let backlinks: Vec<(PathBuf, String)> = match (&vault, &active_path) {
-            (Some(v), Some(ap)) => collect_backlinks(&self.note_index, v, ap)
-                .into_iter()
-                .map(|d| (d.path.clone(), d.title.clone()))
-                .collect(),
-            _ => Vec::new(),
-        };
+        let backlinks: Vec<(PathBuf, String)> =
+            backlink_rows(&self.note_index, vault.as_deref(), active_path.as_deref());
 
         // Take the filter string out so the text field can borrow it mutably
         // without touching `self` inside the closure.
@@ -379,14 +439,14 @@ impl ScribeApp {
 
                 // ---- the note list ----
                 egui::ScrollArea::vertical()
-                    .max_height(ui.available_height() * 0.55)
+                    .max_height(notes_list_height(ui.available_height()))
                     .id_salt("notes-list-scroll")
                     .show(ui, |ui| {
-                        if vault.is_some() && filtered.is_empty() {
+                        if show_no_match_hint(vault.is_some(), filtered.len()) {
                             ui.label(RichText::new("no notes match").color(muted).small());
                         }
                         for (path, title, rel) in &filtered {
-                            let is_active = active_path.as_deref() == Some(path.as_path());
+                            let is_active = is_active_row(active_path.as_deref(), path.as_path());
                             let row = ui.selectable_label(
                                 is_active,
                                 RichText::new(title).monospace().small(),

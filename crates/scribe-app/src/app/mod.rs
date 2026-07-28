@@ -2242,6 +2242,12 @@ mod cli_jump_tests;
 mod resize_tests;
 
 #[cfg(test)]
+mod chrome_tests;
+
+#[cfg(test)]
+mod notes_ui_tests;
+
+#[cfg(test)]
 mod save_session_tests;
 
 #[cfg(test)]

@@ -69,6 +69,23 @@ thread_local! {
     /// test — the real hover path is `Response::hovered()` / `rect_contains_pointer`.
     pub(super) static TEST_FORCE_GLYPH_HOVER:
         std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Test hook: the policy triple the LAST [`apply_chrome_policy`] call handed
+    /// to `scribe-win32-chrome`. Recorded inside that single helper (never at the
+    /// call site) for the same reason as [`TEST_PUBLISHED_MAX_RECT`] — so a test
+    /// asserts the app's real titlebar render path applies the policy, and would
+    /// fail if that wire were cut.
+    ///
+    /// It records the VALUES, not a call count: each of the three is a deliberate
+    /// choice documented on `apply_chrome_policy`, and the crate exposes no
+    /// reader for them (the setters are `#[cfg(windows)]` no-ops elsewhere), so
+    /// there is no other way to assert what was applied.
+    pub(crate) static TEST_APPLIED_CHROME_POLICY: std::cell::Cell<
+        Option<(
+            scribe_win32_chrome::HitTestMode,
+            bool,
+            scribe_win32_chrome::Backdrop,
+        )>,
+    > = const { std::cell::Cell::new(None) };
 }
 
 /// Hand the maximize/restore button's rect to `scribe-win32-chrome` so
@@ -129,11 +146,14 @@ fn apply_chrome_policy() {
     use std::sync::Once;
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
-        scribe_win32_chrome::set_hit_test_mode(
-            scribe_win32_chrome::HitTestMode::MaximizeButtonOnly,
-        );
-        scribe_win32_chrome::set_snap_support_enabled(true);
-        scribe_win32_chrome::set_backdrop(scribe_win32_chrome::Backdrop::None);
+        let mode = scribe_win32_chrome::HitTestMode::MaximizeButtonOnly;
+        let snap = true;
+        let backdrop = scribe_win32_chrome::Backdrop::None;
+        scribe_win32_chrome::set_hit_test_mode(mode);
+        scribe_win32_chrome::set_snap_support_enabled(snap);
+        scribe_win32_chrome::set_backdrop(backdrop);
+        #[cfg(test)]
+        TEST_APPLIED_CHROME_POLICY.with(|c| c.set(Some((mode, snap, backdrop))));
     });
 }
 
@@ -146,7 +166,7 @@ fn apply_chrome_policy() {
 /// `chrome.rs` code would otherwise run. That is exactly the case the retraction
 /// exists for: fullscreen, zen, and `appearance.frameless == false`.
 #[derive(Default)]
-struct MaximizeRectRetractor;
+pub(super) struct MaximizeRectRetractor;
 
 impl egui::Plugin for MaximizeRectRetractor {
     fn debug_name(&self) -> &'static str {
@@ -169,46 +189,53 @@ impl egui::Plugin for MaximizeRectRetractor {
     }
 }
 
-/// Pop the native window system menu when the user secondary-clicks the
-/// titlebar, excluding the caption buttons themselves.
+/// Where — in SCREEN-space physical pixels — the native window system menu
+/// should pop for a titlebar secondary-click at `pos`, or `None` when that click
+/// must be ignored.
 ///
 /// With `HitTestMode::MaximizeButtonOnly` the titlebar answers `HTCLIENT`, so
 /// Windows never sees a non-client right-click and never pops the menu itself —
-/// the app must do it. Screen coordinates come from the viewport's `inner_rect`
-/// (logical points, screen space) plus the pointer position; when the backend
-/// does not report `inner_rect` we skip rather than pop the menu in the wrong
-/// place.
-fn handle_titlebar_system_menu(ctx: &egui::Context, band: egui::Rect) {
-    // Never steal a right-click that egui is already using for its own popup
-    // (the tab / editor context menus).
-    if ctx.memory(|m| m.any_popup_open()) {
-        return;
-    }
-    let Some(pos) = ctx.input(|i| {
-        i.pointer
-            .button_clicked(egui::PointerButton::Secondary)
-            .then(|| i.pointer.interact_pos())
-            .flatten()
-    }) else {
-        return;
-    };
+/// the app must do it, at the right place. This is the whole decision:
+///
+/// * a click OUTSIDE the recorded titlebar band is not a titlebar right-click;
+/// * a click ON a caption button pops nothing on a native window either, so the
+///   caption-button union is excluded from the band;
+/// * `inner_rect` (the viewport's top-left in logical screen points) plus the
+///   client-space pointer position, scaled by `pixels_per_point`, is the screen
+///   point Win32 wants.
+///
+/// Pure, and separate from the `Context` plumbing in [`caption_btn`], because a
+/// wrong answer here pops the menu in the wrong place (or over a button that
+/// should have swallowed the click) — a defect with no other witness than a live
+/// Windows desktop.
+pub(super) fn system_menu_point(
+    pos: egui::Pos2,
+    band: egui::Rect,
+    caption_union: Option<egui::Rect>,
+    inner_rect: egui::Rect,
+    pixels_per_point: f32,
+) -> Option<(i32, i32)> {
     if !band.contains(pos) {
-        return;
+        return None;
     }
     // A right-click ON a caption button pops nothing on a native window either.
-    if CAPTION_BTN_UNION
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .is_some_and(|r| r.contains(pos))
-    {
-        return;
+    if caption_union.is_some_and(|r| r.contains(pos)) {
+        return None;
     }
-    let Some(inner) = ctx.input(|i| i.viewport().inner_rect) else {
-        return;
-    };
-    let ppp = ctx.pixels_per_point();
-    let screen = (inner.min.to_vec2() + pos.to_vec2()) * ppp;
-    scribe_win32_chrome::show_system_menu(screen.x.round() as i32, screen.y.round() as i32);
+    let screen = (inner_rect.min.to_vec2() + pos.to_vec2()) * pixels_per_point;
+    Some((screen.x.round() as i32, screen.y.round() as i32))
+}
+
+/// Whether a glyph control (a tab's pin / close ✕) paints its hover feedback.
+///
+/// Sensed hover OR a raw pointer-in-rect test. The raw test is not redundant: it
+/// is what keeps the veil lit while an ADJACENT widget (the tab chip, mid-drag)
+/// holds the pointer grab, in which case this control's own
+/// `Response::hovered()` is false and the control would read dead under the
+/// cursor. Extracted so that "either signal lights it" is a tested rule rather
+/// than an inline operator whose only witness is a painted pixel.
+pub(super) fn glyph_is_hovered(sensed: bool, pointer_in_rect: bool) -> bool {
+    sensed || pointer_in_rect
 }
 
 pub(super) fn caption_btn(
@@ -258,8 +285,30 @@ pub(super) fn caption_btn(
         // Exactly ONE caption button runs this per frame — `show_system_menu`
         // spins a MODAL `TrackPopupMenu` loop, so running it once per button
         // would pop the menu four times over.
-        if let Some(band) = *TITLEBAR_BAND.lock().unwrap_or_else(|e| e.into_inner()) {
-            handle_titlebar_system_menu(&ctx, band);
+        //
+        // The `Context` plumbing lives here (rather than in a helper of its own)
+        // so the only thing between the raw input and the OS call is the tested
+        // pure decision in `system_menu_point`. Never steal a right-click egui is
+        // already using for its own popup (the tab / editor context menus), and
+        // skip entirely when the backend reports no `inner_rect` rather than pop
+        // the menu in the wrong place.
+        let band = *TITLEBAR_BAND.lock().unwrap_or_else(|e| e.into_inner());
+        let popup_open = ctx.memory(|m| m.any_popup_open());
+        let click_pos = ctx.input(|i| {
+            i.pointer
+                .button_clicked(egui::PointerButton::Secondary)
+                .then(|| i.pointer.interact_pos())
+                .flatten()
+        });
+        let inner_rect = ctx.input(|i| i.viewport().inner_rect);
+        if let (false, Some(band), Some(pos), Some(inner)) =
+            (popup_open, band, click_pos, inner_rect)
+        {
+            let union = *CAPTION_BTN_UNION.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((x, y)) = system_menu_point(pos, band, union, inner, ctx.pixels_per_point())
+            {
+                scribe_win32_chrome::show_system_menu(x, y);
+            }
         }
     }
     // Once Windows answers `HTMAXBUTTON` for that rect it delivers WM_NCMOUSEMOVE
@@ -395,7 +444,7 @@ pub(super) fn tab_glyph_button(
         egui::Sense::click(),
     );
     #[allow(unused_mut)]
-    let mut hovered = resp.hovered() || ui.rect_contains_pointer(rect);
+    let mut hovered = glyph_is_hovered(resp.hovered(), ui.rect_contains_pointer(rect));
     // Test-only: force the hover branch so an offscreen render can capture the
     // HOVER frame deterministically (no live pointer). Never set in production.
     #[cfg(test)]
