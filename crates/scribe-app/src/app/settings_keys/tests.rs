@@ -263,6 +263,262 @@ fn the_chord_button_reads_the_binding_and_never_lies_about_a_dead_one() {
     assert_eq!(chord_button_text("a+b", false), "a+b (won't fire)");
 }
 
+// ---- the shared label-column width ----
+
+/// Re-measure the widest visible label independently of the function under
+/// test, so the assertions below compare against a real measurement rather
+/// than a constant baked into the test.
+fn widest_label_px(ui: &egui::Ui, q: &str) -> f32 {
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    labels()
+        .into_iter()
+        .filter(|label| crate::settings::row_visible(q, label))
+        .map(|label| {
+            ui.painter()
+                .layout_no_wrap(label.to_string(), font.clone(), egui::Color32::WHITE)
+                .size()
+                .x
+        })
+        .fold(0.0_f32, f32::max)
+}
+
+/// What one measuring frame observed.
+#[derive(Default)]
+struct Measured {
+    /// Widest visible label for the unfiltered page.
+    widest_all: f32,
+    /// What the function under test returned for the unfiltered page.
+    got_all: f32,
+    /// Widest visible label when the search narrows the page to one short row.
+    widest_narrow: f32,
+    /// What the function under test returned for that narrow page.
+    got_narrow: f32,
+}
+
+/// Measure inside a REAL frame.
+///
+/// `egui::__run_test_ui` cannot be used here: it calls
+/// `set_fonts(FontDefinitions::empty())` to save CPU, so every
+/// `layout_no_wrap` comes back **zero-wide** and every assertion about a text
+/// width silently compares 0 against 0 — a fixture modelling the shape the bug
+/// is not in. `egui_kittest`'s harness keeps the default fonts, so the widths
+/// here are real. The preconditions below fail loudly if that ever regresses.
+fn measure() -> Measured {
+    let mut h = egui_kittest::Harness::new_ui_state(
+        |ui, m: &mut Measured| {
+            // A 40 px body pushes every label far past the 150 px floor. At the
+            // default size the `.max(FLOOR)` clamp swallows a wrong gutter
+            // (150 wins either way) — the clamp-masks-the-arithmetic trap.
+            ui.style_mut()
+                .text_styles
+                .insert(egui::TextStyle::Body, egui::FontId::proportional(40.0));
+            m.widest_all = widest_label_px(ui, "");
+            m.got_all = label_column_width(ui, "");
+            m.widest_narrow = widest_label_px(ui, "save");
+            m.got_narrow = label_column_width(ui, "save");
+        },
+        Measured::default(),
+    );
+    h.run();
+    std::mem::take(h.state_mut())
+}
+
+/// The gutter is ADDED to the widest visible label, and it is small.
+///
+/// The whole point of the shared column is that every group's grid starts at
+/// the same x. A width that ignores the labels (a constant), that SUBTRACTS the
+/// gutter, or that scales by it puts the chord buttons back where they were —
+/// misaligned.
+#[test]
+fn the_label_column_is_the_widest_visible_label_plus_a_small_gutter() {
+    let m = measure();
+    assert!(
+        m.widest_all > 200.0,
+        "precondition: real fonts, and the enlarged body puts the widest label \
+         well past the 150 px floor so the clamp cannot mask the gutter — got {}",
+        m.widest_all
+    );
+
+    let gutter = m.got_all - m.widest_all;
+    assert!(
+        gutter > 0.0 && gutter <= 24.0,
+        "the column must be the widest label ({}) plus a SMALL gutter, got {} \
+         (delta {gutter})",
+        m.widest_all,
+        m.got_all
+    );
+}
+
+/// The floor exists so a one-row search result cannot collapse the page into a
+/// cramped strip — and it is a FLOOR, not the answer: the unfiltered page is
+/// wider than it.
+#[test]
+fn a_narrow_search_result_is_floored_but_the_full_page_is_wider() {
+    let m = measure();
+    assert!(
+        m.widest_narrow > 0.0 && m.widest_narrow < 138.0,
+        "precondition: `Save` alone is narrower than the floor minus the gutter \
+         — got {}",
+        m.widest_narrow
+    );
+    assert_eq!(
+        m.got_narrow, 150.0,
+        "a narrow filter is floored, not collapsed"
+    );
+    assert!(
+        m.got_all > 150.0,
+        "the floor is not simply the answer for every query — the unfiltered \
+         page measures {} ",
+        m.got_all
+    );
+}
+
+// ---- the "something changed" signal the host persists on ----
+
+/// A row button's change must be REPORTED UP, not merely applied.
+///
+/// `show` returns `true` so the host calls `save_config`; the wiring tests
+/// below all assert the live *dispatcher* follows a rebind, which reads
+/// `config.keybindings` directly and is therefore true whether or not the
+/// return value survived the walk back up. That leaves the per-row aggregation
+/// (`changed |= binding_row(..)`) unasserted — flip it to `&=` and every row
+/// edit becomes a change the host never writes to disk, with every existing
+/// test still green. This drives the real page and reads the return value.
+#[test]
+fn a_row_button_change_is_reported_up_so_the_host_persists_it() {
+    use egui_kittest::kittest::{NodeT as _, Queryable as _};
+
+    struct Page {
+        config: Config,
+        /// ACCUMULATED across frames: `Harness::run` settles by running several
+        /// frames, and the click lands in an earlier one than the last, so a
+        /// plain assignment would be overwritten by the quiet final frame.
+        reported: bool,
+    }
+
+    let mut config = Config::default();
+    // One row off its default, so exactly one ↺ / one ✕ is enabled.
+    config.keybindings.save = "mod+alt+k".into();
+
+    let mut h = egui_kittest::Harness::new_ui_state(
+        |ui, page: &mut Page| {
+            page.reported |= show(ui, &mut page.config, "");
+        },
+        Page {
+            config,
+            reported: false,
+        },
+    );
+    h.run();
+    assert!(
+        !h.state().reported,
+        "a frame with no interaction reports no change — otherwise the host \
+         would rewrite the config file every frame"
+    );
+
+    // Click the one ENABLED restore button (the Save row's).
+    let mut clicked = false;
+    for node in h.get_all_by_label("↺") {
+        if !node.accesskit_node().is_disabled() {
+            node.click();
+            clicked = true;
+            break;
+        }
+    }
+    assert!(clicked, "precondition: the rebound row offers an enabled ↺");
+    h.run();
+
+    assert_eq!(
+        h.state().config.keybindings.save,
+        "mod+s",
+        "the row restored the shipped chord"
+    );
+    assert!(
+        h.state().reported,
+        "…and `show` must REPORT it, or the host never persists the change"
+    );
+}
+
+/// The same signal for the ✕ (unbind) button, which is the other half of the
+/// per-row aggregation.
+#[test]
+fn unbinding_a_row_is_also_reported_up() {
+    use egui_kittest::kittest::{NodeT as _, Queryable as _};
+
+    struct Page {
+        config: Config,
+        /// Accumulated — see the sibling test.
+        reported: bool,
+    }
+
+    let mut h = egui_kittest::Harness::new_ui_state(
+        |ui, page: &mut Page| {
+            page.reported |= show(ui, &mut page.config, "save");
+        },
+        Page {
+            config: Config::default(),
+            reported: false,
+        },
+    );
+    h.run();
+    assert!(!h.state().reported, "no interaction, no change");
+
+    let mut clicked = false;
+    for node in h.get_all_by_label("✕") {
+        if !node.accesskit_node().is_disabled() {
+            node.click();
+            clicked = true;
+            break;
+        }
+    }
+    assert!(clicked, "precondition: a bound row offers an enabled ✕");
+    h.run();
+
+    assert_eq!(
+        h.state().config.keybindings.save,
+        "",
+        "the row unbound the chord"
+    );
+    assert!(
+        h.state().reported,
+        "…and `show` must REPORT it, or the unbind is lost on restart"
+    );
+}
+
+/// A row's warning must be ITS OWN.
+///
+/// `issues.iter().find(|(a, _)| *a == act)` is the only thing tying a row to
+/// its problem, and nothing asserted it: the classification tests all check
+/// `issues_by_action` (which row is broken) rather than what a ROW renders.
+/// Flip that `==` to `!=` and the one broken row loses its warning while every
+/// healthy row grows one — 34 false alarms — with the whole suite still green.
+#[test]
+fn only_the_broken_row_carries_a_warning_icon() {
+    use egui_kittest::kittest::Queryable as _;
+
+    struct Page {
+        config: Config,
+    }
+
+    let mut config = Config::default();
+    // Exactly one problem on the page: Save is unbound.
+    config.keybindings.save = String::new();
+
+    let mut h = egui_kittest::Harness::new_ui_state(
+        |ui, page: &mut Page| {
+            show(ui, &mut page.config, "");
+        },
+        Page { config },
+    );
+    h.run();
+
+    let warned = h.get_all_by_label("⚠").count();
+    assert_eq!(
+        warned, 1,
+        "exactly the ONE unbound row may carry a ⚠ — every other row is healthy"
+    );
+}
+
 // ---- the wire: UI -> config -> live dispatcher ----
 
 mod wiring {
