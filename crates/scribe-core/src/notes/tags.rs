@@ -212,6 +212,28 @@ mod tests {
     }
 
     #[test]
+    fn inline_code_span_skips_an_otherwise_valid_tag() {
+        // The `#` here is preceded by a SPACE, so the mid-word boundary check
+        // would happily accept it — the ONLY thing suppressing it is the
+        // in-code-span state. `inline_code_span_skipped` above cannot see that:
+        // its `#` follows a backtick, which the boundary check rejects on its
+        // own, so the code-span tracking is never actually load-bearing there.
+        let text = "run `echo #notatag` but tag #real";
+        assert_eq!(extract_inline_tags(text), vec!["real".to_string()]);
+    }
+
+    #[test]
+    fn code_span_state_toggles_back_off_after_the_closing_backtick() {
+        // A tag AFTER a closed span is still collected, and a second span
+        // re-enters the skip state. Pins the toggle (not just "sticky on").
+        let text = "`echo #one` #two `echo #three` #four";
+        assert_eq!(
+            extract_inline_tags(text),
+            vec!["four".to_string(), "two".to_string()]
+        );
+    }
+
+    #[test]
     fn duplicate_tags_collapse() {
         assert_eq!(
             extract_inline_tags("#dup #dup #dup"),
