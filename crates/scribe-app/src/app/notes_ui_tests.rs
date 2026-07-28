@@ -12,13 +12,13 @@
 //! that reads the same constant as the code under test moves with it, so a
 //! wrong constant would still look right. The literals below are the contract.
 
-use super::ScribeApp;
 use super::notes_ui::{
-    NoteDoc, backlink_rows, body_cap_end, collect_backlinks, dedup_link_targets, filter_docs,
-    is_active_row, notes_list_height, scan_vault, show_no_match_hint,
+    backlink_rows, body_cap_end, collect_backlinks, dedup_link_targets, filter_docs, is_active_row,
+    notes_list_height, scan_vault, show_no_match_hint, NoteDoc,
 };
-use scribe_core::Config;
+use super::ScribeApp;
 use scribe_core::notes::query;
+use scribe_core::Config;
 use std::path::{Path, PathBuf};
 
 /// `MAX_NOTE_BYTES` — the per-file size ceiling the vault walk applies, restated
