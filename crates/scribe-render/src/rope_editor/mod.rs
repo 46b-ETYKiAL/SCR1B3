@@ -1724,6 +1724,148 @@ mod tests {
         assert_eq!(r.to_string(), "ab\ncd\n", "each X removed");
     }
 
+    /// A key event with every modifier stated explicitly, so a test can press
+    /// the NEAR MISSES of a guarded chord and not just the chord itself.
+    fn key_mods(key: egui::Key, shift: bool, cmd: bool, alt: bool) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers {
+                shift,
+                command: cmd,
+                ctrl: cmd,
+                alt,
+                ..Default::default()
+            },
+        }
+    }
+
+    // ---- guard exactness: an arm must fire on its chord and NOTHING else ----
+    //
+    // Every guarded arm in `apply_event` is a CONJUNCTION (`alt && cmd`,
+    // `cmd && !shift && !alt`, `cmd && shift`). A conjunction that drifts into
+    // a disjunction still passes every test that only ever presses the RIGHT
+    // chord — the arm keeps working, it just also swallows chords that belong
+    // to the plain-arrow arms below it or to the app level. The only way to see
+    // that is to press the near misses, which is what these do.
+
+    #[test]
+    fn adding_a_caret_requires_alt_AND_ctrl_not_either_alone() {
+        for key in [egui::Key::ArrowDown, egui::Key::ArrowUp] {
+            for (cmd, alt, what) in [(true, false, "Ctrl"), (false, true, "Alt")] {
+                let mut r = Rope::from_str("ab\ncd\nef\n");
+                let mut st = RopeEditorState::new();
+                st.edit = EditState::at(3); // middle line: both directions exist
+                apply_event(&mut r, &mut st, &key_mods(key, false, cmd, alt));
+                assert!(
+                    !st.is_multi(),
+                    "{what}+{key:?} alone must NOT add a caret — only Ctrl+Alt does"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ctrl_alt_up_adds_the_caret_on_the_line_above_not_below() {
+        let mut r = Rope::from_str("ab\ncd\nef\n");
+        let mut st = RopeEditorState::new();
+        st.edit = EditState::at(3); // line 1, col 0
+        apply_event(&mut r, &mut st, &alt_cmd_key(egui::Key::ArrowUp));
+        assert!(st.is_multi(), "a second caret was added");
+        // WHERE the caret landed is only observable by editing at both of them.
+        apply_event(&mut r, &mut st, &text_event("!"));
+        assert_eq!(
+            r.to_string(),
+            "!ab\n!cd\nef\n",
+            "Ctrl+Alt+Up must add the caret ABOVE (line 0), not below"
+        );
+    }
+
+    #[test]
+    fn ctrl_d_fires_on_exactly_ctrl_d_and_no_near_miss() {
+        // Ctrl+Shift+D is duplicate-line at the app level and Ctrl+Alt+D is
+        // unbound; both must fall through untouched, as must a bare D (which
+        // arrives as text, never as a rope-editor command).
+        for (shift, cmd, alt, what) in [
+            (false, false, false, "plain D"),
+            (true, false, false, "Shift+D"),
+            (true, true, false, "Ctrl+Shift+D"),
+            (false, true, true, "Ctrl+Alt+D"),
+        ] {
+            let mut r = Rope::from_str("foo bar foo");
+            let mut st = RopeEditorState::new();
+            st.edit = EditState::at(1);
+            let out = apply_event(&mut r, &mut st, &key_mods(egui::Key::D, shift, cmd, alt));
+            assert!(!out.consumed, "{what} must not be consumed by the rope path");
+            assert!(!st.edit.has_selection(), "{what} must not select the word");
+            assert!(!st.is_multi(), "{what} must not add an occurrence caret");
+        }
+    }
+
+    #[test]
+    fn tab_on_a_single_line_selection_replaces_it_instead_of_indenting_the_line() {
+        // The multi-line branch indents every selected LINE; the single-line
+        // branch replaces the SELECTION. Only the multi-line half was pinned,
+        // so the `multiline && extra.is_empty()` test could flip to `||` (or the
+        // line comparison to `==`) and still pass.
+        let mut r = Rope::from_str("ab cd\n");
+        let mut st = RopeEditorState::new();
+        st.edit = EditState {
+            anchor: 0,
+            cursor: 2, // "ab", entirely within line 0
+            goal_col: None,
+        };
+        apply_event(&mut r, &mut st, &key_ev(egui::Key::Tab, false, false));
+        assert_eq!(
+            r.to_string(),
+            "     cd\n",
+            "the SELECTION became four spaces; the line was not indented"
+        );
+    }
+
+    #[test]
+    fn delete_line_fires_on_exactly_ctrl_shift_k() {
+        for (shift, cmd, what) in [
+            (false, true, "Ctrl+K"),
+            (true, false, "Shift+K"),
+            (false, false, "plain K"),
+        ] {
+            let mut r = Rope::from_str("keep\ndrop\n");
+            let mut st = RopeEditorState::new();
+            st.edit = EditState::at(6); // on "drop"
+            let out = apply_event(&mut r, &mut st, &key_ev(egui::Key::K, shift, cmd));
+            assert!(!out.consumed, "{what} is not the delete-line chord");
+            assert_eq!(r.to_string(), "keep\ndrop\n", "{what} deleted a line");
+        }
+    }
+
+    #[test]
+    fn undo_and_redo_ignore_the_bare_keys() {
+        // Undo first, so a REDO is genuinely available: a stray redo then has a
+        // visible content effect instead of being a silent no-op that a
+        // content-only assertion would miss.
+        for (key, shift, what) in [
+            (egui::Key::Z, false, "plain Z"),
+            (egui::Key::Z, true, "Shift+Z"),
+            (egui::Key::Y, false, "plain Y"),
+            (egui::Key::Y, true, "Shift+Y"),
+        ] {
+            let mut r = Rope::from_str("");
+            let mut st = RopeEditorState::new();
+            for ch in ["a", "b", "c"] {
+                apply_event(&mut r, &mut st, &text_event(ch));
+            }
+            apply_event(&mut r, &mut st, &key_ev(egui::Key::Z, false, true));
+            assert_eq!(r.to_string(), "", "precondition: undone, a redo is queued");
+
+            let out = apply_event(&mut r, &mut st, &key_mods(key, shift, false, false));
+            assert!(!out.consumed, "{what} is not an undo/redo chord");
+            assert_eq!(r.to_string(), "", "{what} must not step history");
+        }
+    }
+
     // ---- keyboard-parity wiring (plan: rope-path key parity) ----
     //
     // These drive `apply_event` — the real dispatch — rather than the
