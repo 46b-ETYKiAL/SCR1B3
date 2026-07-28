@@ -92,13 +92,19 @@ pub fn window_around(rope: &Rope, cursor: usize) -> Window {
     let len = rope.len_chars();
     let cursor = cursor.min(len);
 
+    // The buffer ends are handled by the iterator alone: `prev()` yields
+    // `None` exactly at char 0 and `next()` exactly at `len`, so the loop
+    // condition carries ONLY the budget. An extra `start > 0` / `end < len`
+    // conjunct would be redundant with that `else { break }` — it can never
+    // change the result, only hide which bound is doing the work.
+
     // ---- backwards ----
     let mut start = cursor;
     {
         let mut it = rope.chars_at(cursor);
         let mut steps = 0;
         let mut saw_word_char = false;
-        while start > 0 && steps < WINDOW_CHARS {
+        while steps < WINDOW_CHARS {
             let Some(ch) = it.prev() else { break };
             start -= 1;
             steps += 1;
@@ -118,7 +124,7 @@ pub fn window_around(rope: &Rope, cursor: usize) -> Window {
         let mut it = rope.chars_at(cursor);
         let mut steps = 0;
         let mut saw_word_char = false;
-        while end < len && steps < WINDOW_CHARS {
+        while steps < WINDOW_CHARS {
             let Some(ch) = it.next() else { break };
             end += 1;
             steps += 1;
@@ -191,8 +197,13 @@ pub fn delete_word_prev(rope: &mut Rope, st: &mut EditState) {
     if editing::delete_selection(rope, st) {
         return;
     }
+    // Reaching here means there was no selection, so `anchor == cursor`. The
+    // test that matters is therefore "did the boundary MOVE" — an ordering test
+    // would additionally have to claim something about the direction, which
+    // `prev_word_boundary` already guarantees (its result is `<= cursor`), and
+    // which nothing here could observe.
     let target = prev_word_boundary(rope, st.cursor);
-    if target < st.cursor {
+    if target != st.cursor {
         st.anchor = target;
         editing::delete_selection(rope, st);
     }
@@ -203,8 +214,10 @@ pub fn delete_word_next(rope: &mut Rope, st: &mut EditState) {
     if editing::delete_selection(rope, st) {
         return;
     }
+    // Mirror of `delete_word_prev`: no selection here, so the only observable
+    // question is whether the boundary moved at all.
     let target = next_word_boundary(rope, st.cursor);
-    if target > st.cursor {
+    if target != st.cursor {
         st.anchor = target;
         editing::delete_selection(rope, st);
     }
@@ -224,6 +237,31 @@ mod tests {
     /// CJK corpus kept separate so the parity sweep covers a no-space script.
     const CJK_CORPUS: &str = "日本語のテキスト abc 漢字とかな mixed";
 
+    /// Every corpus the exhaustive parity sweep runs over.
+    ///
+    /// The sweep is the strongest assertion in this module (every caret
+    /// position of every corpus, both directions), so widening the corpus is
+    /// worth more than any number of extra single-position tests. Beyond the
+    /// two originals it covers the input-space corners word segmentation
+    /// actually trips on: the empty buffer, a one-char buffer, an EMPTY LINE
+    /// (two newlines with nothing between — no word for the scan to latch
+    /// onto), runs of consecutive separators, a word that touches EOF with no
+    /// trailing whitespace, and multi-byte text at 2, 3 and 4 bytes per char
+    /// (a CHAR boundary is not a BYTE boundary — every index in this module is
+    /// a char index, and only astral/combining text can prove it).
+    const PARITY_CORPORA: &[&str] = &[
+        CORPUS,
+        CJK_CORPUS,
+        "",
+        "x",
+        " ",
+        "a\n\nb",
+        "a,,,b   .  c",
+        "alpha beta",
+        "αβγ δεζ ηθι",
+        "he\u{301}llo→wörld 𝄞x yz",
+    ];
+
     fn r(s: &str) -> Rope {
         Rope::from_str(s)
     }
@@ -235,7 +273,7 @@ mod tests {
     /// this asserts the windowing never changes the answer.
     #[test]
     fn windowed_boundaries_match_egui_whole_buffer_boundaries() {
-        for text in [CORPUS, CJK_CORPUS] {
+        for text in PARITY_CORPORA.iter().copied() {
             let rope = r(text);
             let n = text.chars().count();
             for i in 0..=n {
@@ -251,6 +289,162 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The window's EXACT shape, not just its bound.
+    ///
+    /// `window_examines_a_bounded_number_of_chars_on_a_huge_rope` only asserts
+    /// `examined_chars() <= 2 * WINDOW_CHARS` — an upper bound that a gutted
+    /// accessor returning 0 (or 1) satisfies just as well as the real count,
+    /// and that a window cut at the wrong place also satisfies. This pins the
+    /// text, the absolute start, the caret-relative index and the count to
+    /// exact values, so every one of those is load-bearing.
+    #[test]
+    fn window_around_extracts_the_exact_whitespace_delimited_slice() {
+        //            0....5....A....F
+        let rope = r("alpha beta gamma");
+        // Caret inside `beta` (on the `t`). The cut rule keeps ONE whitespace
+        // char on each side, so the window is " beta ", not "beta".
+        let w = window_around(&rope, 8);
+        assert_eq!(w.text, " beta ", "one whitespace kept on each side");
+        assert_eq!(w.start, 5, "absolute start is the space before `beta`");
+        assert_eq!(w.rel, 3, "caret 8 sits 3 chars into the window");
+        assert_eq!(w.examined_chars(), 6, "exact count, not merely bounded");
+        assert_eq!(
+            w.examined_chars(),
+            w.text.chars().count(),
+            "examined_chars must REPORT the window, not a constant"
+        );
+        // `rel` must index the caret's own char within `text`.
+        assert_eq!(w.text.chars().nth(w.rel), Some('t'));
+    }
+
+    /// The `WINDOW_CHARS` budget is the whole point of the module, so the cut
+    /// must land on EXACTLY the budget char — one short or one long is a real
+    /// defect, and an unbounded walk defeats the sub-linearity guarantee.
+    #[test]
+    fn a_long_unbroken_run_is_cut_at_exactly_the_window_budget() {
+        const OVERSHOOT: usize = 88;
+        let n = WINDOW_CHARS + OVERSHOOT;
+        let rope = r(&"a".repeat(n));
+
+        // Caret at EOF: only the BACKWARD walk runs, and it must stop after
+        // exactly WINDOW_CHARS chars even though the run continues.
+        let back = window_around(&rope, n);
+        assert_eq!(back.start, OVERSHOOT, "backward walk cut at the budget");
+        assert_eq!(back.rel, WINDOW_CHARS);
+        assert_eq!(back.examined_chars(), WINDOW_CHARS);
+
+        // Caret at BOF: mirror, only the FORWARD walk runs.
+        let fwd = window_around(&rope, 0);
+        assert_eq!(fwd.start, 0);
+        assert_eq!(fwd.rel, 0);
+        assert_eq!(fwd.examined_chars(), WINDOW_CHARS, "forward walk cut too");
+
+        // Caret in the middle: BOTH walks run and both are capped, so the
+        // window is exactly twice the budget — the bound the huge-rope test
+        // only ever asserts as an inequality.
+        let mid = Rope::from_str(&"a".repeat(4 * WINDOW_CHARS));
+        let w = window_around(&mid, 2 * WINDOW_CHARS);
+        assert_eq!(w.start, WINDOW_CHARS);
+        assert_eq!(w.rel, WINDOW_CHARS);
+        assert_eq!(w.examined_chars(), 2 * WINDOW_CHARS);
+    }
+
+    /// Every index in this module is a CHAR index. Only multi-byte text can
+    /// tell a char index from a byte index, so this uses 2-byte Greek and then
+    /// a 3-byte arrow / 4-byte astral pair — a byte-indexed slice would either
+    /// panic on a non-boundary or land on the wrong char.
+    #[test]
+    fn the_window_is_indexed_by_char_not_by_byte() {
+        let text = "αβγ δεζ ηθι";
+        let rope = r(text);
+        assert_eq!(rope.len_chars(), 11);
+        assert!(text.len() > rope.len_chars(), "corpus is genuinely multi-byte");
+
+        // Caret on `ε` (char 5, byte 9).
+        let w = window_around(&rope, 5);
+        assert_eq!(w.text, " δεζ ");
+        assert_eq!(w.start, 3, "start is a CHAR index (byte index would be 5)");
+        assert_eq!(w.rel, 2);
+        assert_eq!(w.examined_chars(), 5);
+
+        // 3-byte and 4-byte scalars in the same window.
+        let text = "ab →𝄞x cd";
+        let rope = r(text);
+        let w = window_around(&rope, 4); // on the astral `𝄞`
+        assert_eq!(w.text, " →𝄞x ");
+        assert_eq!(w.start, 2);
+        assert_eq!(w.rel, 2);
+        assert_eq!(w.examined_chars(), 5);
+    }
+
+    /// The degenerate corners: nothing to walk in either direction.
+    #[test]
+    fn the_window_degenerates_safely_on_empty_and_single_char_ropes() {
+        let empty = r("");
+        assert_eq!(
+            window_around(&empty, 0),
+            Window {
+                text: String::new(),
+                start: 0,
+                rel: 0
+            }
+        );
+        // A caret past the end is CLAMPED, not a panic and not a stale index.
+        assert_eq!(
+            window_around(&empty, 99),
+            Window {
+                text: String::new(),
+                start: 0,
+                rel: 0
+            }
+        );
+
+        let one = r("a");
+        assert_eq!(
+            window_around(&one, 0),
+            Window {
+                text: "a".to_string(),
+                start: 0,
+                rel: 0
+            },
+            "at BOF the forward walk still takes the single char"
+        );
+        assert_eq!(
+            window_around(&one, 1),
+            Window {
+                text: "a".to_string(),
+                start: 0,
+                rel: 1
+            },
+            "at EOF the backward walk still takes it"
+        );
+        assert_eq!(window_around(&one, 99).rel, 1, "clamped to len");
+    }
+
+    /// `dir` is an `isize` and the documented contract is "`< 0` is left,
+    /// anything else is right". `0` is the ONLY value that separates `dir < 0`
+    /// from `dir <= 0`, so it is the input that pins the comparison.
+    #[test]
+    fn a_zero_direction_moves_forward_for_both_word_and_document() {
+        let rope = r("alpha beta gamma");
+
+        let mut st = EditState::at(0);
+        move_word(&rope, &mut st, 0, false);
+        assert_eq!(
+            st.cursor,
+            next_word_boundary(&rope, 0),
+            "dir 0 is NOT `< 0`, so a word move goes FORWARD"
+        );
+
+        let mut st = EditState::at(3);
+        move_document(&rope, &mut st, 0, false);
+        assert_eq!(
+            st.cursor,
+            rope.len_chars(),
+            "dir 0 is NOT `< 0`, so a document move goes to the END"
+        );
     }
 
     #[test]
