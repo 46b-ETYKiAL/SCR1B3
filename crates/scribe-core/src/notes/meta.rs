@@ -105,4 +105,23 @@ mod tests {
     fn tags_empty_when_none() {
         assert!(note_tags("plain body, no tags").is_empty());
     }
+
+    #[test]
+    fn six_hashes_is_a_heading_but_seven_is_not() {
+        // ATX headings run `#` .. `######` — the legal maximum is EXACTLY six.
+        // Both halves of `hashes == 0 || hashes > 6` need their own boundary:
+        // a six-hash heading proves the bound is `> 6` (not `>= 6` / `== 6`),
+        // and a seven-hash line proves the guard actually fires (an `&&` there
+        // makes it unreachable and promotes an illegal line to the title).
+        assert_eq!(
+            note_title("###### Six Hashes\nbody", "stem"),
+            "Six Hashes",
+            "six hashes is the largest legal ATX heading"
+        );
+        assert_eq!(
+            note_title("####### Seven Hashes\nbody", "stem"),
+            "stem",
+            "seven hashes is not a heading — fall back to the file stem"
+        );
+    }
 }

@@ -52,6 +52,21 @@ static LAST_MAX_RECT_PASS: std::sync::atomic::AtomicU64 =
 /// the first button drawn.
 static LAST_BAND_PASS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
 
+/// Put both pass latches back to their initial "never published" state.
+///
+/// These are PROCESS-globals and a test binary is one process, so every test
+/// that runs a pass mutates the same two counters. Without a reset, a test's
+/// starting latch state is whatever a sibling left behind — which made
+/// `the_retraction_happens_once_and_then_latches` pass alone and fail in the
+/// suite. Tests pair this with `chrome_tests::CHROME_GLOBALS_LOCK` so the reset
+/// is not immediately undone by a concurrent sibling.
+#[cfg(test)]
+pub(super) fn reset_pass_latches_for_test() {
+    use std::sync::atomic::Ordering;
+    LAST_MAX_RECT_PASS.store(u64::MAX, Ordering::Relaxed);
+    LAST_BAND_PASS.store(u64::MAX, Ordering::Relaxed);
+}
+
 #[cfg(test)]
 thread_local! {
     /// Test hook: the physical-pixel rect the LAST [`publish_maximize_rect`]
@@ -145,15 +160,29 @@ fn retract_maximize_rect() {
 fn apply_chrome_policy() {
     use std::sync::Once;
     static ONCE: Once = Once::new();
+
+    let mode = scribe_win32_chrome::HitTestMode::MaximizeButtonOnly;
+    let snap = true;
+    let backdrop = scribe_win32_chrome::Backdrop::None;
+
+    // Record the policy on EVERY pass, OUTSIDE the `Once`.
+    //
+    // `ONCE` is a process-global, and a test binary is one process: whichever
+    // test happened to reach this first consumed it, and every later test read
+    // `None` — so this assertion passed or failed purely on test ORDER, which is
+    // exactly how it was committed red. The thread-local is per-test, so
+    // recording outside the `Once` makes each test observe its own pass.
+    //
+    // The real Win32 calls stay inside the `Once` — they are the part that must
+    // happen once. What the test asserts is that the titlebar path computes and
+    // would apply these three values, which this records faithfully.
+    #[cfg(test)]
+    TEST_APPLIED_CHROME_POLICY.with(|c| c.set(Some((mode, snap, backdrop))));
+
     ONCE.call_once(|| {
-        let mode = scribe_win32_chrome::HitTestMode::MaximizeButtonOnly;
-        let snap = true;
-        let backdrop = scribe_win32_chrome::Backdrop::None;
         scribe_win32_chrome::set_hit_test_mode(mode);
         scribe_win32_chrome::set_snap_support_enabled(snap);
         scribe_win32_chrome::set_backdrop(backdrop);
-        #[cfg(test)]
-        TEST_APPLIED_CHROME_POLICY.with(|c| c.set(Some((mode, snap, backdrop))));
     });
 }
 

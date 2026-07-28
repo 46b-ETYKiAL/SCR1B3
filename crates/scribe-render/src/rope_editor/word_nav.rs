@@ -360,7 +360,10 @@ mod tests {
         let text = "αβγ δεζ ηθι";
         let rope = r(text);
         assert_eq!(rope.len_chars(), 11);
-        assert!(text.len() > rope.len_chars(), "corpus is genuinely multi-byte");
+        assert!(
+            text.len() > rope.len_chars(),
+            "corpus is genuinely multi-byte"
+        );
 
         // Caret on `ε` (char 5, byte 9).
         let w = window_around(&rope, 5);

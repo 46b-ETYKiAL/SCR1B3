@@ -581,11 +581,12 @@ impl<'a> RopeEditor<'a> {
 
         // Record the viewport's row count for the NEXT frame's PageUp/PageDown
         // (the input phase runs before this paint, so the step is always the
-        // last painted height — which is what the user just saw). One row is
-        // held back so a page keeps a line of context, matching every editor.
-        state.page_rows = ((scroll.inner_rect.height() / line_h).floor() as usize)
-            .saturating_sub(1)
-            .max(1);
+        // last painted height — which is what the user just saw).
+        //
+        // Delegates to `page_rows_for_viewport` rather than repeating the
+        // arithmetic: a second inline copy is the one the app actually runs, so
+        // the extracted-and-tested version would prove nothing about it.
+        state.page_rows = page_rows_for_viewport(scroll.inner_rect.height(), line_h);
 
         // Pointer input: click to place the caret, click-drag to select,
         // shift-click to extend (TextEdit parity). Clicking also focuses the
@@ -773,6 +774,23 @@ fn pos_to_char_offset(
     };
     let col = raw_col.min(len);
     line_start + col
+}
+
+/// Rows one PageUp/PageDown moves by, for a painted viewport of `viewport_h`
+/// at `line_h` per row.
+///
+/// One row is held back so a page keeps a line of context, matching every other
+/// editor, and the result is never 0 — a viewport too short for even one row
+/// still has to move the caret, or PageDown would do nothing forever.
+///
+/// Extracted from `show_editable` deliberately: inline, this arithmetic was
+/// reachable only through a live painted frame, so `/` could become `%` or `*`
+/// with nothing able to observe it (ADR-0007 "egui-paint"). As a free function
+/// it is ordinary testable math.
+fn page_rows_for_viewport(viewport_h: f32, line_h: f32) -> usize {
+    ((viewport_h / line_h).floor() as usize)
+        .saturating_sub(1)
+        .max(1)
 }
 
 /// Decimal digits needed to print the largest line number (>= 1).
@@ -1752,7 +1770,7 @@ mod tests {
     // that is to press the near misses, which is what these do.
 
     #[test]
-    fn adding_a_caret_requires_alt_AND_ctrl_not_either_alone() {
+    fn adding_a_caret_requires_alt_and_ctrl_together_not_either_alone() {
         for key in [egui::Key::ArrowDown, egui::Key::ArrowUp] {
             for (cmd, alt, what) in [(true, false, "Ctrl"), (false, true, "Alt")] {
                 let mut r = Rope::from_str("ab\ncd\nef\n");
@@ -1798,7 +1816,10 @@ mod tests {
             let mut st = RopeEditorState::new();
             st.edit = EditState::at(1);
             let out = apply_event(&mut r, &mut st, &key_mods(egui::Key::D, shift, cmd, alt));
-            assert!(!out.consumed, "{what} must not be consumed by the rope path");
+            assert!(
+                !out.consumed,
+                "{what} must not be consumed by the rope path"
+            );
             assert!(!st.edit.has_selection(), "{what} must not select the word");
             assert!(!st.is_multi(), "{what} must not add an occurrence caret");
         }
@@ -2388,6 +2409,46 @@ mod tests {
                 assert_eq!(resp.buffer_mode, BufferModeSeen::Rope);
             });
         });
+    }
+
+    /// The PageUp/PageDown step, pinned at the boundaries the arithmetic can be
+    /// broken at.
+    ///
+    /// Inline in `show_editable` this was reachable only through a live painted
+    /// frame, so `/` could become `%` or `*` with nothing able to observe it
+    /// (ADR-0007 "egui-paint"). Extracting it only helps if the extracted
+    /// function is BOTH the one production calls and the one covered here — it
+    /// is called at the `state.page_rows` assignment, and these are its tests.
+    #[test]
+    fn page_rows_holds_one_row_back_and_never_returns_zero() {
+        // Exact fit: 10 rows of 20px in 200px -> 10 visible, 9 stepped (one row
+        // of context is deliberately retained). `floor` and the `- 1` are both
+        // load-bearing here: `%` would give 0 and `*` a huge number.
+        assert_eq!(page_rows_for_viewport(200.0, 20.0), 9);
+        // Partial trailing row is not counted: 9.5 rows -> 9 visible -> 8.
+        assert_eq!(page_rows_for_viewport(190.0, 20.0), 8);
+
+        // The floor of the useful range. Two rows visible -> step 1.
+        assert_eq!(page_rows_for_viewport(40.0, 20.0), 1);
+
+        // Degenerate viewports still MOVE the caret. Without the `.max(1)` these
+        // return 0 and PageDown does nothing forever — a silent dead key, which
+        // is worse than a wrong step size because nothing surfaces it.
+        assert_eq!(
+            page_rows_for_viewport(20.0, 20.0),
+            1,
+            "exactly one visible row must still step by one"
+        );
+        assert_eq!(
+            page_rows_for_viewport(5.0, 20.0),
+            1,
+            "a viewport shorter than a single row must still step by one"
+        );
+        assert_eq!(
+            page_rows_for_viewport(0.0, 20.0),
+            1,
+            "a zero-height viewport (first frame, collapsed pane) must still step"
+        );
     }
 
     #[test]

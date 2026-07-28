@@ -320,4 +320,42 @@ mod tests {
         let q = parse("\"a:b\"");
         assert_eq!(q.clauses[0].term, Term::Text("a:b".into()));
     }
+
+    #[test]
+    fn a_query_with_clauses_is_not_empty() {
+        // `is_empty()` is the caller's short-circuit for "matches every note" —
+        // a constant `true` would skip the whole-vault filter entirely and hand
+        // back every note for a real query. Every existing test only asserted
+        // the TRUE direction, so the false direction was never pinned.
+        assert!(
+            !parse("roadmap").is_empty(),
+            "a free-text query has a clause"
+        );
+        assert!(!parse("tag:project").is_empty(), "an operator has a clause");
+        assert!(parse("   ").is_empty(), "a blank query still has none");
+    }
+
+    #[test]
+    fn a_quoted_or_empty_key_is_never_an_operator() {
+        // `split_operator` must reject a key that is empty OR contains a quote.
+        // Loosening either `||` lets a half-typed phrase through as an operator
+        // with an EMPTY value, which `parse_word` then drops entirely — the
+        // clause silently disappears and the query degenerates to "match
+        // everything" (the exact failure the module doc warns about).
+        let q = parse("\"a:");
+        assert_eq!(
+            q.clauses.len(),
+            1,
+            "a quoted key is free text, not an operator"
+        );
+        assert_eq!(q.clauses[0].term, Term::Text("\"a:".into()));
+
+        let q = parse(":");
+        assert_eq!(
+            q.clauses.len(),
+            1,
+            "an empty key is free text, not an operator"
+        );
+        assert_eq!(q.clauses[0].term, Term::Text(":".into()));
+    }
 }

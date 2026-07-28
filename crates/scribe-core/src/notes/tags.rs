@@ -89,14 +89,18 @@ fn scan_line_tags(line: &str, out: &mut BTreeSet<String>) {
 /// `#123` is excluded). At least one segment must contain a letter so a pure
 /// `#-` / `#_` is rejected.
 fn is_valid_tag_body(body: &str) -> bool {
-    if body.is_empty() || body.starts_with('/') || body.ends_with('/') {
-        return false;
-    }
     if body.chars().next().is_some_and(|c| c.is_ascii_digit()) {
         return false;
     }
-    let segments: Vec<&str> = body.split('/').collect();
-    if segments.iter().any(|s| s.is_empty()) {
+    // An empty body, a leading `/`, a trailing `/`, and an empty middle segment
+    // (`a//b`) are all the SAME condition — "some `/`-separated segment is
+    // empty": `""` splits to `[""]`, `"/b"` to `["", "b"]`, `"a/"` to
+    // `["a", ""]`. A separate `is_empty() || starts_with('/') || ends_with('/')`
+    // guard ahead of this one is therefore pure duplication: it can only ever
+    // reject inputs this check already rejects, so no test could distinguish
+    // whether it ran. `every_empty_segment_shape_is_rejected` pins all four
+    // shapes against this single check.
+    if body.split('/').any(str::is_empty) {
         return false;
     }
     body.chars().any(|c| c.is_ascii_alphabetic())
@@ -129,10 +133,20 @@ where
 /// notes by a selected tag-tree node.
 #[must_use]
 pub fn tag_matches(candidate: &str, selected: &str) -> bool {
-    candidate == selected
-        || (candidate.len() > selected.len()
-            && candidate.starts_with(selected)
-            && candidate.as_bytes()[selected.len()] == b'/')
+    if candidate == selected {
+        return true;
+    }
+    // A descendant is `selected` + `/` + more, so the byte at `selected.len()`
+    // must be the separator. Reading it through `get` bounds the access itself,
+    // which is why no `candidate.len() > selected.len()` guard is needed — and
+    // why one would be indistinguishable duplication: equal lengths only reach
+    // this point when the two strings DIFFER, and then `starts_with` is already
+    // false. `tag_matches_boundary_cases` pins the shorter / equal / longer
+    // candidate cases against this single bounds-safe read.
+    match candidate.as_bytes().get(selected.len()) {
+        Some(b'/') => candidate.starts_with(selected),
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -269,6 +283,50 @@ mod tests {
         assert!(tag_matches("project/frontend/ui", "project"));
         assert!(!tag_matches("projectx", "project")); // not a `/` boundary
         assert!(!tag_matches("project", "project/frontend"));
+    }
+
+    #[test]
+    fn every_empty_segment_shape_is_rejected() {
+        // The four distinct malformed shapes that all reduce to "some
+        // `/`-separated segment is empty", pinned individually so the single
+        // segment check in `is_valid_tag_body` provably stands in for all of
+        // them (and a regression in any one shape is attributable).
+        assert!(extract_inline_tags("#").is_empty(), "empty body");
+        assert!(extract_inline_tags("#/").is_empty(), "slash only");
+        assert!(extract_inline_tags("#/b").is_empty(), "leading slash");
+        assert!(extract_inline_tags("#a/").is_empty(), "trailing slash");
+        assert!(
+            extract_inline_tags("#a//b").is_empty(),
+            "empty middle segment"
+        );
+        // A well-formed nested tag passes all of them.
+        assert_eq!(extract_inline_tags("#a/b"), vec!["a/b".to_string()]);
+    }
+
+    #[test]
+    fn tag_matches_boundary_cases() {
+        // `/` is the ONLY descendant boundary, and the check must stay
+        // bounds-safe for a candidate shorter than, equal to, or longer than
+        // the selection.
+        assert!(tag_matches("a/b", "a"), "direct child");
+        assert!(
+            !tag_matches("ab", "a"),
+            "no `/` boundary is not a descendant"
+        );
+        assert!(
+            !tag_matches("a", "a/b"),
+            "candidate shorter than the selection"
+        );
+        assert!(tag_matches("", ""), "identical empty strings match");
+        assert!(
+            !tag_matches("a", ""),
+            "an empty selection is not a `/` parent of `a`"
+        );
+        assert!(tag_matches("/a", ""), "`/a` does start at the `/` boundary");
+        assert!(
+            tag_matches("a/", "a"),
+            "a trailing separator is a descendant form"
+        );
     }
 
     #[test]

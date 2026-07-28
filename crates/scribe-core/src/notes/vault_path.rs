@@ -336,4 +336,49 @@ mod tests {
         assert!(!safe_stem("a/b\\c").contains('/'));
         assert!(!safe_stem("a/b\\c").contains('\\'));
     }
+
+    #[test]
+    fn reject_messages_are_distinct_and_name_their_reason() {
+        // Every rejection reason is surfaced to the user / logs — the module doc
+        // is explicit that it is "never silently swallowed". Nothing asserted
+        // `message()` at all, so a blank or single-constant text passed.
+        const ALL: [PathReject; 5] = [
+            PathReject::Empty,
+            PathReject::Absolute,
+            PathReject::Traversal,
+            PathReject::IllegalChar,
+            PathReject::Escapes,
+        ];
+        for r in &ALL {
+            assert!(!r.message().is_empty(), "{r:?} has an empty message");
+        }
+        // Each arm names its own case, so they cannot collapse to one constant.
+        assert!(PathReject::Empty.message().contains("empty"));
+        assert!(PathReject::Absolute.message().contains("absolute"));
+        assert!(PathReject::Traversal.message().contains(".."));
+        assert!(PathReject::IllegalChar
+            .message()
+            .contains("illegal character"));
+        assert!(PathReject::Escapes.message().contains("outside the vault"));
+        // …and no two arms share a message.
+        let mut seen: Vec<&str> = ALL.iter().map(PathReject::message).collect();
+        let n = seen.len();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), n, "reject messages must be distinct");
+    }
+
+    #[test]
+    fn safe_stem_replaces_control_characters() {
+        // A control byte is NOT in the Windows-illegal literal set, so the
+        // `c if c.is_control()` guard is the only thing that maps it to `-`.
+        // Disabling that guard smuggles a raw control byte (a classic
+        // path-truncation vector) straight into a file name.
+        assert_eq!(safe_stem("a\u{7}b"), "a-b", "BEL is replaced");
+        assert_eq!(safe_stem("a\tb"), "a-b", "TAB is replaced");
+        assert!(
+            !safe_stem("note\u{1}name").contains('\u{1}'),
+            "no control byte may survive into a stem"
+        );
+    }
 }

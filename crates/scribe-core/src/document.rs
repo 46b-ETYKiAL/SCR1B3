@@ -50,9 +50,14 @@ pub fn sniff_binary(bytes: &[u8]) -> bool {
             // A single NUL is decisive — real text never contains one.
             0x00 => return true,
             // Ordinary text whitespace / formatting controls: tab, LF, FF, CR.
+            // This arm SHADOWS the whole-C0 arm below (match arms are tried in
+            // order), which is what makes it load-bearing: spelling the C0 range
+            // out minus these four would make this arm pure duplication of the
+            // `_ => {}` fallthrough — behaviourally identical, and therefore an
+            // arm no test could ever prove was doing anything.
             0x09 | 0x0a | 0x0c | 0x0d => {}
-            // Remaining C0 control bytes + DEL are "non-text".
-            0x01..=0x08 | 0x0b | 0x0e..=0x1f | 0x7f => non_text += 1,
+            // Every remaining C0 control byte + DEL is "non-text".
+            0x01..=0x1f | 0x7f => non_text += 1,
             // Printable ASCII and any high byte (potential UTF-8) count as text.
             _ => {}
         }
@@ -983,5 +988,68 @@ mod tests {
             Err(crate::error::CoreError::Io(_)) => {}
             other => panic!("expected CoreError::Io on unwritable target, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn size_constants_have_their_documented_values() {
+        // Both constants are load-bearing thresholds whose behaviour is not
+        // unit-reachable: a 256 MiB file is prohibitive to build in a test, and
+        // an 8 KiB sniff window is larger than every fixture here. Pin the exact
+        // arithmetic so a silent change to either literal cannot slip through
+        // unobserved.
+        assert_eq!(LARGE_FILE_THRESHOLD, 268_435_456, "256 MiB, in bytes");
+        assert_eq!(BINARY_SNIFF_BYTES, 8_192, "8 KiB, in bytes");
+    }
+
+    #[test]
+    fn binary_sniff_uses_a_strict_scaled_thirty_percent_threshold() {
+        // The documented rule is "> 30 %", not ">= 30 %", and it compares two
+        // SCALED quantities (`non_text * 100` against `len * 30`) — never a
+        // fixed offset. Three fixtures pin all three of those properties.
+
+        // Exactly 30% control bytes is still text (the bound is strict).
+        let mut exactly_30 = vec![b'a'; 100];
+        for b in exactly_30.iter_mut().take(30) {
+            *b = 0x01;
+        }
+        assert!(
+            !sniff_binary(&exactly_30),
+            "exactly 30% control bytes is NOT binary"
+        );
+
+        // One more control byte tips it over.
+        let mut just_over = exactly_30.clone();
+        just_over[30] = 0x01;
+        assert!(sniff_binary(&just_over), "31% control bytes IS binary");
+
+        // A small amount of noise in a large window stays text. This is what
+        // fails if either side of the comparison stops scaling with the window
+        // (e.g. `len + 30` or `len / 30` instead of `len * 30`).
+        let mut sparse = vec![b'a'; 100];
+        sparse[0] = 0x01;
+        sparse[1] = 0x01;
+        assert!(
+            !sniff_binary(&sparse),
+            "2% control bytes is NOT binary — the bound scales with the window"
+        );
+    }
+
+    #[test]
+    fn file_name_is_the_path_leaf_or_untitled() {
+        // `file_name` drives the tab title; nothing in this crate asserted it,
+        // so a blank or constant name went unnoticed.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("report.md");
+        std::fs::write(&p, b"x\n").unwrap();
+        assert_eq!(
+            Document::open(&p).unwrap().file_name(),
+            "report.md",
+            "a file-backed document reports its leaf name"
+        );
+        assert_eq!(
+            Document::scratch().file_name(),
+            "untitled",
+            "a pathless scratch buffer reports `untitled`"
+        );
     }
 }

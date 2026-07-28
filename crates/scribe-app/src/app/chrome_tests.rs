@@ -14,16 +14,42 @@
 //! after driving the app's real titlebar render path is what makes these wiring
 //! tests rather than "the helper I just called did what I called it with".
 
-use super::ScribeApp;
 use super::chrome::{
-    MaximizeRectRetractor, TEST_APPLIED_CHROME_POLICY, TEST_PUBLISHED_MAX_RECT, glyph_is_hovered,
-    system_menu_point,
+    glyph_is_hovered, system_menu_point, MaximizeRectRetractor, TEST_APPLIED_CHROME_POLICY,
+    TEST_PUBLISHED_MAX_RECT,
 };
-use egui::{Rect, pos2, vec2};
+use super::ScribeApp;
+use egui::{pos2, vec2, Rect};
 use egui_kittest::kittest::Queryable as _;
 use scribe_core::Config;
 
 // ───────────────────────── the titlebar render path ─────────────────────────
+
+/// Serialises every test that runs a titlebar pass.
+///
+/// `chrome.rs` tracks "did the titlebar publish this pass?" in two PROCESS-global
+/// `AtomicU64` latches, and a test binary is one process — so passes driven by
+/// concurrent tests interleave on the same two counters. That is not theoretical:
+/// `the_retraction_happens_once_and_then_latches` passed alone and failed in the
+/// suite, because a sibling's pass cleared the latch this test had just set and
+/// the retractor then re-stored the empty rect it was asserting had NOT been
+/// re-stored.
+static CHROME_GLOBALS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take [`CHROME_GLOBALS_LOCK`] and reset the pass latches to their initial
+/// state, so a test starts from a known point rather than from whatever a
+/// sibling left behind.
+///
+/// Poison-tolerant: one failing test must not cascade into every other test in
+/// the file reporting a poisoned-mutex panic instead of its own result.
+fn chrome_globals_guard() -> std::sync::MutexGuard<'static, ()> {
+    let g = CHROME_GLOBALS_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    super::chrome::reset_pass_latches_for_test();
+    TEST_PUBLISHED_MAX_RECT.with(|c| c.set(None));
+    g
+}
 
 /// An app with the CUSTOM (frameless) titlebar — the only mode that lays out the
 /// painted caption buttons, and therefore the only mode that publishes the
@@ -53,6 +79,7 @@ fn published() -> Option<scribe_win32_chrome::RectPx> {
 /// silently never appears — a defect invisible to every other test in the tree.
 #[test]
 fn the_titlebar_publishes_the_maximize_button_rect() {
+    let _chrome = chrome_globals_guard();
     TEST_PUBLISHED_MAX_RECT.with(|c| c.set(None));
     let mut h = harness(frameless_app());
     h.run();
@@ -87,6 +114,7 @@ fn the_titlebar_publishes_the_maximize_button_rect() {
 /// retraction lives in an end-of-pass plugin rather than in the button layout.
 #[test]
 fn the_published_rect_is_retracted_once_the_titlebar_stops_rendering() {
+    let _chrome = chrome_globals_guard();
     TEST_PUBLISHED_MAX_RECT.with(|c| c.set(None));
     let mut h = harness(frameless_app());
     h.run();
@@ -117,9 +145,19 @@ fn the_published_rect_is_retracted_once_the_titlebar_stops_rendering() {
 /// cross-crate store for no reason.
 #[test]
 fn the_retraction_happens_once_and_then_latches() {
+    let _chrome = chrome_globals_guard();
+    // Start from a known hook state. Without this the assertion below reads
+    // whatever a previous pass left behind, which is how this landed red.
+    TEST_PUBLISHED_MAX_RECT.with(|c| c.set(None));
     let mut h = harness(frameless_app());
     h.run();
     h.state_mut().config.appearance.frameless = false;
+    // TWO passes, matching `the_published_rect_is_retracted_once_the_titlebar_
+    // stops_rendering`. The retractor is an END-of-pass plugin, so the pass that
+    // first sees `frameless == false` is already laid out — the retraction lands
+    // on the pass after it. One pass here asserted before the retraction could
+    // possibly have happened and failed with the still-live rect.
+    h.run();
     h.run();
     assert_eq!(
         published(),
@@ -149,6 +187,7 @@ fn the_retraction_happens_once_and_then_latches() {
 /// buttons over the custom titlebar.
 #[test]
 fn the_titlebar_applies_the_chrome_policy() {
+    let _chrome = chrome_globals_guard();
     TEST_APPLIED_CHROME_POLICY.with(|c| c.set(None));
     let mut h = harness(frameless_app());
     h.run();
@@ -304,8 +343,8 @@ fn a_glyph_control_returns_a_real_click_response() {
     let mut app = frameless_app();
     app.open_path(alpha);
     app.open_path(beta); // beta is active
-    // Pin every OTHER tab so exactly one ✕ renders and the
-    // by-glyph query is unambiguous.
+                         // Pin every OTHER tab so exactly one ✕ renders and the
+                         // by-glyph query is unambiguous.
     let last = app.tabs.len() - 1;
     for (i, t) in app.tabs.iter_mut().enumerate() {
         t.pinned = i != last;

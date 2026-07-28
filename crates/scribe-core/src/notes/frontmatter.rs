@@ -224,4 +224,51 @@ mod tests {
         let fm = parse("not a fence\n---\ntitle: X\n---\n");
         assert_eq!(fm, Frontmatter::default());
     }
+
+    #[test]
+    fn a_following_key_ends_the_tags_block_and_is_still_parsed() {
+        // Inside a `tags:` block sequence, the bare-dash arm must match ONLY a
+        // lone `-`. Inverting that test makes it swallow every subsequent line
+        // as a continuation, so the `title:` below is never parsed.
+        let fm = parse("---\ntags:\n  - a\n  -\ntitle: T\n---\nbody");
+        assert_eq!(fm.tags, vec!["a".to_string()], "the bare `-` yields no tag");
+        assert_eq!(
+            fm.title.as_deref(),
+            Some("T"),
+            "a non-indented key ends the block and is parsed as a new key"
+        );
+    }
+
+    #[test]
+    fn an_indented_comment_does_not_end_the_tags_block() {
+        // An indented line that is not `- item` is ignored but must keep us
+        // INSIDE the block, so items after it are still collected. Requiring
+        // both a leading space AND a leading tab makes that guard unreachable
+        // and silently drops every item after the comment.
+        let fm = parse("---\ntags:\n  - a\n  # a comment\n  - b\n---\nbody");
+        assert_eq!(
+            fm.tags,
+            vec!["a".to_string(), "b".to_string()],
+            "items after an indented comment are still collected"
+        );
+    }
+
+    #[test]
+    fn unquote_strips_only_a_matched_quote_pair() {
+        // A leading quote with no matching trailing quote is DATA, not a quote
+        // pair. Loosening either `&&` to `||` strips the lone quote AND eats the
+        // last real character of the value.
+        let fm = parse("---\ntitle: \"unbalanced\n---\n");
+        assert_eq!(
+            fm.title.as_deref(),
+            Some("\"unbalanced"),
+            "an unmatched double quote is kept verbatim"
+        );
+        let fm = parse("---\ntitle: 'unbalanced\n---\n");
+        assert_eq!(
+            fm.title.as_deref(),
+            Some("'unbalanced"),
+            "an unmatched single quote is kept verbatim"
+        );
+    }
 }

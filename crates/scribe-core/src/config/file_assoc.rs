@@ -721,6 +721,86 @@ mod tests {
     }
 
     #[test]
+    fn claim_type_labels_are_distinct_and_name_their_group() {
+        // The Settings checklist renders one row per group from `label()`.
+        // Nothing asserted it, so a blank or single-constant label produced five
+        // identical rows with no way to tell which checkbox toggles what.
+        for c in ClaimType::ALL {
+            assert!(!c.label().is_empty(), "empty label for {c:?}");
+        }
+        let labels: Vec<&str> = ClaimType::ALL.iter().map(|c| c.label()).collect();
+        for i in 0..labels.len() {
+            for j in (i + 1)..labels.len() {
+                assert_ne!(labels[i], labels[j], "duplicate ClaimType label");
+            }
+        }
+        // Pin the user-visible text so a label cannot become a placeholder.
+        assert_eq!(ClaimType::Markdown.label(), "Markdown");
+        assert_eq!(ClaimType::Json.label(), "JSON");
+    }
+
+    #[test]
+    fn macos_utis_are_reverse_dns_and_unique_per_group() {
+        // `macos_utis` was only ever checked for non-emptiness, so any
+        // placeholder string passed. A UTI is a reverse-DNS identifier and — like
+        // the Windows extensions and Linux MIME types — must belong to exactly
+        // one group, or one group's registration silently shadows another's.
+        let mut seen: Vec<(&str, ClaimType)> = Vec::new();
+        for c in ClaimType::ALL {
+            for u in c.macos_utis() {
+                assert!(
+                    u.contains('.') && !u.starts_with('.') && !u.ends_with('.'),
+                    "UTI {u:?} for {c:?} is not a reverse-DNS identifier"
+                );
+                if let Some((_, other)) = seen.iter().find(|(s, _)| s == u) {
+                    panic!("UTI {u} claimed by both {other:?} and {c:?}");
+                }
+                seen.push((u, c));
+            }
+        }
+        // The two anchor UTIs the plain-text / Markdown claims depend on.
+        assert!(
+            ClaimType::PlainText
+                .macos_utis()
+                .contains(&"public.plain-text"),
+            "PlainText must claim the system plain-text UTI"
+        );
+        assert!(
+            ClaimType::Markdown
+                .macos_utis()
+                .contains(&"net.daringfireball.markdown"),
+            "Markdown must claim the system Markdown UTI"
+        );
+    }
+
+    #[test]
+    fn save_format_labels_are_distinct_and_carry_the_extension() {
+        // `filter_label` names the Save-As filter and `ui_label` the Settings
+        // dropdown row. Both were only checked for non-emptiness, so a single
+        // constant made the two formats indistinguishable in the UI.
+        let filters: Vec<&str> = DefaultSaveFormat::ALL
+            .iter()
+            .map(|f| f.filter_label())
+            .collect();
+        let uis: Vec<&str> = DefaultSaveFormat::ALL
+            .iter()
+            .map(|f| f.ui_label())
+            .collect();
+        assert_ne!(filters[0], filters[1], "filter labels must differ");
+        assert_ne!(uis[0], uis[1], "ui labels must differ");
+        // The dropdown row names the extension it will actually write.
+        for f in DefaultSaveFormat::ALL {
+            assert!(
+                f.ui_label().contains(&format!(".{}", f.extension())),
+                "ui_label {:?} must name its extension",
+                f.ui_label()
+            );
+        }
+        assert_eq!(DefaultSaveFormat::Markdown.filter_label(), "Markdown");
+        assert_eq!(DefaultSaveFormat::PlainText.filter_label(), "Plain Text");
+    }
+
+    #[test]
     fn format_labels_are_distinct_and_nonempty() {
         for f in DefaultSaveFormat::ALL {
             assert!(!f.extension().is_empty());
