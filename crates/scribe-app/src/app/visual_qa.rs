@@ -368,6 +368,17 @@ fn scene_settings_appearance() {
     render_settings_category("settings_appearance", "Appearance");
 }
 
+/// Keyboard page — the rebinding UI. This page shipped WITHOUT a visual scene,
+/// so its rows had never actually been looked at: the whole point of the page is
+/// that each row is click-to-capture, and a row that renders as a dead label
+/// (which is what the rows looked like BEFORE they were rebindable) is
+/// indistinguishable from a working one in a passing unit test.
+#[test]
+#[ignore = "GPU render"]
+fn scene_settings_keyboard() {
+    render_settings_category("settings_keyboard", "Keyboard");
+}
+
 /// Several tabs incl. a dirty one + a pinned one — checks the tab strip
 /// layout, the dirty `*` marker, the pin glyph, and active-tab styling.
 #[test]

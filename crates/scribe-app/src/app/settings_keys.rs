@@ -326,6 +326,16 @@ pub(crate) fn show(ui: &mut egui::Ui, config: &mut Config, q: &str) -> bool {
         }
     }
 
+    // Each group renders its OWN `Grid`, and a Grid auto-sizes column 0 to the
+    // widest label IT contains. With a per-group `min_col_width` the chord
+    // buttons and the unbind/restore icons therefore started at a DIFFERENT x in
+    // every group — "Files and tabs" (widest: "Reopen closed tab") sat visibly
+    // left of "Find and navigate" (widest: "Jump to matching bracket"), so the
+    // page read as four misaligned tables rather than one. Measuring the widest
+    // label across EVERY visible row and using it as the shared floor makes all
+    // groups share one column grid. Found by rendering the page and looking at
+    // it — no unit test can see a column that is 40 px off.
+    let label_col = label_column_width(ui, q);
     for (group, rows) in GROUPS {
         let visible: Vec<&(&str, &str)> = rows
             .iter()
@@ -340,7 +350,7 @@ pub(crate) fn show(ui: &mut egui::Ui, config: &mut Config, q: &str) -> bool {
         egui::Grid::new(format!("settings-keys-{group}"))
             .num_columns(4)
             .spacing([16.0, 8.0])
-            .min_col_width(150.0)
+            .min_col_width(label_col)
             .show(ui, |ui| {
                 for (act, label) in visible {
                     changed |= binding_row(ui, config, &defaults, &issues, act, label, warn);
@@ -348,6 +358,29 @@ pub(crate) fn show(ui: &mut egui::Ui, config: &mut Config, q: &str) -> bool {
             });
     }
     changed
+}
+
+/// Width of the label column, shared by every group's grid.
+///
+/// The widest CURRENTLY-VISIBLE row label, measured in the live font, plus a
+/// small gutter — floored at the previous constant so a narrow search result
+/// ("Save") cannot collapse the page into a cramped strip.
+fn label_column_width(ui: &egui::Ui, q: &str) -> f32 {
+    const FLOOR: f32 = 150.0;
+    const GUTTER: f32 = 12.0;
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    let widest = GROUPS
+        .iter()
+        .flat_map(|(_, rows)| rows.iter())
+        .filter(|(_, label)| crate::settings::row_visible(q, label))
+        .map(|(_, label)| {
+            ui.painter()
+                .layout_no_wrap((*label).to_string(), font.clone(), egui::Color32::WHITE)
+                .size()
+                .x
+        })
+        .fold(0.0_f32, f32::max);
+    (widest + GUTTER).max(FLOOR)
 }
 
 /// The issue messages to show in the banner, each once. A conflict yields one
