@@ -485,6 +485,62 @@ fn unbinding_a_row_is_also_reported_up() {
     );
 }
 
+/// The CAPTURE path is the third contributor to `changed`, and the only one
+/// the two tests above do not touch.
+///
+/// `changed |= config.keybindings.set(&target, &combo)` sits at the top of
+/// `show`, where `changed` is still `false` — so flipping that `|=` to `&=`
+/// makes it `false & true == false` and a chord the user just pressed becomes a
+/// change the host never writes to disk. Every existing capture test reads the
+/// live config (or the dispatcher), which the write still updates, so the whole
+/// suite stays green while the rebind silently stops persisting. This drives a
+/// real capture through the page and reads the RETURN value.
+#[test]
+fn a_captured_chord_is_reported_up_so_the_host_persists_it() {
+    use egui_kittest::kittest::Queryable as _;
+
+    struct Page {
+        config: Config,
+        /// Accumulated — see `a_row_button_change_is_reported_up_so_the_host_persists_it`.
+        reported: bool,
+    }
+
+    let default_chord = display_combo("mod+s").expect("mod+s resolves");
+
+    let mut h = egui_kittest::Harness::new_ui_state(
+        |ui, page: &mut Page| {
+            page.reported |= show(ui, &mut page.config, "");
+        },
+        Page {
+            config: Config::default(),
+            reported: false,
+        },
+    );
+    h.run();
+    assert!(!h.state().reported, "no interaction, no change");
+
+    // Click Save's chord button to arm the capture, then press the new chord.
+    h.get_by_label(default_chord.as_str()).click();
+    h.run();
+    assert!(
+        !h.state().reported,
+        "arming a capture is not itself a change — nothing is bound yet"
+    );
+
+    h.key_press_modifiers(CMD | ALT, egui::Key::K);
+    h.run();
+
+    assert_eq!(
+        h.state().config.keybindings.save,
+        "mod+alt+k",
+        "precondition: the capture wrote the new chord"
+    );
+    assert!(
+        h.state().reported,
+        "…and `show` must REPORT the capture, or the rebind is lost on restart"
+    );
+}
+
 /// A row's warning must be ITS OWN.
 ///
 /// `issues.iter().find(|(a, _)| *a == act)` is the only thing tying a row to
@@ -516,6 +572,73 @@ fn only_the_broken_row_carries_a_warning_icon() {
     assert_eq!(
         warned, 1,
         "exactly the ONE unbound row may carry a ⚠ — every other row is healthy"
+    );
+}
+
+/// The conflict BANNER must actually render.
+///
+/// `dedup_messages` has its own test, but that only pins the STRINGS — nothing
+/// asserted the page draws them. The banner is guarded by `if !issues
+/// .is_empty()`, and deleting that `!` inverts it into a guard that can never
+/// produce output: with issues the block is skipped, and without issues the
+/// loop it guards has nothing to iterate. The banner vanishes for every user
+/// while the whole suite stays green, because the per-row ⚠ icon (which has its
+/// own guard) still renders. Two conflicting rows in DIFFERENT groups is the
+/// case the banner exists for — the row icons alone cannot tell you what
+/// collided with what.
+#[test]
+fn a_conflict_renders_a_banner_line_not_just_the_row_icons() {
+    use egui_kittest::kittest::Queryable as _;
+
+    struct Page {
+        config: Config,
+    }
+
+    let mut config = Config::default();
+    // "Save" (Files and tabs) and "Find in this file" (Find and navigate) —
+    // deliberately different groups, so only a page-level banner can name both.
+    config.keybindings.set("save", "mod+k");
+    config.keybindings.set("find", "mod+k");
+    let expected = dedup_messages(&issues_by_action(&config.keybindings));
+    assert_eq!(
+        expected.len(),
+        1,
+        "precondition: this fixture is exactly one conflict, got {expected:?}"
+    );
+
+    let mut h = egui_kittest::Harness::new_ui_state(
+        |ui, page: &mut Page| {
+            show(ui, &mut page.config, "");
+        },
+        Page { config },
+    );
+    h.run();
+
+    let banner = format!("⚠ {}", expected[0]);
+    // `query_*` (not `get_*`) so a MISSING banner fails on this assertion's
+    // message rather than panicking inside the query helper.
+    assert_eq!(
+        h.query_all_by_label(banner.as_str()).count(),
+        1,
+        "the page must draw the conflict banner exactly once — expected a label \
+         reading {banner:?}"
+    );
+
+    // And a page with NO issues draws no banner at all, so the guard is a real
+    // guard rather than an always-on strip.
+    let mut clean = egui_kittest::Harness::new_ui_state(
+        |ui, page: &mut Page| {
+            show(ui, &mut page.config, "");
+        },
+        Page {
+            config: Config::default(),
+        },
+    );
+    clean.run();
+    assert_eq!(
+        clean.query_all_by_label_contains("⚠ ").count(),
+        0,
+        "the shipped defaults are conflict-free and must render no banner"
     );
 }
 
