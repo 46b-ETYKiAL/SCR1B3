@@ -275,6 +275,46 @@ mod tests {
         );
     }
 
+    /// The failure count and its noun must agree.
+    ///
+    /// `if n == 1 { "write" } else { "writes" }` is the only thing keeping the
+    /// message from reading "1 registry writes failed" / "2 registry write
+    /// failed". Every existing message assertion matches a prefix that stops
+    /// before the noun, so flipping that `==` to `!=` inverts the grammar of
+    /// EVERY failure message a user ever sees with the whole suite green. Both
+    /// sides of the equality are pinned here — one alone leaves the flip alive
+    /// in the other direction.
+    #[test]
+    fn the_failure_count_and_its_noun_agree() {
+        let requested = [ClaimType::PlainText, ClaimType::Markdown, ClaimType::Json];
+
+        let one = summarize(&requested, &[failure(Some("markdown"))]);
+        assert!(
+            one.message.contains("(1 registry write failed)"),
+            "a single failed write is singular, got: {}",
+            one.message
+        );
+
+        let two = summarize(
+            &requested,
+            &[failure(Some("markdown")), failure(Some("json"))],
+        );
+        assert!(
+            two.message.contains("(2 registry writes failed)"),
+            "two failed writes are plural, got: {}",
+            two.message
+        );
+
+        // The shared-key branch builds its own sentence from the same pair, so
+        // it needs the same guarantee.
+        let shared = summarize(&requested, &[failure(None)]);
+        assert!(
+            shared.message.contains("(1 registry write failed)"),
+            "the total-failure message is singular for one write, got: {}",
+            shared.message
+        );
+    }
+
     #[test]
     fn a_clean_run_reports_success_and_the_windows_limitation() {
         let requested = [ClaimType::PlainText];
