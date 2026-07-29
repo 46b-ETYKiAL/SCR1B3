@@ -99,6 +99,18 @@ test_tool = "nextest"
 # ONE function in ONE file (no substring/cross-file collision). `show` is
 # file-scoped because the bare word is shared by settings.rs and md_preview.rs.
 exclude_re = [
+  # hit_test.rs `classify`: `caption_height > 0` vs `>= 0` are equivalent.
+  # `classify` early-returns Client unless `geo.client.contains(x, y)`, and
+  # `contains` requires `y >= client.top` — so the third conjunct
+  # `y < client.top + caption_height` already IMPLIES `caption_height > 0`.
+  # The guard is a redundant short-circuit: the two differ only at ch == 0,
+  # where conjunct 3 is false either way. Confirmed empirically over 952,560
+  # classify calls (both modes x caption_height in {-3,-1,0,1,2,34} x 3 client
+  # rects incl. negative/offset tops x maximized x border in {0,1,8} x 3
+  # max-button variants x boundary x/y): byte-identical output.
+  # NOTE: this rests on the `!geo.client.contains(x, y)` early return. If that
+  # guard is ever removed, DROP this pardon — it would start hiding a real bug.
+  'hit_test\.rs.*replace > with >= in classify',
   # scribe-win32-chrome/src/lib.rs: the `#[cfg(windows)]` thin wrappers that
   # delegate to `imp`. Not compiled on the ubuntu mutation runner, so 100% of
   # their mutants are vacuous MISSES no test could ever kill — the same
@@ -207,17 +219,25 @@ exclude_re = [
   'app/builtins\.rs:126:',          # FoldAll active<len: active invariantly clamped to len-1; ==len unreachable
   'app/drag_scroll\.rs:189:',       # edge_autoscroll boundary: depth 0 both ways -> 0.0
   'app/drag_scroll\.rs:191:',
-  'app/drag_scroll\.rs:208:',       # caret_edge_nudge boundary: caret==limit -> 0.0 both ways
-  'app/drag_scroll\.rs:210:',
+  # caret_edge_nudge boundary: at caret==limit both predicates fall through to
+  # the same 0.0. Description-anchored; the old ':208:'/':210:' pair had rotated
+  # onto a blank line and a doc comment.
+  'replace < with <= in caret_edge_nudge',
+  'replace > with >= in caret_edge_nudge',
   'app/file_ops\.rs:47:19:',        # apply_buffer_transform active<len: same invariant as builtins 126
   'app/mod\.rs:107:',               # tab_index_after_move: idx==src guarded before this line
   'replace < with <= in ensure_readable_tone',  # bg_l<0.5 vs <=0.5 differ only at bg_l==0.5 exactly, unreachable from u8 channels (== and > ARE tested)
   'render_support\.rs:458:',        # highlight_job tail-append is defensive: syntect spans always cover the full line (byte==line.len()), so the tail branch never fires; the </>/==/&&->|| variants only toggle firing an EMPTY tail (no-op)
   'replace > with >= in highlight_job::append_split',  # None-branch next-boundary filter: a url starting AT pos would put pos INSIDE it (in_url=Some), so the None branch never sees st==pos -> `>` and `>=` are identical (== and < variants ARE killed)
   'replace match guard \*k == key with false in make_layouter',  # job-cache guard -> false = cache NEVER hits = always recompute highlight_job (deterministic, same output) = performance-equivalent (the 664 galley-cache correctness IS tested)
-  'app/text_ops_methods\.rs:360:',  # move_cursor_line trailing-"" drop: only text=="" distinguishes, then no-op
-  'app/text_ops_methods\.rs:418:',  # duplicate_cursor_line: insert(ln+1,copy)==insert(ln,copy) (author-documented)
-  'app/text_ops_methods\.rs:799:',  # join_cursor_line_with_next: same trailing-"" equivalence
+  'app/text_ops_methods\.rs:364:',  # move_cursor_line trailing-"" drop: only text=="" distinguishes, then no-op
+  # duplicate_cursor_line: `copy == lines[ln]`, so insert(ln+1,copy) and
+  # insert(ln,copy) build element-wise identical vectors and join() the same.
+  # Anchored on the mutant DESCRIPTION, not a line: the old ':418:' anchor
+  # rotated onto a comment when a refactor moved the statement to 423, and the
+  # mutant silently came back.
+  'replace \+ with \* in ScribeApp::duplicate_cursor_line',
+  'app/text_ops_methods\.rs:805:',  # join_cursor_line_with_next: same trailing-"" equivalence
   'change_bar\.rs:54:',             # changed_mask idx<n: new_index() in [0,n-1]; boundary unreachable
   'datetime\.rs:34:',               # format_iso8601_utc else-branch dead for all u64 secs (z>=719_468)
   'editor_features\.rs:264:',       # label_for_def trim disjunction redundant with the following split([...])
