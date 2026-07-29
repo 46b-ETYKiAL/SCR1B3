@@ -99,6 +99,23 @@ test_tool = "nextest"
 # ONE function in ONE file (no substring/cross-file collision). `show` is
 # file-scoped because the bare word is shared by settings.rs and md_preview.rs.
 exclude_re = [
+  # scribe-win32-chrome/src/lib.rs: the `#[cfg(windows)]` thin wrappers that
+  # delegate to `imp`. Not compiled on the ubuntu mutation runner, so 100% of
+  # their mutants are vacuous MISSES no test could ever kill — the same
+  # condition ci.yml already excludes `imp.rs` and `integration/windows.rs` for.
+  # Bounded to `with \(\)` deliberately: each has a `#[cfg(not(windows))]` stub
+  # with an EMPTY body, which generates no `with ()` mutant of its own, so these
+  # patterns cannot reach a compiled definition. The two `-> bool` members of
+  # this family are NOT listed here — their stubs return a real value and DO
+  # generate mutants that are currently caught, so they are re-exported from
+  # `imp.rs` instead (see `the_non_windows_stubs_are_never_mutation_excluded`).
+  'replace set_maximize_button_rect with \(\)',
+  'replace clear_maximize_button_rect with \(\)',
+  'replace set_hit_test_mode with \(\)',
+  'replace set_snap_support_enabled with \(\)',
+  'replace show_system_menu with \(\)',
+  'replace apply_rounded_corners with \(\)',
+  'replace set_backdrop with \(\)',
   "replace path -> Option<&'static PathBuf>",
   'replace log_outcome with \(\)',
   "paint_crt_scanlines",

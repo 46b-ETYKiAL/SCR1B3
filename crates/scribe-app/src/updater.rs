@@ -698,10 +698,32 @@ impl Updater {
 
 #[cfg(test)]
 mod tests {
+    /// Serialises the tests that MUTATE the shared staging directory.
+    ///
+    /// `staging_dir()` is one fixed path per process (`%TEMP%/scr1b3-update`),
+    /// so two tests that create and reap it race. That is not theoretical:
+    /// `cleanup_after_update_removes_the_staging_dir` creates the dir and then
+    /// writes a file into it, and if
+    /// `cleanup_after_update_is_idempotent_and_never_errors` reaps it in
+    /// between, the write `.unwrap()` panics. Pre-existing; it surfaces under
+    /// parallel load, which is why a plain `cargo test` failed here while
+    /// running the test alone always passed.
+    ///
+    /// Poison-tolerant so one failure does not cascade into the other test
+    /// reporting a poisoned mutex instead of its own result.
+    static STAGING_DIR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn staging_guard() -> std::sync::MutexGuard<'static, ()> {
+        STAGING_DIR_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     use super::*;
 
     #[test]
     fn cleanup_after_update_removes_the_staging_dir() {
+        let _staging = staging_guard();
         // cleanup_after_update's first duty is reaping the staging tree (via
         // clean_staging_dir). The `replace with ()` mutant on EITHER function
         // leaves it. Existing idempotent test only asserts no-panic. Kills 49:5, 62:5.
@@ -1335,6 +1357,7 @@ mod tests {
 
     #[test]
     fn cleanup_after_update_is_idempotent_and_never_errors() {
+        let _staging = staging_guard();
         // Best-effort housekeeping: removing a (possibly absent) staging dir and
         // a (possibly absent) `.bak` must be a silent no-op when there is nothing
         // to remove, and must be safe to call repeatedly. It returns () and must

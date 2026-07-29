@@ -189,10 +189,16 @@ pub fn set_main_hwnd(_hwnd: isize) {}
 /// its animations through `MotionConfig::effective_enabled(this)`, so the OS
 /// accessibility preference overrides the in-app toggle. Fast (a registry-cached
 /// read); safe to call per frame.
+// The Windows body is RE-EXPORTED from `imp` rather than wrapped here.
+// A `#[cfg(windows)] pub fn` wrapper is not compiled on the ubuntu mutation
+// runner, so every mutant of it is a vacuous MISS — but it shares its NAME
+// with the `#[cfg(not(windows))]` stub below, whose mutants are REAL and are
+// caught by `off_windows_the_query_stubs_answer_false`. A name-keyed
+// exclusion could not separate the two and would have silenced the real one.
+// Re-exporting moves the Windows definition into `imp.rs`, which is already
+// excluded as a whole file, and leaves the compiled stub under full coverage.
 #[cfg(windows)]
-pub fn os_reduced_motion() -> bool {
-    imp::os_reduced_motion()
-}
+pub use imp::os_reduced_motion;
 
 /// Non-Windows: no OS signal is consulted, so motion follows the in-app toggle
 /// only (reduced-motion `false` means "the OS is not forcing motion off").
@@ -288,11 +294,16 @@ pub fn clear_maximize_button_rect() {}
 /// events, so egui's own `Response::hovered()` goes permanently false there and
 /// the button stops painting its hover fill. Read this and OR it into the
 /// button's hover state to restore that. Always `false` off-Windows.
+// The Windows body is RE-EXPORTED from `imp` rather than wrapped here.
+// A `#[cfg(windows)] pub fn` wrapper is not compiled on the ubuntu mutation
+// runner, so every mutant of it is a vacuous MISS — but it shares its NAME
+// with the `#[cfg(not(windows))]` stub below, whose mutants are REAL and are
+// caught by `off_windows_the_query_stubs_answer_false`. A name-keyed
+// exclusion could not separate the two and would have silenced the real one.
+// Re-exporting moves the Windows definition into `imp.rs`, which is already
+// excluded as a whole file, and leaves the compiled stub under full coverage.
 #[cfg(windows)]
-#[must_use]
-pub fn maximize_button_hovered() -> bool {
-    imp::maximize_button_hovered()
-}
+pub use imp::maximize_button_hovered;
 
 /// Always `false` on non-Windows platforms.
 #[cfg(not(windows))]
@@ -446,14 +457,12 @@ mod tests {
     /// and fail loudly, but a shift that happens to land on a same-gated
     /// neighbour would keep passing while silently checking the wrong function —
     /// a guard that reads green having verified nothing.
-    const MUTATION_EXCLUDED_WRAPPERS: [&str; 12] = [
+    const MUTATION_EXCLUDED_WRAPPERS: [&str; 10] = [
         "ensure_caption_stripped",
         "set_main_hwnd",
-        "os_reduced_motion",
         "allow_foreground_handoff",
         "set_maximize_button_rect",
         "clear_maximize_button_rect",
-        "maximize_button_hovered",
         "set_hit_test_mode",
         "set_snap_support_enabled",
         "show_system_menu",
@@ -465,10 +474,13 @@ mod tests {
     /// runner, so their mutants are real signal and must never be excluded —
     /// `off_windows_the_query_stubs_answer_false` is what kills them.
     ///
-    /// Both names also appear in [`MUTATION_EXCLUDED_WRAPPERS`]: each is a
-    /// cfg-PAIR, one Windows body and one stub, and only the Windows half is
-    /// excluded. That overlap is why the lookups below select by `#[cfg]` rather
-    /// than by name alone.
+    /// Their Windows halves are RE-EXPORTS (`#[cfg(windows)] pub use imp::NAME;`),
+    /// NOT wrappers, so they are deliberately absent from
+    /// [`MUTATION_EXCLUDED_WRAPPERS`]. That is the whole point: a name-keyed
+    /// exclusion cannot tell a vacuous `#[cfg(windows)]` wrapper from the REAL
+    /// stub that shares its name, so excluding these two by name would have
+    /// silenced mutants that are currently CAUGHT. Re-exporting puts the
+    /// Windows definition inside the already-excluded `imp.rs` instead.
     const STUBS_THAT_MUST_STAY_GATED: [&str; 2] = ["os_reduced_motion", "maximize_button_hovered"];
 
     /// Every `#[cfg(..)]` attribute governing a top-level `fn <name>` in `src`.
@@ -564,14 +576,28 @@ mod tests {
                  `off_windows_the_query_stubs_answer_false` is what kills its \
                  mutants."
             );
-            // …and the pair must remain a pair. If the Windows half vanished,
-            // the surviving body is cross-platform and excluding it would be
-            // silencing rather than de-noising.
+            // The stub must NOT also have a `#[cfg(windows)] pub fn` twin here.
+            // Such a twin is not compiled on the ubuntu runner, so all of its
+            // mutants are vacuous MISSES — and because it shares this name, no
+            // name-keyed exclusion could suppress them without ALSO suppressing
+            // the stub's mutants, which are real and currently caught. The
+            // Windows half therefore lives in the already-excluded `imp.rs` and
+            // is surfaced by re-export.
             assert!(
-                cfgs.iter().any(|c| c == "#[cfg(windows)]"),
-                "`{name}` lost its `#[cfg(windows)]` half: {cfgs:?}. A single \
-                 cross-platform body's mutants are REAL — drop it from \
-                 MUTATION_EXCLUDED_WRAPPERS and from ci.yml."
+                !cfgs.iter().any(|c| c == "#[cfg(windows)]"),
+                "`{name}` grew a `#[cfg(windows)] pub fn` twin in lib.rs: {cfgs:?}. \
+                 That twin's mutants are vacuous on the ubuntu gate and cannot be \
+                 excluded by name without silencing the stub's REAL ones. Put the \
+                 Windows body in `imp.rs` and re-export it instead."
+            );
+
+            // …and the re-export must actually be there, or the Windows build
+            // has no definition at all.
+            let reexport = format!("#[cfg(windows)]\npub use imp::{name};");
+            assert!(
+                src.contains(&reexport),
+                "`{name}` has no `#[cfg(windows)] pub use imp::{name};` re-export — \
+                 the Windows target would have no definition for it."
             );
         }
     }
@@ -591,11 +617,22 @@ mod tests {
             "the number of off-Windows stubs changed; each new one carries a \
              REAL mutant that needs a killing assertion in this module"
         );
+        // Every `#[cfg(windows)]` in this file is accounted for by exactly one of
+        // three roles, so a NEW one cannot appear without failing here:
+        //   * one per excluded wrapper (vacuous on ubuntu — excluded by name),
+        //   * one on `mod imp;` (the whole file is excluded),
+        //   * one per re-exported stub pair (`pub use imp::NAME;`) — the Windows
+        //     definition lives inside the already-excluded `imp.rs`, which is how
+        //     those two avoid needing a name-keyed exclusion that would also
+        //     silence their compiled stubs.
+        let reexported = STUBS_THAT_MUST_STAY_GATED.len();
         assert_eq!(
             windows_gated,
-            MUTATION_EXCLUDED_WRAPPERS.len() + 1,
-            "expected one `#[cfg(windows)]` per excluded wrapper plus the one on \
-             `mod imp;`; update BOTH this list and ci.yml"
+            MUTATION_EXCLUDED_WRAPPERS.len() + 1 + reexported,
+            "expected one `#[cfg(windows)]` per excluded wrapper ({}), plus the one \
+             on `mod imp;`, plus one per re-exported stub pair ({reexported}); \
+             update BOTH this list and ci.yml",
+            MUTATION_EXCLUDED_WRAPPERS.len()
         );
     }
 

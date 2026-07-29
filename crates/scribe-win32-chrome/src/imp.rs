@@ -45,7 +45,7 @@ use crate::Backdrop;
 /// Query `SPI_GETCLIENTAREAANIMATION`. The BOOL out-param is `TRUE` when
 /// animations are ON; reduced-motion is the negation. A failed call (returns
 /// 0) is treated as "not reduced" so a query error never suppresses motion.
-pub(super) fn os_reduced_motion() -> bool {
+pub fn os_reduced_motion() -> bool {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         SystemParametersInfoW, SPI_GETCLIENTAREAANIMATION,
     };
