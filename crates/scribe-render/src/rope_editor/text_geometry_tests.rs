@@ -362,6 +362,65 @@ fn apply_event_arrow_left_at_start_clamps() {
     assert_eq!(st.edit.cursor, 0, "left at start stays at 0");
 }
 
+/// The `if cmd` guard on the ArrowLeft word-jump arm is what SEPARATES the two
+/// ArrowLeft behaviours, and only a test that presses the SAME key both ways
+/// can pin it.
+///
+/// `Key::ArrowLeft if cmd` (word jump) sits directly above the unguarded
+/// `Key::ArrowLeft` (one character). Hard-wire that guard to `true` and a plain
+/// ArrowLeft silently starts jumping words; hard-wire it to `false` and
+/// Ctrl+ArrowLeft degrades to a one-character step, the guarded arm becoming
+/// dead code. Asserting only one direction leaves the other mutation alive, so
+/// this drives both from one caret position and requires the results to DIFFER
+/// — and to differ in the specific, documented way.
+#[test]
+fn apply_event_arrow_left_jumps_a_word_only_with_the_modifier() {
+    const TEXT: &str = "hello world";
+    let caret = TEXT.chars().count(); // end of buffer
+
+    // Plain ArrowLeft: exactly one character.
+    let mut r = Rope::from_str(TEXT);
+    let mut st = RopeEditorState::new();
+    st.edit = EditState::at(caret);
+    let out = apply_event(&mut r, &mut st, &plain(egui::Key::ArrowLeft));
+    assert!(out.consumed, "ArrowLeft is handled by the rope editor");
+    let plain_cursor = st.edit.cursor;
+    assert_eq!(
+        plain_cursor,
+        caret - 1,
+        "a plain ArrowLeft moves ONE character — if it jumps a word, the \
+         `if cmd` guard is no longer separating the two arms"
+    );
+
+    // Ctrl+ArrowLeft: back to the start of the word the caret sits after.
+    let mut r = Rope::from_str(TEXT);
+    let mut st = RopeEditorState::new();
+    st.edit = EditState::at(caret);
+    let out = apply_event(
+        &mut r,
+        &mut st,
+        &key(egui::Key::ArrowLeft, false, true, false),
+    );
+    assert!(out.consumed, "Ctrl+ArrowLeft is handled by the rope editor");
+    let word_cursor = st.edit.cursor;
+    assert_eq!(
+        word_cursor,
+        TEXT.find("world").expect("fixture contains the word"),
+        "Ctrl+ArrowLeft lands on the start of `world` — if it stops one \
+         character back, the guarded word-jump arm is dead"
+    );
+
+    assert_ne!(
+        plain_cursor, word_cursor,
+        "the modifier must CHANGE the outcome; equal results mean the guard \
+         has collapsed to a constant in one direction or the other"
+    );
+    assert!(
+        !st.edit.has_selection(),
+        "without Shift a word jump moves the caret, it does not select"
+    );
+}
+
 /// ArrowUp / ArrowDown move between lines preserving the goal column.
 #[test]
 fn apply_event_arrow_up_down_change_line() {

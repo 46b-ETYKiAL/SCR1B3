@@ -395,6 +395,54 @@ mod tests {
         );
     }
 
+    /// The `Some(0)` short-circuit is a DISJUNCT, not a conjunct.
+    ///
+    /// `if q.pattern.is_empty() || max == Some(0)` returns before `build_regex`
+    /// even runs, so "replace at most zero" is a total no-op — it never
+    /// compiles, never scans, and therefore cannot fail. Flip that `||` to
+    /// `&&` and the guard only fires when BOTH hold: a `Some(0)` call with a
+    /// real pattern falls through and compiles the regex.
+    ///
+    /// Every other observable is identical under the flip (a `Some(0)` fall-
+    /// through breaks on the loop's first iteration and re-emits the whole
+    /// text; an empty pattern compiles to a regex whose every match is
+    /// zero-width and is skipped) — the ONE thing that survives to the caller
+    /// is the compile ERROR. So the discriminating input is a *bad* pattern
+    /// with `max == Some(0)`: exactly the `max` side of the disjunction true.
+    #[test]
+    fn replace_n_zero_short_circuits_before_the_pattern_is_even_compiled() {
+        let bad = Query {
+            pattern: "(unclosed".into(),
+            regex: true,
+            ..Default::default()
+        };
+        // Precondition: this pattern really is uncompilable, so the test is
+        // asserting a short-circuit rather than a pattern that merely works.
+        assert!(
+            replace_n("(unclosed group", &bad, "x", Some(1)).is_err(),
+            "precondition: the pattern must fail to compile when it IS compiled"
+        );
+        assert_eq!(
+            replace_n("(unclosed group", &bad, "x", Some(0)).unwrap(),
+            "(unclosed group",
+            "`Some(0)` means do nothing — it must return the text unchanged \
+             without ever compiling the pattern"
+        );
+    }
+
+    /// The pattern side of that same disjunction: an empty pattern is a no-op
+    /// for every cap, including the caps that do NOT satisfy the `Some(0)` arm.
+    #[test]
+    fn replace_n_empty_pattern_is_a_noop_at_every_cap() {
+        for max in [None, Some(1), Some(99)] {
+            assert_eq!(
+                replace_n("alpha alpha", &q(""), "beta", max).unwrap(),
+                "alpha alpha",
+                "an empty query replaces nothing at max={max:?}"
+            );
+        }
+    }
+
     #[test]
     fn replace_n_cap_above_match_count_replaces_everything() {
         assert_eq!(replace_n("a a a", &q("a"), "b", Some(99)).unwrap(), "b b b");
