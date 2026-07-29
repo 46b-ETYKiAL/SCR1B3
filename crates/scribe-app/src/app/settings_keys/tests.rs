@@ -548,6 +548,41 @@ mod wiring {
         h
     }
 
+    /// Every group's chord column starts at the SAME x.
+    ///
+    /// Each group renders its own `egui::Grid`, and a Grid auto-sizes column 0 to
+    /// the widest label IT contains — so with a per-group `min_col_width` the
+    /// chord buttons started ~40px apart between "Files and tabs" (widest:
+    /// "Reopen closed tab") and "Find and navigate" (widest: "Jump to matching
+    /// bracket"), and the page read as four misaligned tables. `show` now feeds
+    /// every grid one shared width from `label_column_width`.
+    ///
+    /// `label_column_width` has its own unit test, but that only pins the NUMBER.
+    /// Nothing asserted the grids USE it: cutting `.min_col_width(label_col)` to
+    /// `.min_col_width(0.0)` left the whole app-bin suite AND the GPU visual
+    /// baselines green, because `visual_qa`'s scenes only write a PNG and assert
+    /// nothing, and the three gated baselines do not include the Keyboard page.
+    /// Comparing two real rendered rows from DIFFERENT groups is what closes it.
+    #[test]
+    fn the_chord_column_is_aligned_across_groups() {
+        let h = harness();
+
+        // Two default chords whose rows live in different groups, chosen because
+        // their groups have different longest labels — the exact case that
+        // diverged.
+        let files_and_tabs = h.get_by_label("Ctrl+N").rect(); // "New file"
+        let find_and_navigate = h.get_by_label("Ctrl+F").rect(); // "Find in this file"
+
+        assert!(
+            (files_and_tabs.left() - find_and_navigate.left()).abs() < 0.5,
+            "the chord column must start at the same x in every group, so the page \
+             reads as ONE table: Files-and-tabs starts at {} and Find-and-navigate \
+             at {}",
+            files_and_tabs.left(),
+            find_and_navigate.left()
+        );
+    }
+
     /// THE discriminating test. A user clicks Save's chord button in Settings,
     /// presses Ctrl+Alt+K, and the editor's dispatcher must fire Save on
     /// Ctrl+Alt+K — with no restart and no "apply" step.

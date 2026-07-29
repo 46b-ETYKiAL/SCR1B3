@@ -2393,6 +2393,66 @@ mod tests {
         });
     }
 
+    /// The painted pass actually FEEDS `state.page_rows` from the viewport.
+    ///
+    /// `page_rows_holds_one_row_back_and_never_returns_zero` pins the helper's
+    /// arithmetic; this pins that `show_editable` still calls it. Those are
+    /// different failures: the helper was once extracted and left with
+    /// production keeping its own inline copy, so a correct-and-tested helper
+    /// sat beside a live path that never used it.
+    ///
+    /// Asserted by RESPONSE rather than by recomputing the expected number with
+    /// the same helper — a test that calls the function under test to build its
+    /// own expectation proves only that the function equals itself. Taller lines
+    /// must fit FEWER rows in the same viewport, so a hard-coded `state.page_rows
+    /// = 10` (or a dropped assignment leaving the default) cannot satisfy this.
+    #[test]
+    fn a_painted_pass_drives_page_rows_from_the_viewport() {
+        fn rows_for_line_height(line_h: f32) -> usize {
+            let mut state = RopeEditorState::new();
+            // A sentinel no viewport could plausibly produce, so "still the
+            // default" and "never assigned" are both visible failures.
+            state.page_rows = usize::MAX;
+            let ctx = egui::Context::default();
+            // Fix the surface so the row count is a function of `line_h` alone.
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(800.0, 600.0),
+                )),
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let mut b = Buffer::Rope(Rope::from_str(&"line\n".repeat(400)));
+                    let _ = RopeEditor::new(&mut b, FontId::monospace(14.0), line_h)
+                        .show_editable(ui, &mut state);
+                });
+            });
+            state.page_rows
+        }
+
+        let tight = rows_for_line_height(12.0);
+        let loose = rows_for_line_height(48.0);
+
+        assert_ne!(
+            tight,
+            usize::MAX,
+            "the painted pass never assigned page_rows — the viewport wire is cut"
+        );
+        assert_ne!(loose, usize::MAX, "same, at the larger line height");
+        assert!(
+            tight > loose,
+            "taller lines must fit FEWER rows in the same 600px viewport, so the \
+             step has to be derived from the live geometry: got {tight} at 12px \
+             and {loose} at 48px"
+        );
+        assert!(
+            loose >= 1,
+            "even a coarse viewport must still step by at least one row"
+        );
+    }
+
     /// The whitespace-overlay path renders a buffer containing spaces + tabs
     /// without panicking and reports the rope branch (exercises
     /// `with_render_whitespace`).

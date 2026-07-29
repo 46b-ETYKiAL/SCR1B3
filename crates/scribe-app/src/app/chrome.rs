@@ -197,6 +197,41 @@ fn apply_chrome_policy() {
 #[derive(Default)]
 pub(super) struct MaximizeRectRetractor;
 
+/// What an end-of-pass should do, given the latch state and the current pass.
+///
+/// Extracted as a PURE decision because the state it reads
+/// ([`LAST_MAX_RECT_PASS`]) is a process-global, and a test binary is one
+/// process: any test anywhere that renders a frameless titlebar advances it.
+/// "Run two idle passes and observe that nothing was re-stored" is therefore not
+/// decidable from a live harness — a concurrent pass in another test file
+/// (`e2e.rs`, `e2e_overlays.rs`) legitimately un-latches it mid-assertion, which
+/// is exactly how that test failed intermittently in a plain `cargo test` while
+/// passing under `--test-threads=1`.
+///
+/// Over `(last_pass, pass)` the decision is total and deterministic, so the
+/// latching property is pinned here instead — all three cases, rather than the
+/// one the harness could observe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum EndPassAction {
+    /// The titlebar published this very pass — the button is on screen.
+    PublishedThisPass,
+    /// First pass without a publish: retract now, then latch.
+    RetractNow,
+    /// Already retracted; an idle pass must NOT re-store the empty rect.
+    AlreadyLatched,
+}
+
+/// The pure end-of-pass decision. See [`EndPassAction`].
+pub(super) const fn classify_end_pass(last_pass: u64, pass: u64) -> EndPassAction {
+    if last_pass == pass {
+        EndPassAction::PublishedThisPass
+    } else if last_pass == u64::MAX {
+        EndPassAction::AlreadyLatched
+    } else {
+        EndPassAction::RetractNow
+    }
+}
+
 impl egui::Plugin for MaximizeRectRetractor {
     fn debug_name(&self) -> &'static str {
         "scr1b3::MaximizeRectRetractor"
@@ -205,15 +240,16 @@ impl egui::Plugin for MaximizeRectRetractor {
     fn on_end_pass(&mut self, ui: &mut egui::Ui) {
         use std::sync::atomic::Ordering;
         let pass = ui.ctx().cumulative_pass_nr();
-        if LAST_MAX_RECT_PASS.load(Ordering::Relaxed) == pass {
-            return; // published this pass — the button is on screen.
-        }
-        // Not published this pass. Retract once, then latch (u64::MAX) so we do
-        // not re-store the same empty rect on every subsequent idle pass.
-        if LAST_MAX_RECT_PASS.swap(u64::MAX, Ordering::Relaxed) != u64::MAX {
-            retract_maximize_rect();
-            *TITLEBAR_BAND.lock().unwrap_or_else(|e| e.into_inner()) = None;
-            *CAPTION_BTN_UNION.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        // One load, one decision, one transition — so the branch the tests pin is
+        // the branch production takes.
+        match classify_end_pass(LAST_MAX_RECT_PASS.load(Ordering::Relaxed), pass) {
+            EndPassAction::PublishedThisPass | EndPassAction::AlreadyLatched => {}
+            EndPassAction::RetractNow => {
+                LAST_MAX_RECT_PASS.store(u64::MAX, Ordering::Relaxed);
+                retract_maximize_rect();
+                *TITLEBAR_BAND.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                *CAPTION_BTN_UNION.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            }
         }
     }
 }

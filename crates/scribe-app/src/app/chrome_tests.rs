@@ -21,6 +21,7 @@ use super::chrome::{
 use super::ScribeApp;
 use egui::{pos2, vec2, Rect};
 use egui_kittest::kittest::Queryable as _;
+use egui_kittest::Harness;
 use scribe_core::Config;
 
 // ───────────────────────── the titlebar render path ─────────────────────────
@@ -61,10 +62,30 @@ fn frameless_app() -> ScribeApp {
     ScribeApp::new_test(cfg)
 }
 
-fn harness(app: ScribeApp) -> egui_kittest::Harness<'static, ScribeApp> {
-    egui_kittest::Harness::builder()
+/// Build a titlebar harness, holding [`CHROME_GLOBALS_LOCK`] for as long as the
+/// caller keeps the returned guard.
+///
+/// The guard is returned FROM here rather than taken separately by each test on
+/// purpose: running a pass is what touches the process-global latches, so every
+/// caller of this function needs it — and when it was a separate call, one test
+/// (`a_glyph_control_returns_a_real_click_response`) simply did not make it.
+/// That single omission was enough to turn a plain `cargo test` red with a
+/// ROTATING victim, because its unguarded pass stored its own pass number and
+/// the guarded test's end-of-pass retractor then overwrote that test's rect.
+///
+/// Returning the guard makes the omission impossible: you cannot obtain a
+/// harness without also obtaining the lock.
+fn harness(
+    app: ScribeApp,
+) -> (
+    std::sync::MutexGuard<'static, ()>,
+    Harness<'static, ScribeApp>,
+) {
+    let guard = chrome_globals_guard();
+    let h = Harness::builder()
         .with_size(vec2(1100.0, 760.0))
-        .build_state(|ctx, app: &mut ScribeApp| app.frame_tick(ctx), app)
+        .build_state(|ctx, app: &mut ScribeApp| app.frame_tick(ctx), app);
+    (guard, h)
 }
 
 fn published() -> Option<scribe_win32_chrome::RectPx> {
@@ -79,9 +100,8 @@ fn published() -> Option<scribe_win32_chrome::RectPx> {
 /// silently never appears — a defect invisible to every other test in the tree.
 #[test]
 fn the_titlebar_publishes_the_maximize_button_rect() {
-    let _chrome = chrome_globals_guard();
     TEST_PUBLISHED_MAX_RECT.with(|c| c.set(None));
-    let mut h = harness(frameless_app());
+    let (_chrome, mut h) = harness(frameless_app());
     h.run();
 
     let px = published().expect("the titlebar render path must publish a rect");
@@ -114,9 +134,8 @@ fn the_titlebar_publishes_the_maximize_button_rect() {
 /// retraction lives in an end-of-pass plugin rather than in the button layout.
 #[test]
 fn the_published_rect_is_retracted_once_the_titlebar_stops_rendering() {
-    let _chrome = chrome_globals_guard();
     TEST_PUBLISHED_MAX_RECT.with(|c| c.set(None));
-    let mut h = harness(frameless_app());
+    let (_chrome, mut h) = harness(frameless_app());
     h.run();
     let live = published().expect("published while the titlebar renders");
     assert!(
@@ -143,36 +162,71 @@ fn the_published_rect_is_retracted_once_the_titlebar_stops_rendering() {
 /// The end-of-pass plugin runs on EVERY pass, including the thousands where
 /// nothing changed; re-publishing an empty rect each time would be a per-frame
 /// cross-crate store for no reason.
+///
+/// Asserted over the PURE decision rather than by idling a live harness. The
+/// latch lives in a process-global pass counter, and a test binary is one
+/// process: `e2e.rs` and `e2e_overlays.rs` also render frameless titlebars, so a
+/// concurrent pass there legitimately un-latches it while this test idles. That
+/// made the harness form fail intermittently under a plain `cargo test` (victim
+/// rotating between this test and its siblings) while passing under
+/// `--test-threads=1` — a red that meant "a sibling rendered", not "the latch
+/// broke". No file-scoped lock can fix that; the property simply is not
+/// decidable from a live harness.
+///
+/// Over `(last_pass, pass)` it IS decidable, and all THREE branches get pinned
+/// instead of the single one the harness could reach.
 #[test]
 fn the_retraction_happens_once_and_then_latches() {
-    let _chrome = chrome_globals_guard();
-    // Start from a known hook state. Without this the assertion below reads
-    // whatever a previous pass left behind, which is how this landed red.
+    use super::chrome::{classify_end_pass, EndPassAction};
+
+    // Published on this very pass → leave the live rect alone.
+    assert_eq!(
+        classify_end_pass(7, 7),
+        EndPassAction::PublishedThisPass,
+        "a pass that published must not be retracted out from under itself"
+    );
+
+    // First pass after the titlebar went away → retract, exactly once.
+    assert_eq!(
+        classify_end_pass(7, 8),
+        EndPassAction::RetractNow,
+        "the first non-publishing pass is what retracts the stale rect"
+    );
+
+    // Already latched → every later idle pass is a no-op. This is the branch the
+    // live harness could never hold still long enough to observe.
+    assert_eq!(
+        classify_end_pass(u64::MAX, 9),
+        EndPassAction::AlreadyLatched,
+        "an idle pass after the retraction must not re-store the empty rect"
+    );
+    assert_eq!(
+        classify_end_pass(u64::MAX, 10_000),
+        EndPassAction::AlreadyLatched,
+        "…and it must still be a no-op thousands of passes later"
+    );
+}
+
+/// The RETRACTION ITSELF, through the live plugin.
+///
+/// The pure test above pins the decision; this pins that the decision is
+/// actually wired to the app's end-of-pass. Both halves are needed: a pure test
+/// alone would pass with the plugin unregistered.
+#[test]
+fn the_titlebar_going_away_retracts_through_the_live_plugin() {
     TEST_PUBLISHED_MAX_RECT.with(|c| c.set(None));
-    let mut h = harness(frameless_app());
+    let (_chrome, mut h) = harness(frameless_app());
     h.run();
     h.state_mut().config.appearance.frameless = false;
-    // TWO passes, matching `the_published_rect_is_retracted_once_the_titlebar_
-    // stops_rendering`. The retractor is an END-of-pass plugin, so the pass that
-    // first sees `frameless == false` is already laid out — the retraction lands
-    // on the pass after it. One pass here asserted before the retraction could
-    // possibly have happened and failed with the still-live rect.
+    // TWO passes: the retractor is an END-of-pass plugin, so the pass that first
+    // sees `frameless == false` is already laid out — the retraction lands on the
+    // pass after it.
     h.run();
     h.run();
     assert_eq!(
         published(),
         Some(scribe_win32_chrome::RectPx::new(0, 0, 0, 0)),
         "retracted after the titlebar went away"
-    );
-
-    // Clear the hook and idle: a latched retractor must not touch it again.
-    TEST_PUBLISHED_MAX_RECT.with(|c| c.set(None));
-    h.run();
-    h.run();
-    assert_eq!(
-        published(),
-        None,
-        "the retraction is latched — idle passes must not keep re-storing it"
     );
 }
 
@@ -187,9 +241,8 @@ fn the_retraction_happens_once_and_then_latches() {
 /// buttons over the custom titlebar.
 #[test]
 fn the_titlebar_applies_the_chrome_policy() {
-    let _chrome = chrome_globals_guard();
     TEST_APPLIED_CHROME_POLICY.with(|c| c.set(None));
-    let mut h = harness(frameless_app());
+    let (_chrome, mut h) = harness(frameless_app());
     h.run();
 
     assert_eq!(
@@ -350,7 +403,7 @@ fn a_glyph_control_returns_a_real_click_response() {
         t.pinned = i != last;
     }
 
-    let mut h = harness(app);
+    let (_chrome, mut h) = harness(app);
     h.run();
     let before = h.state().tabs.len();
     h.get_by_label(egui_phosphor::thin::X).click();
