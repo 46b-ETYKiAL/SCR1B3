@@ -11,6 +11,7 @@
 //! (`` `…` ``) are skipped so a `#comment` inside a shell snippet is not
 //! mistaken for a tag. Pure — no I/O.
 
+use super::scan_guard::assert_advanced;
 use std::collections::BTreeSet;
 
 /// True if `c` may appear in a tag body.
@@ -46,7 +47,15 @@ fn scan_line_tags(line: &str, out: &mut BTreeSet<String>) {
     let chars: Vec<char> = line.chars().collect();
     let mut i = 0usize;
     let mut in_code = false;
+    // Cursor at the top of the previous iteration. `usize::MAX` is a safe "no
+    // previous iteration yet" sentinel: `i` is bounded by `chars.len()`, so it
+    // can never legitimately reach it.
+    let mut prev_i = usize::MAX;
     while i < chars.len() {
+        if prev_i != usize::MAX {
+            assert_advanced(prev_i, i, "scan_line_tags");
+        }
+        prev_i = i;
         let c = chars[i];
         if c == '`' {
             in_code = !in_code;
@@ -69,7 +78,12 @@ fn scan_line_tags(line: &str, out: &mut BTreeSet<String>) {
             if prev_ok {
                 // Collect the tag body.
                 let mut j = i + 1;
+                let mut prev_j = usize::MAX;
                 while j < chars.len() && is_tag_char(chars[j]) {
+                    if prev_j != usize::MAX {
+                        assert_advanced(prev_j, j, "scan_line_tags tag body");
+                    }
+                    prev_j = j;
                     j += 1;
                 }
                 let body: String = chars[i + 1..j].iter().collect();

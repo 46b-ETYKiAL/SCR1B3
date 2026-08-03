@@ -693,8 +693,24 @@ mod wiring {
         // Two default chords whose rows live in different groups, chosen because
         // their groups have different longest labels — the exact case that
         // diverged.
-        let files_and_tabs = h.get_by_label("Ctrl+N").rect(); // "New file"
-        let find_and_navigate = h.get_by_label("Ctrl+F").rect(); // "Find in this file"
+        //
+        // The locator is DERIVED from `display_combo`, not hard-coded: the same
+        // binding renders "Ctrl+N" on Windows/Linux and "Cmd+N" on macOS, so the
+        // literal spelling failed the whole macos-latest job with a bare "no
+        // nodes found". Deriving it is not circular — the label is only a handle
+        // for FINDING the widget; the assertion below is about geometry, which
+        // `display_combo` has no say in.
+        let chord_label = |act: &str| {
+            let combo = Keybindings::default()
+                .get(act)
+                .unwrap_or_else(|| panic!("`{act}` must have a default binding"))
+                .to_string();
+            crate::app::keymap::display_combo(&combo)
+                .unwrap_or_else(|| panic!("`{act}`'s default combo `{combo}` must be displayable"))
+        };
+
+        let files_and_tabs = h.get_by_label(&chord_label(action::NEW_FILE)).rect();
+        let find_and_navigate = h.get_by_label(&chord_label(action::FIND)).rect();
 
         assert!(
             (files_and_tabs.left() - find_and_navigate.left()).abs() < 0.5,

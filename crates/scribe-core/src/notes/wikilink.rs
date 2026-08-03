@@ -21,6 +21,8 @@
 //! [`crate::notes::vault_path`], which rejects traversal. A `target` string here
 //! is UNTRUSTED note content and must be sanitised before any path use.
 
+use super::scan_guard::assert_advanced;
+
 /// One parsed `[[wiki-link]]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WikiLink {
@@ -68,7 +70,15 @@ pub fn extract_wikilinks(text: &str) -> Vec<WikiLink> {
     let mut out = Vec::new();
     let mut i = 0usize;
     let n = bytes.len();
+    // See `notes::scan_guard`: this loop's stride varies (it jumps past a whole
+    // `[[...]]`), so forward progress is a per-branch obligation, not a
+    // structural guarantee.
+    let mut prev_i = usize::MAX;
     while i + 1 < n {
+        if prev_i != usize::MAX {
+            assert_advanced(prev_i, i, "extract_wikilinks");
+        }
+        prev_i = i;
         if bytes[i] == b'[' && bytes[i + 1] == b'[' {
             // A `[[` — find the closing `]]`.
             let inner_start = i + 2;
@@ -94,7 +104,12 @@ pub fn extract_wikilinks(text: &str) -> Vec<WikiLink> {
 /// does not close the link.
 fn find_close(bytes: &[u8]) -> Option<usize> {
     let mut j = 0usize;
+    let mut prev_j = usize::MAX;
     while j + 1 < bytes.len() {
+        if prev_j != usize::MAX {
+            assert_advanced(prev_j, j, "find_close");
+        }
+        prev_j = j;
         if bytes[j] == b']' && bytes[j + 1] == b']' {
             return Some(j);
         }

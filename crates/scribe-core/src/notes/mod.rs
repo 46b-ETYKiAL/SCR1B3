@@ -19,6 +19,7 @@
 pub mod frontmatter;
 pub mod meta;
 pub mod query;
+mod scan_guard;
 pub mod tags;
 pub mod vault_path;
 pub mod wikilink;
