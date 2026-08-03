@@ -56,6 +56,28 @@ pub(super) fn assert_advanced(prev: usize, next: usize, what: &str) {
 mod tests {
     use super::assert_advanced;
 
+    // The three `should_panic` cases below are gated on `debug_assertions`
+    // because the guard IS a `debug_assert!` — in a release build its body
+    // compiles away, so nothing panics and a `should_panic` test fails.
+    //
+    // That is not hypothetical. CI's `benchmarks smoke` job runs
+    // `cargo bench -p scribe-core --benches -- --test`, and `--benches` pulls in
+    // the lib's implicit bench target, which runs these unit tests in RELEASE.
+    // Ungated, all three failed there while the whole debug suite was green.
+    //
+    // The gate costs no coverage where it matters: `cargo mutants` runs the
+    // suite in debug, so these still execute and still kill every mutant this
+    // function can carry. `accepts_forward_progress` is deliberately NOT gated —
+    // it must hold in both profiles.
+    //
+    // Keeping `debug_assert!` (rather than promoting to `assert!` so the tests
+    // pass everywhere) is the deliberate trade: the hazard being guarded is a
+    // developer editing a scan branch and forgetting to advance the cursor,
+    // which dev/test/CI all run in debug and would catch immediately. Promoting
+    // it would add a compare-and-branch to every character of every scanned
+    // line — a per-char cost in a vault-wide tag scan — to convert a shipped
+    // hang into a shipped panic, which is not a trade worth making here.
+
     /// The ordinary case: a cursor that stepped forward is accepted silently.
     ///
     /// Without this, a mutant that makes the guard panic unconditionally (or
@@ -71,6 +93,7 @@ mod tests {
 
     /// A stalled cursor is the exact shape of the `i += 1` -> `i *= 1` mutant.
     #[test]
+    #[cfg(debug_assertions)]
     #[should_panic(expected = "scan cursor did not advance")]
     fn scan_guard_rejects_a_stall() {
         assert_advanced(7, 7, "unit");
@@ -79,6 +102,7 @@ mod tests {
     /// A rewound cursor is the `+=` -> `-=` mutant. It also catches a guard
     /// weakened from `>` to `>=`, which a stall alone would not.
     #[test]
+    #[cfg(debug_assertions)]
     #[should_panic(expected = "scan cursor did not advance")]
     fn scan_guard_rejects_a_rewind() {
         assert_advanced(7, 6, "unit");
@@ -87,6 +111,7 @@ mod tests {
     /// The panic names the caller's loop, not this helper — otherwise a failure
     /// in one of four scan loops would be indistinguishable from the others.
     #[test]
+    #[cfg(debug_assertions)]
     #[should_panic(expected = "scan_line_tags")]
     fn scan_guard_names_the_calling_loop() {
         assert_advanced(2, 2, "scan_line_tags");

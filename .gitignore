@@ -36,3 +36,6 @@ desktop.ini
 # Python bytecode (scripts/ helpers are run in-place)
 __pycache__/
 *.pyc
+
+# Mutation-run scratch (agent analysis logs; mutants.out* already ignored above)
+/.mutlogs/
