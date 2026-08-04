@@ -755,21 +755,28 @@ jobs:
           [ -s main.wixobj ] || { echo "::error::candle reported success but produced no .wixobj"; exit 1; }
       - name: Link the installer (light, with ICE validation)
         shell: bash
-        # ICE validation stays ON. Exactly three ICEs are suppressed, and only
-        # these three -- each is a known false positive for a per-user
+        # ICE validation stays ON. Exactly two ICEs are suppressed, and only
+        # these two -- each is a known false positive for a per-user
         # (InstallScope="perUser") MSI, which is what this installer is by
         # design (no admin / no UAC, so the in-app updater can swap the binary
         # in place; see the header comment in main.wxs):
         #   ICE38 -- "component installs to user profile, KeyPath must be an
         #            HKCU registry value, not a file". Written for per-machine
-        #            packages; a per-user package legitimately uses a file
-        #            KeyPath under LOCALAPPDATA.
-        #   ICE64 -- "directory in the user profile is not in the RemoveFile
-        #            table". Aimed at directories a package CREATES in a roaming
-        #            profile; MSI already removes its own installed files and
-        #            directories on uninstall.
+        #            packages so they can track per-user install state; a
+        #            strictly perUser package has no other-user scenario. The
+        #            file KeyPath is also what lets MSI detect and self-heal a
+        #            deleted scr1b3.exe, which an HKCU KeyPath would not.
+        #            Verified load-bearing: dropping this alone still fails 204.
         #   ICE91 -- per-user directory "doesn't vary based on ALLUSERS", which
-        #            is the explicit intent of a perUser install.
+        #            is the explicit intent of a perUser install. Note this one
+        #            is LGHT1076, a WARNING -- light exits 0 without the flag.
+        #            Kept so intent is documented and so it stays correct if
+        #            -wx is ever added, NOT because the build needs it.
+        # ICE64 was suppressed here and is no longer: main.wxs now carries the
+        # RemoveFolder rows, so the ICE links clean and is ENFORCED again. That
+        # was done to strengthen the gate, not to fix a leak -- a real per-user
+        # install/uninstall cycle showed Windows Installer already sweeps the
+        # empty directories it created, with or without those rows.
         # Every other ICE -- including the ones that catch duplicate keys, bad
         # foreign keys, malformed tables and invalid sequencing -- still fails
         # the build. Do NOT widen this list to make an edit pass: an ICE outside
@@ -778,7 +785,7 @@ jobs:
           set -euo pipefail
           "$RUNNER_TEMP/wix/light.exe" -nologo \
             -ext WixUIExtension -ext WixUtilExtension \
-            -sice:ICE38 -sice:ICE64 -sice:ICE91 \
+            -sice:ICE38 -sice:ICE91 \
             -out scr1b3-installer.msi main.wixobj
           [ -f scr1b3-installer.msi ] || { echo "::error::light reported success but produced no .msi"; exit 1; }
           # light writes the .msi BEFORE ICE validation runs, so "the file
