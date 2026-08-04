@@ -31,8 +31,8 @@ use scribe_core::Config;
 
 /// Human labels for the rebindable actions, in display groups.
 ///
-/// The schema is a flat 35-field struct; a wall of 35 rows is unreadable, so the
-/// page groups them the way a user thinks about them. `every_action_has_a_label`
+/// The schema is a flat struct; one undifferentiated wall of rows is unreadable,
+/// so the page groups them the way a user thinks about them. `every_action_has_a_label`
 /// pins this table to the schema in BOTH directions — a binding added to
 /// `Keybindings` without a label here (or a label for an action that no longer
 /// exists) fails the suite instead of becoming a row the user never sees.
@@ -43,11 +43,28 @@ const GROUPS: &[(&str, &[(&str, &str)])] = &[
             (action::NEW_FILE, "New file"),
             (action::OPEN_FILE, "Open file"),
             (action::SAVE, "Save"),
+            (action::SAVE_AS, "Save as…"),
             (action::CLOSE_TAB, "Close tab"),
             (action::REOPEN_TAB, "Reopen closed tab"),
             (action::NEXT_TAB, "Next tab"),
             (action::PREV_TAB, "Previous tab"),
             (action::RECENT_FILES, "Recent files"),
+        ],
+    ),
+    (
+        // Their own group: nine near-identical rows inlined above would bury
+        // the seven distinct file/tab actions they sit next to.
+        "Go to tab by number",
+        &[
+            (action::GOTO_TAB_1, "Go to tab 1"),
+            (action::GOTO_TAB_2, "Go to tab 2"),
+            (action::GOTO_TAB_3, "Go to tab 3"),
+            (action::GOTO_TAB_4, "Go to tab 4"),
+            (action::GOTO_TAB_5, "Go to tab 5"),
+            (action::GOTO_TAB_6, "Go to tab 6"),
+            (action::GOTO_TAB_7, "Go to tab 7"),
+            (action::GOTO_TAB_8, "Go to tab 8"),
+            (action::GOTO_TAB_9, "Go to tab 9"),
         ],
     ),
     (

@@ -26,6 +26,7 @@ pub(super) mod action {
     pub const NEW_FILE: &str = "new_file";
     pub const OPEN_FILE: &str = "open_file";
     pub const SAVE: &str = "save";
+    pub const SAVE_AS: &str = "save_as";
     pub const FIND: &str = "find";
     pub const FIND_IN_FILES: &str = "find_in_files";
     pub const REPLACE: &str = "replace";
@@ -37,6 +38,31 @@ pub(super) mod action {
     pub const CLOSE_TAB: &str = "close_tab";
     pub const NEXT_TAB: &str = "next_tab";
     pub const PREV_TAB: &str = "prev_tab";
+    /// By-index tab activation, 1..=9. Indexed by `n - 1` through
+    /// [`GOTO_TAB`], which is what lets the input layer wire nine chords in one
+    /// loop instead of nine copy-pasted blocks.
+    pub const GOTO_TAB_1: &str = "goto_tab_1";
+    pub const GOTO_TAB_2: &str = "goto_tab_2";
+    pub const GOTO_TAB_3: &str = "goto_tab_3";
+    pub const GOTO_TAB_4: &str = "goto_tab_4";
+    pub const GOTO_TAB_5: &str = "goto_tab_5";
+    pub const GOTO_TAB_6: &str = "goto_tab_6";
+    pub const GOTO_TAB_7: &str = "goto_tab_7";
+    pub const GOTO_TAB_8: &str = "goto_tab_8";
+    pub const GOTO_TAB_9: &str = "goto_tab_9";
+
+    /// The nine by-index tab actions in index order: `GOTO_TAB[i]` activates
+    /// the tab at 0-based index `i`.
+    ///
+    /// NOT test-only (unlike [`ALL`]): the input layer iterates it, so a tenth
+    /// action added to the schema without a slot here simply never fires —
+    /// which `action_names_match_the_config_schema` catches via [`ALL`]. That
+    /// the ORDER is the index order (and not, say, transposed) is pinned by
+    /// `each_goto_tab_action_answers_to_its_own_number_key`.
+    pub const GOTO_TAB: &[&str] = &[
+        GOTO_TAB_1, GOTO_TAB_2, GOTO_TAB_3, GOTO_TAB_4, GOTO_TAB_5, GOTO_TAB_6, GOTO_TAB_7,
+        GOTO_TAB_8, GOTO_TAB_9,
+    ];
     pub const REOPEN_TAB: &str = "reopen_tab";
     pub const TOGGLE_GRID: &str = "toggle_grid";
     pub const TOGGLE_COMMENT: &str = "toggle_comment";
@@ -66,6 +92,7 @@ pub(super) mod action {
         NEW_FILE,
         OPEN_FILE,
         SAVE,
+        SAVE_AS,
         FIND,
         FIND_IN_FILES,
         REPLACE,
@@ -77,6 +104,15 @@ pub(super) mod action {
         CLOSE_TAB,
         NEXT_TAB,
         PREV_TAB,
+        GOTO_TAB_1,
+        GOTO_TAB_2,
+        GOTO_TAB_3,
+        GOTO_TAB_4,
+        GOTO_TAB_5,
+        GOTO_TAB_6,
+        GOTO_TAB_7,
+        GOTO_TAB_8,
+        GOTO_TAB_9,
         REOPEN_TAB,
         TOGGLE_GRID,
         TOGGLE_COMMENT,
@@ -112,8 +148,8 @@ pub(super) mod action {
 ///
 /// Both are compared case-insensitively, which is what lets the lowercase tokens
 /// the config grammar produces (`"arrowup"`) resolve. `every_default_binding_
-/// resolves_to_the_expected_key` pins all 35 defaults, so a future egui rename
-/// fails the suite rather than silently killing a shortcut.
+/// resolves_to_the_expected_key` pins EVERY shipped default, so a future egui
+/// rename fails the suite rather than silently killing a shortcut.
 fn key_from_token(token: &str) -> Option<egui::Key> {
     egui::Key::ALL.iter().copied().find(|k| {
         k.name().eq_ignore_ascii_case(token) || format!("{k:?}").eq_ignore_ascii_case(token)
@@ -554,6 +590,81 @@ mod tests {
         );
     }
 
+    // ---- the ten actions added on top of the original 35 ----
+    //
+    // Save-As, and the nine by-index tab switches. The two pins above
+    // (`action_names_match_the_config_schema` and
+    // `every_default_binding_resolves_to_the_expected_key`) were both updated
+    // for them rather than merely widened; these are the behavioural tests that
+    // say what the new chords must DO.
+
+    #[test]
+    fn ctrl_shift_s_is_save_as_and_ctrl_s_is_still_save() {
+        // Save and Save-As differ by exactly one modifier, so they are the pair
+        // most at risk of collapsing into each other. Both directions, because
+        // only one of them going wrong is the interesting failure: a Ctrl+S that
+        // also opens the Save-As dialog, or a Ctrl+Shift+S that silently
+        // overwrites the original file instead of asking for a new name.
+        let km = Keymap::resolve(&Keybindings::default());
+        assert!(fired(&km, action::SAVE, egui::Key::S, CMD));
+        assert!(
+            !fired(&km, action::SAVE, egui::Key::S, CMD | SHIFT),
+            "Ctrl+Shift+S must NOT save in place — that is Save As"
+        );
+        assert!(fired(&km, action::SAVE_AS, egui::Key::S, CMD | SHIFT));
+        assert!(
+            !fired(&km, action::SAVE_AS, egui::Key::S, CMD),
+            "Ctrl+S must NOT open the Save-As dialog"
+        );
+    }
+
+    #[test]
+    fn each_goto_tab_action_answers_to_its_own_number_key_and_no_other() {
+        // The failure this catches is a TRANSPOSED table — `GOTO_TAB[2]` wired
+        // to Ctrl+7 — which is invisible to any test that only checks "some tab
+        // action fired". Pressing Ctrl+N must fire the Nth action and leave the
+        // other eight cold, so the full 9x9 matrix is asserted.
+        let km = Keymap::resolve(&Keybindings::default());
+        let num_keys = [
+            egui::Key::Num1,
+            egui::Key::Num2,
+            egui::Key::Num3,
+            egui::Key::Num4,
+            egui::Key::Num5,
+            egui::Key::Num6,
+            egui::Key::Num7,
+            egui::Key::Num8,
+            egui::Key::Num9,
+        ];
+        assert_eq!(action::GOTO_TAB.len(), num_keys.len());
+        for (pressed_idx, key) in num_keys.iter().enumerate() {
+            for (action_idx, tab_action) in action::GOTO_TAB.iter().enumerate() {
+                assert_eq!(
+                    fired(&km, tab_action, *key, CMD),
+                    pressed_idx == action_idx,
+                    "Ctrl+{} must fire '{tab_action}' iff it is tab {}",
+                    pressed_idx + 1,
+                    pressed_idx + 1
+                );
+            }
+        }
+        // Ctrl+0 belongs to the font reset, not to a tab — the tab band is
+        // 1..=9 and must not creep onto the digit next to it.
+        for tab_action in action::GOTO_TAB {
+            assert!(!fired(&km, tab_action, egui::Key::Num0, CMD));
+        }
+    }
+
+    #[test]
+    fn a_bare_number_key_does_not_switch_tabs() {
+        // Typing "1" into a note is a character. If the chord lost its command
+        // modifier, every digit typed would jump the user to another tab.
+        let km = Keymap::resolve(&Keybindings::default());
+        for mods in [egui::Modifiers::NONE, SHIFT, ALT] {
+            assert!(!fired(&km, action::GOTO_TAB_1, egui::Key::Num1, mods));
+        }
+    }
+
     #[test]
     fn action_names_match_the_config_schema() {
         // Bidirectional parity: every const names a real binding, and every
@@ -583,7 +694,9 @@ mod tests {
 
     #[test]
     fn every_default_binding_resolves_to_the_expected_key() {
-        // Pins the token -> egui::Key mapping for all 35 shipped defaults. This is
+        // Pins the token -> egui::Key mapping for EVERY shipped default (the
+        // `expect.len() == action::ALL.len()` assert below is what keeps this
+        // table exhaustive rather than merely long). This is
         // the guard on `key_from_token` reading egui's own tables: an egui rename
         // (or a Debug-format change) breaks this test instead of silently
         // resolving a shortcut to `None` and killing it at runtime.
@@ -593,6 +706,7 @@ mod tests {
             (action::NEW_FILE, true, false, false, egui::Key::N),
             (action::OPEN_FILE, true, false, false, egui::Key::O),
             (action::SAVE, true, false, false, egui::Key::S),
+            (action::SAVE_AS, true, true, false, egui::Key::S),
             (action::FIND, true, false, false, egui::Key::F),
             (action::FIND_IN_FILES, true, true, false, egui::Key::F),
             (action::REPLACE, true, false, false, egui::Key::H),
@@ -604,6 +718,18 @@ mod tests {
             (action::CLOSE_TAB, true, false, false, egui::Key::W),
             (action::NEXT_TAB, true, false, false, egui::Key::Tab),
             (action::PREV_TAB, true, true, false, egui::Key::Tab),
+            // Ctrl+1..9 — pinned per index, so a transposed default (goto_tab_3
+            // resolving to Num7) fails HERE instead of quietly switching the
+            // user to the wrong tab.
+            (action::GOTO_TAB_1, true, false, false, egui::Key::Num1),
+            (action::GOTO_TAB_2, true, false, false, egui::Key::Num2),
+            (action::GOTO_TAB_3, true, false, false, egui::Key::Num3),
+            (action::GOTO_TAB_4, true, false, false, egui::Key::Num4),
+            (action::GOTO_TAB_5, true, false, false, egui::Key::Num5),
+            (action::GOTO_TAB_6, true, false, false, egui::Key::Num6),
+            (action::GOTO_TAB_7, true, false, false, egui::Key::Num7),
+            (action::GOTO_TAB_8, true, false, false, egui::Key::Num8),
+            (action::GOTO_TAB_9, true, false, false, egui::Key::Num9),
             (action::REOPEN_TAB, true, true, false, egui::Key::R),
             (
                 action::TOGGLE_GRID,

@@ -660,7 +660,35 @@ impl<'a> RopeEditor<'a> {
         };
         if let Some(pos) = area.interact_pointer_pos() {
             let (shift, alt) = ui.input(|i| (i.modifiers.shift, i.modifiers.alt));
-            if area.clicked() {
+            // Multi-click MUST be tested before the plain-click arm. egui's
+            // `double_clicked()` / `triple_clicked()` are `CLICKED && count == n`
+            // (see `Response::double_clicked_by`), so `clicked()` is ALSO true on
+            // the second and third click — a plain-click arm placed first would
+            // collapse the caret and the word/line selection would never survive
+            // the frame it was made in.
+            if area.triple_clicked() {
+                // Triple-click selects the whole line INCLUDING its newline, so
+                // the follow-up the gesture exists for (Ctrl+X / type-over)
+                // removes the line rather than leaving a blank one behind.
+                if let Some(off) = pos_to_offset(pos) {
+                    state.block_anchor = None;
+                    state.clear_extra_carets();
+                    let (s, e) = line_span(rope, off);
+                    state.edit = EditState::at(s);
+                    state.edit.cursor = e;
+                }
+            } else if area.double_clicked() {
+                // Double-click selects the word under the pointer, using the
+                // SAME `word_bounds` Ctrl+D expands from — so what a double-click
+                // selects and what Ctrl+D matches can never disagree.
+                if let Some(off) = pos_to_offset(pos) {
+                    state.block_anchor = None;
+                    state.clear_extra_carets();
+                    let (s, e) = editing::word_bounds(rope, off);
+                    state.edit = EditState::at(s);
+                    state.edit.cursor = e;
+                }
+            } else if area.clicked() {
                 if let Some(off) = pos_to_offset(pos) {
                     state.block_anchor = None;
                     state.clear_extra_carets();
@@ -808,6 +836,30 @@ fn pos_to_char_offset(
     };
     let col = raw_col.min(len);
     line_start + col
+}
+
+/// `(start, end)` char indices of the whole line containing `cursor`, INCLUDING
+/// its line terminator — what a triple-click selects.
+///
+/// The terminator is inside the span on purpose: a triple-click is the gesture
+/// users follow with Cut / type-over to remove a line, and a span that stopped
+/// short of the `\n` would leave an empty line behind. The final line of a
+/// buffer with no trailing newline simply ends at `len_chars`.
+///
+/// A free function rather than an inline block in the pointer handler for the
+/// same reason `page_rows_for_viewport` is: inline it would be reachable only
+/// through a live painted frame, where its arithmetic could drift unobserved.
+fn line_span(rope: &Rope, cursor: usize) -> (usize, usize) {
+    let n = rope.len_chars();
+    let c = cursor.min(n);
+    let line = rope.char_to_line(c);
+    let start = rope.line_to_char(line);
+    let end = if line + 1 < rope.len_lines() {
+        rope.line_to_char(line + 1)
+    } else {
+        n
+    };
+    (start, end)
 }
 
 /// Rows one PageUp/PageDown moves by, for a painted viewport of `viewport_h`
@@ -1614,7 +1666,12 @@ pub fn apply_event(
                 Key::Z if cmd && shift => history_step!(redo),
                 // Ctrl+Y is the Windows redo chord; egui's TextEdit path binds
                 // it too (`text_edit/builder.rs`), so the rope path matches.
-                Key::Y if cmd => history_step!(redo),
+                //
+                // `!shift` for the same reason the two Z arms above carry their
+                // guards: without it Ctrl+SHIFT+Y also redid, so the arm claimed
+                // a chord it was never meant to own and consumed the event —
+                // making Ctrl+Shift+Y unavailable to anything else.
+                Key::Y if cmd && !shift => history_step!(redo),
                 _ => {}
             }
         }
@@ -2120,6 +2177,69 @@ mod tests {
         assert_eq!(r.to_string(), "", "undone");
         apply_event(&mut r, &mut st, &key_ev(egui::Key::Y, false, true));
         assert_eq!(r.to_string(), "hi", "Ctrl+Y redid it");
+    }
+
+    #[test]
+    fn ctrl_shift_y_is_not_a_redo_and_is_left_unconsumed() {
+        // The Ctrl+Y arm carried no `!shift`, so Ctrl+SHIFT+Y redid too — a
+        // chord it was never meant to own, and one it CONSUMED, making it
+        // unavailable to anything else. The Z arms above draw the same line with
+        // `cmd && !shift` / `cmd && shift`; this is Y catching up.
+        //
+        // Asserting both halves matters: the buffer must not move, AND the event
+        // must come back unconsumed. A version that skipped the redo but still
+        // reported `consumed` would still be swallowing the chord.
+        let mut r = Rope::from_str("");
+        let mut st = RopeEditorState::new();
+        apply_event(&mut r, &mut st, &text_event("hi"));
+        apply_event(&mut r, &mut st, &key_ev(egui::Key::Z, false, true));
+        assert_eq!(r.to_string(), "", "precondition: undone, a redo is queued");
+
+        let out = apply_event(&mut r, &mut st, &key_ev(egui::Key::Y, true, true));
+        assert_eq!(
+            r.to_string(),
+            "",
+            "Ctrl+Shift+Y must not redo — the queued redo is still queued"
+        );
+        assert!(!out.consumed, "Ctrl+Shift+Y is not this editor's chord");
+
+        // …and the redo it declined is genuinely still available, so the test
+        // above cannot pass merely because the history was empty.
+        apply_event(&mut r, &mut st, &key_ev(egui::Key::Y, false, true));
+        assert_eq!(r.to_string(), "hi", "plain Ctrl+Y still redoes");
+    }
+
+    // ---- line_span (what a triple-click selects) ----
+
+    #[test]
+    fn line_span_covers_the_whole_line_including_its_newline() {
+        // The terminator is IN the span on purpose: triple-click then Cut has to
+        // remove the line, not leave a blank one. Asserting the sliced TEXT (not
+        // just the indices) is what makes an off-by-one visible as the wrong
+        // string rather than as two numbers that look plausible.
+        let r = Rope::from_str("alpha\nbeta\ngamma\n");
+        let slice = |(s, e): (usize, usize)| r.slice(s..e).to_string();
+        assert_eq!(slice(line_span(&r, 0)), "alpha\n", "from the line start");
+        assert_eq!(slice(line_span(&r, 3)), "alpha\n", "from mid-line");
+        assert_eq!(
+            slice(line_span(&r, 5)),
+            "alpha\n",
+            "from the newline itself"
+        );
+        assert_eq!(slice(line_span(&r, 6)), "beta\n", "the next line");
+    }
+
+    #[test]
+    fn line_span_of_a_final_line_without_a_newline_stops_at_the_end() {
+        // The last line of a buffer with no trailing newline has no terminator
+        // to include; the span must end at len_chars rather than run past it.
+        let r = Rope::from_str("alpha\nbeta");
+        assert_eq!(line_span(&r, 7), (6, 10));
+        assert_eq!(r.slice(6..10).to_string(), "beta");
+        // A cursor clamped to the very end still resolves.
+        assert_eq!(line_span(&r, 10), (6, 10));
+        // …and an empty rope is a single empty line, not a panic.
+        assert_eq!(line_span(&Rope::from_str(""), 0), (0, 0));
     }
 
     #[test]
@@ -3048,6 +3168,157 @@ mod tests {
             Some("hello world"),
             "an injected action must not admit the unfocused editor to the \
              ordinary keyboard queue — the typed 'Z' must NOT replace the selection"
+        );
+    }
+
+    // ---- pointer: double-click = word, triple-click = line -----------------
+    //
+    // These drive the REAL `show_editable` pointer block on ONE persistent
+    // context. The context has to persist because egui's multi-click counter
+    // lives in its input state (`last_click_time` / `last_last_click_time`), so
+    // a fresh context per frame — which `drive_editable_frame` above uses —
+    // can never report anything but a single click.
+
+    /// One `show_editable` pass on the shared context `ctx`.
+    fn pointer_frame(
+        ctx: &egui::Context,
+        buf: &mut Buffer,
+        state: &mut RopeEditorState,
+        events: Vec<egui::Event>,
+    ) {
+        let raw = egui::RawInput {
+            events,
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(800.0, 600.0),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run(raw, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ =
+                    RopeEditor::new(buf, FontId::monospace(14.0), 18.0).show_editable(ui, state);
+            });
+        });
+    }
+
+    /// A press+release at `pos` in its own frame. Consecutive calls advance
+    /// egui's clock by one predicted frame (~16 ms), well inside the
+    /// double-click window, so click 2 counts as a double and click 3 as a
+    /// triple — exactly what a real user's clicks do.
+    fn pointer_click(
+        ctx: &egui::Context,
+        buf: &mut Buffer,
+        state: &mut RopeEditorState,
+        pos: egui::Pos2,
+    ) {
+        let m = egui::Modifiers::NONE;
+        pointer_frame(
+            ctx,
+            buf,
+            state,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: m,
+                },
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: m,
+                },
+            ],
+        );
+    }
+
+    /// The text currently selected in `state`.
+    fn selection_text(buf: &Buffer, state: &RopeEditorState) -> String {
+        let rope = buf.as_rope().expect("a rope buffer");
+        let sel = state.edit.selection();
+        rope.slice(sel).to_string()
+    }
+
+    /// A document whose first line is ONE word, so a click anywhere on that row
+    /// selects the same word regardless of the host's font metrics — the test
+    /// asserts a literal, not whatever the geometry happened to produce.
+    fn click_doc() -> Buffer {
+        Buffer::Rope(Rope::from_str("alphabetagammadelta\nsecond line\nthird\n"))
+    }
+
+    #[test]
+    fn a_single_click_still_only_places_the_caret() {
+        // The baseline the two tests below are read against: one click selects
+        // NOTHING. Without it, a double-click test could pass on an editor that
+        // selected the word on every click.
+        let ctx = egui::Context::default();
+        let mut buf = click_doc();
+        let mut st = RopeEditorState::new();
+        pointer_frame(&ctx, &mut buf, &mut st, Vec::new()); // paint once so the text geometry exists
+        pointer_click(&ctx, &mut buf, &mut st, egui::pos2(60.0, 18.0));
+        assert!(
+            !st.edit.has_selection(),
+            "a single click places a caret; it does not select"
+        );
+    }
+
+    #[test]
+    fn a_double_click_selects_the_word_under_the_pointer() {
+        let ctx = egui::Context::default();
+        let mut buf = click_doc();
+        let mut st = RopeEditorState::new();
+        pointer_frame(&ctx, &mut buf, &mut st, Vec::new());
+        let pos = egui::pos2(60.0, 18.0);
+        pointer_click(&ctx, &mut buf, &mut st, pos);
+        pointer_click(&ctx, &mut buf, &mut st, pos);
+        assert_eq!(
+            selection_text(&buf, &st),
+            "alphabetagammadelta",
+            "a double-click selects the whole word under the pointer"
+        );
+    }
+
+    #[test]
+    fn a_triple_click_selects_the_whole_line_including_its_newline() {
+        let ctx = egui::Context::default();
+        let mut buf = click_doc();
+        let mut st = RopeEditorState::new();
+        pointer_frame(&ctx, &mut buf, &mut st, Vec::new());
+        let pos = egui::pos2(60.0, 18.0);
+        pointer_click(&ctx, &mut buf, &mut st, pos);
+        pointer_click(&ctx, &mut buf, &mut st, pos);
+        pointer_click(&ctx, &mut buf, &mut st, pos);
+        assert_eq!(
+            selection_text(&buf, &st),
+            "alphabetagammadelta\n",
+            "a triple-click selects the line AND its terminator, so the \
+             follow-up Cut removes the line instead of blanking it"
+        );
+    }
+
+    #[test]
+    fn a_double_click_on_a_gap_selects_nothing_rather_than_the_next_word() {
+        // `word_bounds` returns (cursor, cursor) off a word. Clicking the blank
+        // area past the end of a short line must therefore collapse, not reach
+        // forward and grab a word the pointer was nowhere near.
+        let ctx = egui::Context::default();
+        let mut buf = Buffer::Rope(Rope::from_str("ab\nlonger second line\n"));
+        let mut st = RopeEditorState::new();
+        pointer_frame(&ctx, &mut buf, &mut st, Vec::new());
+        // Far right of the 2-char first row: the column clamps to the line's
+        // own length, so the offset lands at the end of "ab"… which IS a word
+        // boundary, so the word under the pointer is "ab" itself.
+        let pos = egui::pos2(600.0, 18.0);
+        pointer_click(&ctx, &mut buf, &mut st, pos);
+        pointer_click(&ctx, &mut buf, &mut st, pos);
+        assert_eq!(
+            selection_text(&buf, &st),
+            "ab",
+            "a double-click past the end of a line selects that line's last \
+             word, never a word from the line below"
         );
     }
 

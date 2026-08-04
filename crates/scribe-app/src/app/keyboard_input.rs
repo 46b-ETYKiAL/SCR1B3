@@ -14,6 +14,13 @@
 //! - **Only mapped actions are rebindable.** F1 (cheatsheet), Esc (close overlay),
 //!   F3 (find-next) and Ctrl+scroll zoom stay hard-wired: they are not actions in
 //!   the `[keybindings]` schema.
+//!
+//! This module also owns the whole **file-drop pipe**, both halves of it: the
+//! drop itself (`RawInput.dropped_files` -> `Pending::files_to_open`) and the
+//! drag-hover feedback that tells the user the window will accept the drop
+//! (`RawInput.hovered_files` -> the drop-target overlay). The two live together
+//! because they are one gesture; splitting them is how the hover half went
+//! missing while the drop half worked.
 #![allow(clippy::wildcard_imports)]
 
 use super::keymap::{action, Keymap};
@@ -26,7 +33,56 @@ use super::*;
 /// `exp(0.5/200) ~= 1.0025`. Below it, trackpad jitter must not resize the font.
 const ZOOM_DEADZONE: f32 = 1.0025;
 
+/// The drop-target copy shown while `n` files are dragged over the window.
+///
+/// Pure, so what the overlay SAYS is assertable without rendering: the count and
+/// the singular/plural form are the two things a user reads off it, and both are
+/// pinned by `drop_target_hint_counts_and_pluralises`.
+pub(super) fn drop_target_hint(n: usize) -> String {
+    if n == 1 {
+        "Drop to open 1 file".to_string()
+    } else {
+        format!("Drop to open {n} files")
+    }
+}
+
 impl ScribeApp {
+    /// F-011 companion — paint the drop-target overlay for `hovered` dragged
+    /// files.
+    ///
+    /// Drawn into a FOREGROUND layer over the whole screen rect rather than into
+    /// some panel's `Ui`, because a drop lands anywhere on the window: the
+    /// feedback has to cover the same area the drop does. `hovered == 0` (no
+    /// drag in flight) paints nothing at all — the overlay must never be visible
+    /// during normal editing.
+    fn paint_drop_target(&self, ctx: &egui::Context, hovered: usize) {
+        if hovered == 0 {
+            return;
+        }
+        let screen = ctx.screen_rect();
+        let painter = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("scr1b3-drop-target"),
+        ));
+        let style = ctx.style();
+        let accent = style.visuals.selection.bg_fill;
+        let text_color = style.visuals.strong_text_color();
+        painter.rect_filled(screen, 0.0, egui::Color32::from_black_alpha(150));
+        painter.rect_stroke(
+            screen.shrink(10.0),
+            8.0,
+            egui::Stroke::new(2.0, accent),
+            egui::StrokeKind::Inside,
+        );
+        painter.text(
+            screen.center(),
+            egui::Align2::CENTER_CENTER,
+            drop_target_hint(hovered),
+            egui::FontId::proportional(20.0),
+            text_color,
+        );
+    }
+
     /// Collect this frame's keyboard shortcuts into `act` (a `Pending` action
     /// set) and record the find-bar F3 navigation direction in `find_nav`.
     ///
@@ -60,10 +116,26 @@ impl ScribeApp {
         }
         let km = &self.keymap;
 
+        // Applied AFTER the input closure, for the same reason `find_nav` is:
+        // `save_as_active` re-borrows `self` (and opens a blocking OS dialog),
+        // which must not happen while egui's input lock is held. It does not go
+        // through `Pending` because nothing downstream needs to observe or
+        // reorder it — the flag never outlives this call.
+        let mut want_save_as = false;
+        // Files being DRAGGED over the window this frame (0 == no drag). Read
+        // inside the closure, painted after it.
+        let mut hovered_files = 0usize;
+
         ctx.input(|i| {
             act.new = km.pressed(i, action::NEW_FILE);
             act.open = km.pressed(i, action::OPEN_FILE);
             act.save = km.pressed(i, action::SAVE);
+            // Save As… — a distinct action, not a shifted Save. Exact modifier
+            // matching is what keeps `mod+s` and `mod+shift+s` apart, so this
+            // needs no `!shift` guard on the Save above.
+            if km.pressed(i, action::SAVE_AS) {
+                want_save_as = true;
+            }
             if km.pressed(i, action::FIND) {
                 if !self.find_open {
                     self.focus_find = true;
@@ -195,6 +267,28 @@ impl ScribeApp {
                     act.files_to_open.push(p);
                 }
             }
+            // …and the other half of the same gesture: while a drag is still IN
+            // FLIGHT egui reports it in `hovered_files`. Nothing read that, so
+            // dragging a file over SCR1B3 gave no sign the window would accept
+            // it — the drop worked but looked like it would not.
+            hovered_files = i.raw.hovered_files.len();
+            // Ctrl+1..9 — activate a tab by its 1-based index. `break` because
+            // one press activates at most one tab: if a user binds two indices
+            // to one combo (`validate` reports that as a Conflict), the earlier
+            // index wins rather than both running.
+            for (idx, tab_action) in action::GOTO_TAB.iter().enumerate() {
+                if km.pressed(i, tab_action) {
+                    if idx < self.tabs.len() {
+                        self.active = idx;
+                    } else {
+                        // Deliberately NOT clamped to the last tab: clamping
+                        // would silently switch to a tab the user did not ask
+                        // for. Say nothing happened, and say why.
+                        self.status = format!("no tab {}", idx + 1);
+                    }
+                    break;
+                }
+            }
             // Tab cycling is suppressed while the completion popup is open — it
             // consumes Tab to accept a candidate.
             if km.pressed(i, action::NEXT_TAB) && self.completion.is_none() {
@@ -277,5 +371,247 @@ impl ScribeApp {
                 }
             }
         });
+        // Outside the input borrow: both of these re-enter `self` / `ctx`.
+        self.paint_drop_target(ctx, hovered_files);
+        if want_save_as {
+            self.save_as_active();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Drive ONE `handle_keyboard_shortcuts` frame and hand back every string
+    /// the frame PAINTED.
+    ///
+    /// Reading the painted text (rather than a bool on `self`) is what makes the
+    /// drop-target assertions observable: the overlay's whole job is to be
+    /// visible, and a flag saying "we would have painted" proves nothing about
+    /// whether anything reached the screen.
+    fn frame(
+        app: &mut ScribeApp,
+        mods: egui::Modifiers,
+        events: Vec<egui::Event>,
+        hovered: usize,
+    ) -> Vec<String> {
+        let ctx = egui::Context::default();
+        let raw = egui::RawInput {
+            modifiers: mods,
+            events,
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(640.0, 480.0),
+            )),
+            hovered_files: vec![egui::HoveredFile::default(); hovered],
+            ..Default::default()
+        };
+        let mut act = Pending::default();
+        let mut nav = None;
+        let out = ctx.run(raw, |ctx| {
+            app.handle_keyboard_shortcuts(ctx, &mut act, &mut nav);
+        });
+        out.shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(t) => Some(t.galley.text().to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn press(key: egui::Key, mods: egui::Modifiers) -> Vec<egui::Event> {
+        vec![egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: mods,
+        }]
+    }
+
+    /// An app with `n` tabs, active on the first.
+    fn app_with_tabs(n: usize) -> ScribeApp {
+        let mut app = ScribeApp::new_test(Config::default());
+        while app.tabs.len() < n {
+            app.new_tab();
+        }
+        app.active = 0;
+        app
+    }
+
+    const CMD: egui::Modifiers = egui::Modifiers::COMMAND;
+
+    // ---- Ctrl+1..9: switch to a tab by number ----
+
+    #[test]
+    fn each_number_chord_activates_the_tab_with_that_number() {
+        // The observable outcome is WHICH tab is showing, so assert `active`
+        // after each chord — and cover every one of the nine, because a table
+        // wired only for the first index looks correct from a single-case test.
+        let mut app = app_with_tabs(9);
+        let keys = [
+            egui::Key::Num1,
+            egui::Key::Num2,
+            egui::Key::Num3,
+            egui::Key::Num4,
+            egui::Key::Num5,
+            egui::Key::Num6,
+            egui::Key::Num7,
+            egui::Key::Num8,
+            egui::Key::Num9,
+        ];
+        for (idx, key) in keys.iter().enumerate() {
+            // Park somewhere else first, so "already there" can never be
+            // mistaken for "the chord worked".
+            app.active = if idx == 0 { 8 } else { 0 };
+            frame(&mut app, CMD, press(*key, CMD), 0);
+            assert_eq!(
+                app.active,
+                idx,
+                "Ctrl+{} must activate tab {}",
+                idx + 1,
+                idx + 1
+            );
+        }
+    }
+
+    #[test]
+    fn a_number_past_the_last_tab_leaves_the_active_tab_alone() {
+        // Clamping to the last tab would be a silent lie: the user asked for
+        // tab 7 and would land on tab 3 without being told. The contract is
+        // no-op plus an explicit status line.
+        let mut app = app_with_tabs(3);
+        app.active = 1;
+        app.status = "untouched".into();
+        frame(&mut app, CMD, press(egui::Key::Num7, CMD), 0);
+        assert_eq!(app.active, 1, "an out-of-range number must not move tabs");
+        assert_eq!(
+            app.status, "no tab 7",
+            "…and must say so, naming the tab that is not there"
+        );
+    }
+
+    #[test]
+    fn a_bare_number_keypress_does_not_switch_tabs() {
+        // Typing "3" into a note is a character. Losing the command modifier
+        // would turn every digit into a tab jump.
+        let mut app = app_with_tabs(5);
+        app.active = 0;
+        frame(
+            &mut app,
+            egui::Modifiers::NONE,
+            press(egui::Key::Num3, egui::Modifiers::NONE),
+            0,
+        );
+        assert_eq!(app.active, 0, "a bare digit is text, not navigation");
+    }
+
+    // ---- Ctrl+Shift+S: Save As ----
+
+    #[test]
+    fn ctrl_shift_s_saves_the_buffer_under_the_newly_picked_path() {
+        // End to end through the REAL save_as_active: only the OS dialog's
+        // answer is injected. The evidence is a file on disk at the PICKED path
+        // — a path the buffer was never associated with, so a Ctrl+Shift+S that
+        // fell through to a plain in-place Save cannot produce it.
+        let dir = std::env::temp_dir().join(format!(
+            "scr1b3-keyboard-input-tests/save-as-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let picked = dir.join("picked.md");
+
+        let mut app = ScribeApp::new_test(Config::default());
+        let active = app.active;
+        app.tabs[active].set_text("hello from ctrl+shift+s".into());
+        crate::app::dialogs::test_hooks::set_next_save_path(picked.clone());
+
+        frame(
+            &mut app,
+            CMD | egui::Modifiers::SHIFT,
+            press(egui::Key::S, CMD | egui::Modifiers::SHIFT),
+            0,
+        );
+
+        assert_eq!(
+            std::fs::read_to_string(&picked).unwrap(),
+            "hello from ctrl+shift+s",
+            "Ctrl+Shift+S must run Save As and write to the picked path"
+        );
+    }
+
+    #[test]
+    fn plain_ctrl_s_does_not_open_the_save_as_dialog() {
+        // The negative half: if Ctrl+S also reached Save-As it would consume the
+        // injected answer and write the file. Nothing may appear at the picked
+        // path — and the injected answer must still be sitting there unused,
+        // which the follow-up Ctrl+Shift+S proves by consuming it.
+        let dir = std::env::temp_dir().join(format!(
+            "scr1b3-keyboard-input-tests/plain-save-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let picked = dir.join("untouched.md");
+
+        let mut app = ScribeApp::new_test(Config::default());
+        let active = app.active;
+        app.tabs[active].set_text("body".into());
+        crate::app::dialogs::test_hooks::set_next_save_path(picked.clone());
+
+        frame(&mut app, CMD, press(egui::Key::S, CMD), 0);
+        assert!(
+            !picked.exists(),
+            "plain Ctrl+S must not run Save As — it is a different action"
+        );
+
+        frame(
+            &mut app,
+            CMD | egui::Modifiers::SHIFT,
+            press(egui::Key::S, CMD | egui::Modifiers::SHIFT),
+            0,
+        );
+        assert!(
+            picked.exists(),
+            "precondition: the injected dialog answer was still unconsumed, so \
+             the Ctrl+S above really did skip Save As"
+        );
+    }
+
+    // ---- drag-hover drop target ----
+
+    #[test]
+    fn drop_target_hint_counts_and_pluralises() {
+        // Assert the WHOLE produced string, not a substring: a hint that dropped
+        // the count, or echoed a bare number, would still contain "file".
+        assert_eq!(drop_target_hint(1), "Drop to open 1 file");
+        assert_eq!(drop_target_hint(2), "Drop to open 2 files");
+        assert_eq!(drop_target_hint(17), "Drop to open 17 files");
+    }
+
+    #[test]
+    fn dragging_files_over_the_window_paints_the_drop_target() {
+        let mut app = ScribeApp::new_test(Config::default());
+        let painted = frame(&mut app, egui::Modifiers::NONE, Vec::new(), 2);
+        assert!(
+            painted.iter().any(|t| t == "Drop to open 2 files"),
+            "a drag in flight must paint the drop-target hint; painted: {painted:?}"
+        );
+    }
+
+    #[test]
+    fn nothing_is_painted_when_no_drag_is_in_flight() {
+        // The load-bearing negative: an overlay that painted unconditionally
+        // would cover the editor during normal typing, and the positive test
+        // above would still pass.
+        let mut app = ScribeApp::new_test(Config::default());
+        let painted = frame(&mut app, egui::Modifiers::NONE, Vec::new(), 0);
+        assert!(
+            !painted.iter().any(|t| t.starts_with("Drop to open")),
+            "no drag => no overlay; painted: {painted:?}"
+        );
     }
 }

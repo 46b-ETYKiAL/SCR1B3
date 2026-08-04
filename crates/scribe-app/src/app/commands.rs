@@ -52,9 +52,65 @@ pub(crate) const KEYBOARD_SHORTCUTS: &[ShortcutEntry] = &[
         bindings: &[action::SAVE],
     },
     ShortcutEntry {
+        chord: "Ctrl+Shift+S",
+        action: "Save active buffer under a new name",
+        bindings: &[action::SAVE_AS],
+    },
+    ShortcutEntry {
         chord: "Ctrl+W",
         action: "Close active tab",
         bindings: &[action::CLOSE_TAB],
+    },
+    // One row PER tab number, deliberately. Folding all nine into a single row
+    // would render as `display_for`'s " / "-joined list — "Ctrl+1 / Ctrl+2 / …
+    // / Ctrl+9" — which is 60+ monospace chars in a two-column grid whose other
+    // column is the description, so it would widen the whole modal. Nine short
+    // rows cost vertical space in an already-scrolling list; one long row costs
+    // every other row's layout.
+    ShortcutEntry {
+        chord: "Ctrl+1",
+        action: "Go to tab 1 (out of range: no-op, never a clamp)",
+        bindings: &[action::GOTO_TAB_1],
+    },
+    ShortcutEntry {
+        chord: "Ctrl+2",
+        action: "Go to tab 2",
+        bindings: &[action::GOTO_TAB_2],
+    },
+    ShortcutEntry {
+        chord: "Ctrl+3",
+        action: "Go to tab 3",
+        bindings: &[action::GOTO_TAB_3],
+    },
+    ShortcutEntry {
+        chord: "Ctrl+4",
+        action: "Go to tab 4",
+        bindings: &[action::GOTO_TAB_4],
+    },
+    ShortcutEntry {
+        chord: "Ctrl+5",
+        action: "Go to tab 5",
+        bindings: &[action::GOTO_TAB_5],
+    },
+    ShortcutEntry {
+        chord: "Ctrl+6",
+        action: "Go to tab 6",
+        bindings: &[action::GOTO_TAB_6],
+    },
+    ShortcutEntry {
+        chord: "Ctrl+7",
+        action: "Go to tab 7",
+        bindings: &[action::GOTO_TAB_7],
+    },
+    ShortcutEntry {
+        chord: "Ctrl+8",
+        action: "Go to tab 8",
+        bindings: &[action::GOTO_TAB_8],
+    },
+    ShortcutEntry {
+        chord: "Ctrl+9",
+        action: "Go to tab 9",
+        bindings: &[action::GOTO_TAB_9],
     },
     ShortcutEntry {
         chord: "Ctrl+Tab",

@@ -309,11 +309,21 @@ fn measure() -> Measured {
             // A 40 px body pushes every label far past the 150 px floor. At the
             // default size the `.max(FLOOR)` clamp swallows a wrong gutter
             // (150 wins either way) — the clamp-masks-the-arithmetic trap.
+            let default_body = egui::TextStyle::Body.resolve(ui.style());
             ui.style_mut()
                 .text_styles
                 .insert(egui::TextStyle::Body, egui::FontId::proportional(40.0));
             m.widest_all = widest_label_px(ui, "");
             m.got_all = label_column_width(ui, "");
+            // The narrow case needs the OPPOSITE condition — a result whose
+            // widest label sits UNDER the floor, so the floor is what is being
+            // tested — and so it is measured at the DEFAULT body size. The 40 px
+            // inflation exists only for the gutter measurement above; at 40 px
+            // even a two-word label clears the floor on its own, which would
+            // leave `got_narrow` measuring the label rather than the clamp.
+            ui.style_mut()
+                .text_styles
+                .insert(egui::TextStyle::Body, default_body);
             m.widest_narrow = widest_label_px(ui, "save");
             m.got_narrow = label_column_width(ui, "save");
         },
