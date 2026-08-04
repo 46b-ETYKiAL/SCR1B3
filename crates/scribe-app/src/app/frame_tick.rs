@@ -77,6 +77,33 @@ pub(super) fn editor_ctx_cmd_id() -> egui::Id {
     egui::Id::new("scr1b3_editor_ctx_menu_cmd")
 }
 
+/// ctx-data slot the in-editor `[[wiki-link]]` click stashes its TARGET into, to
+/// be drained + followed a frame later.
+///
+/// Same reason as [`editor_ctx_cmd_id`]: the click is detected inside the
+/// `ScrollArea` closure while the highlight layouter holds `&self`, so
+/// `open_or_create_wikilink` (which opens a tab and can rescan the vault) cannot
+/// run there. Deferring by a frame also keeps the `active` tab index the rest of
+/// this frame's editor code is indexing with from moving under it.
+fn editor_wikilink_follow_id() -> egui::Id {
+    egui::Id::new("scr1b3_editor_wikilink_follow")
+}
+
+/// ctx-data slot recording the frame on which a TEXT paste event was seen.
+///
+/// A clipboard carrying BOTH text and a bitmap must paste the TEXT; see
+/// [`PASTE_IMAGE_TEXT_GRACE_FRAMES`].
+fn last_text_paste_frame_id() -> egui::Id {
+    egui::Id::new("scr1b3_last_text_paste_frame")
+}
+
+/// How many frames a text paste suppresses the image-paste branch for.
+///
+/// `egui_winit` emits `Event::Paste` on the paste key-DOWN and the `V` key
+/// RELEASE one or more frames later, so the two halves of ONE gesture land in
+/// different frames. This window joins them back together.
+const PASTE_IMAGE_TEXT_GRACE_FRAMES: u64 = 20;
+
 /// Which editor surface actually rendered the active buffer on the last frame.
 ///
 /// SCR1B3 swaps the editor out from under the user in three situations — the
@@ -664,6 +691,19 @@ impl ScribeApp {
         // renders, so the injected event reaches the central editor (shown
         // later this frame) and egui's TextEdit performs it natively.
         self.drain_pending_editor_action(ctx);
+        // Follow a `[[wiki-link]]` clicked in the EDITOR on a previous frame
+        // (stashed by the overlay pass, which runs while `self` is immutably
+        // borrowed). Unconditional — a link in a read-only buffer is still
+        // followable, and this is the same `open_or_create_wikilink` the notes
+        // pane's link list calls, so the vault-traversal gate is identical.
+        if let Some(target) = ctx.data_mut(|d| {
+            let id = editor_wikilink_follow_id();
+            let v = d.get_temp::<String>(id);
+            d.remove::<String>(id);
+            v
+        }) {
+            self.open_or_create_wikilink(&target);
+        }
         // F-022 — poll the disk mtimes of every open file-backed tab. Cheap
         // when nothing changed (one stat per tab); silent reload when the
         // buffer is clean; status toast when local edits would be clobbered.
@@ -2800,6 +2840,62 @@ impl ScribeApp {
                         }
                     });
 
+                    // Ctrl/Cmd+V with an IMAGE on the clipboard saves it into the
+                    // vault's attachments folder and inserts the markdown link —
+                    // the same `paste_image_attachment` the palette runs, now on
+                    // the key people actually press.
+                    //
+                    // The hook is the V key RELEASE, not `consume_key(COMMAND, V)`,
+                    // and that is NOT a stylistic choice: `egui_winit`'s
+                    // `on_keyboard_input` special-cases the paste chord on
+                    // key-DOWN and `return`s immediately after pushing
+                    // `Event::Paste` — so `Event::Key { key: V, pressed: true }`
+                    // NEVER reaches us, and when the clipboard holds no TEXT it
+                    // pushes nothing at all. On an image-only clipboard the key
+                    // release is therefore the ONLY observable event of the whole
+                    // gesture; a `consume_key` here would be permanently dead
+                    // code. Shift is excluded so Ctrl+Shift+V keeps its binding.
+                    let now = ctx.cumulative_pass_nr();
+                    let (text_pasted, paste_released) = ctx.input(|i| {
+                        (
+                            i.events
+                                .iter()
+                                .any(|e| matches!(e, egui::Event::Paste(t) if !t.is_empty())),
+                            i.events.iter().any(|e| {
+                                matches!(
+                                    e,
+                                    egui::Event::Key {
+                                        key: egui::Key::V,
+                                        pressed: false,
+                                        modifiers,
+                                        ..
+                                    } if modifiers.command && !modifiers.shift && !modifiers.alt
+                                )
+                            }),
+                        )
+                    });
+                    if text_pasted {
+                        ctx.data_mut(|d| d.insert_temp(last_text_paste_frame_id(), now));
+                    }
+                    if paste_released {
+                        // A clipboard carrying BOTH text and a bitmap pastes the
+                        // TEXT: that already happened on the key-down frame, so
+                        // the release must not also drop an image in.
+                        let text_won = ctx
+                            .data_mut(|d| {
+                                let id = last_text_paste_frame_id();
+                                let v = d.get_temp::<u64>(id);
+                                d.remove::<u64>(id);
+                                v
+                            })
+                            .is_some_and(|f| {
+                                now.saturating_sub(f) <= PASTE_IMAGE_TEXT_GRACE_FRAMES
+                            });
+                        if !text_won && self.config.notes.vault_dir.is_some() {
+                            self.paste_image_attachment();
+                        }
+                    }
+
                     // P1-2 — smart paste: rewrite a clipboard-URL Paste event that
                     // lands over a non-empty selection into `[selection](url)`, so
                     // egui's native paste replaces the selection with a md link.
@@ -3166,62 +3262,123 @@ impl ScribeApp {
                         // to http/https (a URL in a file is untrusted data; open only
                         // on an explicit modifier-click, never on render). Bounded by
                         // a buffer-size cap like the other per-frame overlays.
-                        if self.config.editor.detect_links
-                            && self.tabs[active].text.len() <= 1_000_000
+                        //
+                        // The SAME pointer->byte hit-test also resolves an
+                        // in-editor `[[wiki-link]]`: `extract_wikilinks` already
+                        // reports ABSOLUTE byte spans, so the link arm is a
+                        // sibling of the URL arm rather than a second scan. The
+                        // two are mutually exclusive at a given byte (a URL is
+                        // never inside a link target), so URL wins the `find` and
+                        // the link arm is the `else`.
+                        //
+                        // Nothing here is needed unless the pointer is actually
+                        // over the editor, so the hover test comes FIRST: both
+                        // scans are O(buffer) and would otherwise run every frame
+                        // of every session, for a hit-test that cannot happen.
+                        let link_hover = ui
+                            .input(|i| i.pointer.hover_pos())
+                            .filter(|p| out.response.rect.contains(*p));
+                        if let Some(p) =
+                            link_hover.filter(|_| self.tabs[active].text.len() <= 1_000_000)
                         {
                             let text_ref = &self.tabs[active].text;
                             let mut url_spans: Vec<(usize, usize, &str)> = Vec::new();
-                            let mut base = 0usize;
-                            for line in text_ref.split_inclusive('\n') {
-                                for r in scribe_core::url_scan::detect_urls(line) {
-                                    url_spans.push((base + r.start, base + r.end, &line[r]));
+                            if self.config.editor.detect_links {
+                                let mut base = 0usize;
+                                for line in text_ref.split_inclusive('\n') {
+                                    for r in scribe_core::url_scan::detect_urls(line) {
+                                        url_spans.push((base + r.start, base + r.end, &line[r]));
+                                    }
+                                    base += line.len();
                                 }
-                                base += line.len();
                             }
-                            if !url_spans.is_empty() {
-                                if let Some(p) = ui.input(|i| i.pointer.hover_pos()) {
-                                    if out.response.rect.contains(p) {
-                                        let rel = p - out.galley_pos;
-                                        let ci = out.galley.cursor_from_pos(rel).index;
-                                        let byte = char_to_byte(text_ref, ci);
-                                        if let Some(&(_, _, url)) = url_spans
-                                            .iter()
-                                            .find(|(s, e, _)| byte >= *s && byte < *e)
-                                        {
-                                            let cmd = ui.input(|i| i.modifiers.command);
-                                            // P1 — pointer affordance when the follow
-                                            // modifier is held.
-                                            if cmd {
-                                                ui.ctx().set_cursor_icon(
-                                                    egui::CursorIcon::PointingHand,
-                                                );
-                                            }
-                                            // P1 — anti-phishing hover preview of the
-                                            // destination (so the user sees where a
-                                            // link goes before opening it).
-                                            egui::show_tooltip_at_pointer(
-                                                ui.ctx(),
-                                                out.response.layer_id,
-                                                egui::Id::new("scr1b3-url-tooltip"),
-                                                |ui| {
-                                                    ui.label(if cmd {
-                                                        url.to_string()
-                                                    } else {
-                                                        format!("{url}  —  Ctrl+click to open")
-                                                    });
-                                                },
+                            // A wiki-link is a NOTES affordance, not a URL one:
+                            // it is live whenever a vault is configured (there is
+                            // nowhere to resolve a target without one), which is
+                            // exactly the precondition `open_or_create_wikilink`
+                            // enforces. An empty target (`[[#Heading]]`, an
+                            // intra-note anchor) names no note and is skipped.
+                            let link_spans: Vec<scribe_core::notes::wikilink::WikiLink> =
+                                if self.config.notes.vault_dir.is_some() {
+                                    scribe_core::notes::wikilink::extract_wikilinks(text_ref)
+                                        .into_iter()
+                                        .filter(|l| !l.target.is_empty())
+                                        .collect()
+                                } else {
+                                    Vec::new()
+                                };
+                            if !url_spans.is_empty() || !link_spans.is_empty() {
+                                let rel = p - out.galley_pos;
+                                let ci = out.galley.cursor_from_pos(rel).index;
+                                let byte = char_to_byte(text_ref, ci);
+                                if let Some(&(_, _, url)) =
+                                    url_spans.iter().find(|(s, e, _)| byte >= *s && byte < *e)
+                                {
+                                    let cmd = ui.input(|i| i.modifiers.command);
+                                    // P1 — pointer affordance when the follow
+                                    // modifier is held.
+                                    if cmd {
+                                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                    }
+                                    // P1 — anti-phishing hover preview of the
+                                    // destination (so the user sees where a
+                                    // link goes before opening it).
+                                    egui::show_tooltip_at_pointer(
+                                        ui.ctx(),
+                                        out.response.layer_id,
+                                        egui::Id::new("scr1b3-url-tooltip"),
+                                        |ui| {
+                                            ui.label(if cmd {
+                                                url.to_string()
+                                            } else {
+                                                format!("{url}  —  Ctrl+click to open")
+                                            });
+                                        },
+                                    );
+                                    // P0 — open only on explicit modifier-click,
+                                    // and only for an http/https scheme.
+                                    if cmd
+                                        && ui.input(|i| i.pointer.primary_clicked())
+                                        && scribe_core::url_scan::is_clickable_url(url)
+                                    {
+                                        ui.ctx().open_url(egui::OpenUrl::new_tab(url.to_string()));
+                                    }
+                                } else if let Some(link) =
+                                    link_spans.iter().find(|l| byte >= l.start && byte < l.end)
+                                {
+                                    let cmd = ui.input(|i| i.modifiers.command);
+                                    if cmd {
+                                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                    }
+                                    // The hover names the TARGET, not the
+                                    // label — an aliased link must not
+                                    // hide where it goes (same contract as
+                                    // the notes pane's link list).
+                                    egui::show_tooltip_at_pointer(
+                                        ui.ctx(),
+                                        out.response.layer_id,
+                                        egui::Id::new("scr1b3-wikilink-tooltip"),
+                                        |ui| {
+                                            ui.label(if cmd {
+                                                format!("[[{}]]", link.target)
+                                            } else {
+                                                format!(
+                                                    "[[{}]]  —  Ctrl+click to open",
+                                                    link.target
+                                                )
+                                            });
+                                        },
+                                    );
+                                    // Stash, don't follow: `self` is
+                                    // borrowed here. Drained at the top of
+                                    // the next frame.
+                                    if cmd && ui.input(|i| i.pointer.primary_clicked()) {
+                                        ui.ctx().data_mut(|d| {
+                                            d.insert_temp(
+                                                editor_wikilink_follow_id(),
+                                                link.target.clone(),
                                             );
-                                            // P0 — open only on explicit modifier-click,
-                                            // and only for an http/https scheme.
-                                            if cmd
-                                                && ui.input(|i| i.pointer.primary_clicked())
-                                                && scribe_core::url_scan::is_clickable_url(url)
-                                            {
-                                                ui.ctx().open_url(egui::OpenUrl::new_tab(
-                                                    url.to_string(),
-                                                ));
-                                            }
-                                        }
+                                        });
                                     }
                                 }
                             }
@@ -4088,5 +4245,340 @@ impl ScribeApp {
         );
 
         self.persist_session_and_autosave();
+    }
+}
+
+/// Editor-surface link + paste wiring, asserted by OBSERVABLE OUTCOME.
+///
+/// Both features are wires between things that already worked separately (the
+/// wiki-link resolver; the attachment-paste command), so the only failure worth
+/// testing for is the wire itself being absent — which a "a pending flag was
+/// set" assertion cannot see. Every test here asserts the end of the wire: the
+/// note that got created and opened, or the markdown that landed in the buffer.
+#[cfg(test)]
+mod editor_link_paste_wiring_tests {
+    use super::super::e2e::Driver;
+    use super::super::note_capture::{test_hooks, ClipboardImage};
+    use crate::app::ScribeApp;
+    use scribe_core::config::Config;
+    use std::path::{Path, PathBuf};
+
+    const CMD: egui::Modifiers = egui::Modifiers::COMMAND;
+
+    struct Vault {
+        _root: tempfile::TempDir,
+        path: PathBuf,
+    }
+
+    fn vault() -> Vault {
+        let root = tempfile::tempdir().expect("temp root");
+        let path = root.path().join("vault");
+        std::fs::create_dir_all(&path).expect("vault dir");
+        Vault { _root: root, path }
+    }
+
+    fn app_with_vault(v: &Path) -> ScribeApp {
+        let mut cfg = Config::default();
+        cfg.editor.first_run_completed = true;
+        cfg.notes.vault_dir = Some(v.to_path_buf());
+        ScribeApp::new_test(cfg)
+    }
+
+    fn solid_image(w: usize, h: usize) -> ClipboardImage {
+        ClipboardImage {
+            width: w,
+            height: h,
+            rgba: vec![0x40u8; w * h * 4],
+        }
+    }
+
+    /// A modified pointer click (move + press + release) in ONE frame — the same
+    /// shape `e2e`'s own Ctrl+click test uses.
+    fn mod_click(d: &Driver, app: &mut ScribeApp, pos: egui::Pos2, modifiers: egui::Modifiers) {
+        d.frame(
+            app,
+            modifiers,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers,
+                },
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers,
+                },
+            ],
+        );
+    }
+
+    /// A buffer whose every byte sits inside a link span, so the pointer
+    /// hit-test cannot land in a gap between links. Taller than the window (any
+    /// y lands on text) and each line is ~60 chars — wide enough that [`CLICK`]'s
+    /// x is mid-row, narrow enough not to soft-wrap. Both bounds matter: a
+    /// wrapped row's short tail clamps the hit-test onto the trailing NEWLINE,
+    /// which is inside no link, and the click silently does nothing.
+    fn wall_of(link: &str) -> String {
+        let line = link.repeat(60_usize.div_ceil(link.len()));
+        assert!(
+            (60..90).contains(&line.chars().count()),
+            "fixture geometry: {line:?}"
+        );
+        (0..200)
+            .map(|_| line.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Well inside the wall of links, on both axes.
+    const CLICK: egui::Pos2 = egui::Pos2::new(150.0, 380.0);
+
+    // ---- A: in-editor [[wiki-link]] click ----
+
+    /// Ctrl+clicking a `[[wiki-link]]` IN THE EDITOR opens the note — creating
+    /// it when it does not exist yet, exactly as the notes pane's link list
+    /// does. Asserted on the file that appears and the tab that ends up active,
+    /// never on an intermediate latch.
+    #[test]
+    fn ctrl_clicking_a_wikilink_in_the_editor_opens_the_note() {
+        let v = vault();
+        std::fs::write(v.path.join("Home.md"), "seed\n").unwrap();
+        let mut app = app_with_vault(&v.path);
+        app.open_path(v.path.join("Home.md"));
+        let active = app.active;
+        app.tabs[active].text = wall_of("[[Target]]");
+
+        let d = Driver::new();
+        d.idle(&mut app);
+        d.idle(&mut app); // editor lays out + takes focus
+        assert!(
+            !v.path.join("Target.md").exists(),
+            "precondition: the link target does not exist yet"
+        );
+
+        mod_click(&d, &mut app, CLICK, CMD);
+        d.idle(&mut app); // the stashed follow is drained at the top of the frame
+
+        let target = v.path.join("Target.md");
+        assert!(
+            target.exists(),
+            "the clicked [[Target]] must be created in the vault"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "# Target\n",
+            "created through open_or_create_wikilink, seeded with its heading"
+        );
+        assert_eq!(
+            app.tabs[app.active].doc.path(),
+            Some(target.as_path()),
+            "…and opened in the active tab"
+        );
+    }
+
+    /// A plain (unmodified) click over a wiki-link must NOT follow it — the
+    /// modifier is the whole consent gesture, same as the URL arm.
+    #[test]
+    fn a_plain_click_on_a_wikilink_does_not_open_anything() {
+        let v = vault();
+        std::fs::write(v.path.join("Home.md"), "seed\n").unwrap();
+        let mut app = app_with_vault(&v.path);
+        app.open_path(v.path.join("Home.md"));
+        let active = app.active;
+        app.tabs[active].text = wall_of("[[Target]]");
+
+        let d = Driver::new();
+        d.idle(&mut app);
+        d.idle(&mut app);
+        mod_click(&d, &mut app, CLICK, egui::Modifiers::NONE);
+        d.idle(&mut app);
+
+        assert!(
+            !v.path.join("Target.md").exists(),
+            "an unmodified click must not create or open the note"
+        );
+    }
+
+    /// The traversal gate is the resolver's, not a second copy: a link that
+    /// escapes the vault is refused with a toast and writes nothing outside it.
+    #[test]
+    fn a_traversal_wikilink_clicked_in_the_editor_is_refused() {
+        let v = vault();
+        let outside = v.path.parent().unwrap().to_path_buf();
+        std::fs::write(v.path.join("Home.md"), "seed\n").unwrap();
+        let mut app = app_with_vault(&v.path);
+        app.open_path(v.path.join("Home.md"));
+        let active = app.active;
+        app.tabs[active].text = wall_of("[[../escaped]]");
+
+        let d = Driver::new();
+        d.idle(&mut app);
+        d.idle(&mut app);
+        mod_click(&d, &mut app, CLICK, CMD);
+        d.idle(&mut app);
+
+        assert!(
+            !outside.join("escaped.md").exists(),
+            "nothing may be written outside the vault"
+        );
+        assert!(
+            app.toast
+                .as_deref()
+                .unwrap_or("")
+                .contains("Can't open that link"),
+            "the refusal is surfaced, not silent: {:?}",
+            app.toast
+        );
+    }
+
+    // ---- C: Ctrl+V pastes a clipboard image as an attachment ----
+
+    /// Ctrl+V with an image on the clipboard runs the attachment paste and the
+    /// markdown link lands IN THE BUFFER. The end of the wire, not the latch:
+    /// `pending_insert_text.is_some()` would still pass with the drain deleted.
+    #[test]
+    fn ctrl_v_with_a_clipboard_image_inserts_the_attachment_markdown() {
+        let v = vault();
+        std::fs::write(v.path.join("Note.md"), "before\n").unwrap();
+        let mut app = app_with_vault(&v.path);
+        app.open_path(v.path.join("Note.md"));
+        let active = app.active;
+
+        let d = Driver::new();
+        d.idle(&mut app);
+        d.idle(&mut app); // the editor must own focus for the paste hook
+
+        test_hooks::set_next_image(solid_image(2, 2));
+        // egui_winit swallows the paste key-DOWN, so the RELEASE is the event
+        // the app really sees; `Driver::key` sends press + release.
+        d.key(&mut app, egui::Key::V, CMD);
+        d.idle(&mut app); // deliver the queued insertion
+        d.idle(&mut app); // …and let the editor settle it
+
+        let text = app.tabs[active].text.clone();
+        assert!(
+            text.contains("![pasted image](attachments/pasted-"),
+            "Ctrl+V must insert the attachment markdown, got {text:?}"
+        );
+        assert!(
+            text.contains("before"),
+            "existing content survives: {text:?}"
+        );
+        let name = text
+            .split_once("](")
+            .and_then(|(_, t)| t.split_once(')'))
+            .map(|(p, _)| p.to_string())
+            .expect("a link target");
+        assert!(
+            v.path.join(&name).exists(),
+            "the link names a PNG that is really there: {name}"
+        );
+    }
+
+    /// The RELEASE alone must fire it — which is the whole reason the hook is
+    /// not `consume_key(COMMAND, V)`.
+    ///
+    /// `egui_winit::State::on_keyboard_input` special-cases the paste chord on
+    /// key-DOWN and returns immediately, so `Event::Key { key: V, pressed: true }`
+    /// is NEVER emitted for Ctrl+V, and on an image-only clipboard (no text to
+    /// put in an `Event::Paste`) it emits nothing at all on the way down. This
+    /// test replays exactly what the real integration delivers — the release and
+    /// nothing else. Without it, `Driver::key`'s press+release pair lets a
+    /// press-watching implementation pass while being dead code in the app.
+    #[test]
+    fn the_paste_key_release_alone_pastes_the_image() {
+        let v = vault();
+        std::fs::write(v.path.join("Note.md"), "before\n").unwrap();
+        let mut app = app_with_vault(&v.path);
+        app.open_path(v.path.join("Note.md"));
+        let active = app.active;
+
+        let d = Driver::new();
+        d.idle(&mut app);
+        d.idle(&mut app);
+
+        test_hooks::set_next_image(solid_image(2, 2));
+        d.frame(
+            &mut app,
+            CMD,
+            vec![egui::Event::Key {
+                key: egui::Key::V,
+                physical_key: None,
+                pressed: false,
+                repeat: false,
+                modifiers: CMD,
+            }],
+        );
+        d.idle(&mut app);
+        d.idle(&mut app);
+
+        assert!(
+            app.tabs[active]
+                .text
+                .contains("![pasted image](attachments/pasted-"),
+            "the key RELEASE is the only event egui emits for an image-only \
+             clipboard; got {:?}",
+            app.tabs[active].text
+        );
+    }
+
+    /// A clipboard carrying TEXT pastes the text: the image branch must not also
+    /// fire on the key release and drop an unwanted attachment in.
+    #[test]
+    fn a_text_paste_is_not_hijacked_by_the_image_branch() {
+        let v = vault();
+        std::fs::write(v.path.join("Note.md"), "before\n").unwrap();
+        let mut app = app_with_vault(&v.path);
+        app.open_path(v.path.join("Note.md"));
+
+        let d = Driver::new();
+        d.idle(&mut app);
+        d.idle(&mut app);
+
+        test_hooks::set_next_image(solid_image(2, 2));
+        // The real gesture shape: `Event::Paste` on the key-down frame, the `V`
+        // release a frame later.
+        d.frame(&mut app, CMD, vec![egui::Event::Paste("hello".into())]);
+        d.key(&mut app, egui::Key::V, CMD);
+        d.idle(&mut app);
+        d.idle(&mut app);
+
+        assert!(
+            !v.path.join("attachments").exists(),
+            "a text paste must not write an image attachment"
+        );
+        assert!(
+            !app.tabs[app.active].text.contains("![pasted image]"),
+            "…nor insert attachment markdown: {:?}",
+            app.tabs[app.active].text
+        );
+    }
+
+    /// Ctrl+SHIFT+V is a different binding (markdown preview) — the image branch
+    /// must not claim its release.
+    #[test]
+    fn ctrl_shift_v_does_not_paste_an_image() {
+        let v = vault();
+        std::fs::write(v.path.join("Note.md"), "before\n").unwrap();
+        let mut app = app_with_vault(&v.path);
+        app.open_path(v.path.join("Note.md"));
+
+        let d = Driver::new();
+        d.idle(&mut app);
+        d.idle(&mut app);
+
+        test_hooks::set_next_image(solid_image(2, 2));
+        d.key(&mut app, egui::Key::V, CMD | egui::Modifiers::SHIFT);
+        d.idle(&mut app);
+        d.idle(&mut app);
+
+        assert!(
+            !v.path.join("attachments").exists(),
+            "Ctrl+Shift+V must not paste an image attachment"
+        );
     }
 }

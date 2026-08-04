@@ -202,20 +202,64 @@ impl ScribeApp {
     /// Open the identifier-completion popup for the prefix ending at `char_idx`
     /// in the active buffer. Sources suggestions from the buffer's own words
     /// (zero network / LSP dependency).
+    ///
+    /// A half-typed NOTES sigil wins first. When the caret sits inside an open
+    /// `[[note` or `#tag`, the vault's own titles / tag tree are the candidates
+    /// — the SAME `notes::completion::complete` source the notes-pane search box
+    /// consumes, so the two surfaces can never drift into two recognition rules.
+    /// The buffer-word source is the fallback for ordinary identifiers.
     pub(super) fn open_completion(&mut self, active: usize, char_idx: Option<usize>) {
         let Some(ci) = char_idx else {
             self.completion = None;
             return;
         };
-        let text = &self.tabs[active].text;
-        let byte = char_to_byte(text, ci);
-        let (start, prefix) = crate::editor_features::prefix_before(text, byte);
-        let items = crate::editor_features::word_completions(text, &prefix, 8);
-        self.completion = (!items.is_empty()).then_some(Completion {
-            prefix_start: start,
-            items,
+        // Scope every immutable borrow of `self` so the assignment below is free
+        // to take `&mut self`.
+        let next = {
+            let text = &self.tabs[active].text;
+            let byte = char_to_byte(text, ci);
+            self.notes_sigil_completion(text, byte).or_else(|| {
+                let (start, prefix) = crate::editor_features::prefix_before(text, byte);
+                let items = crate::editor_features::word_completions(text, &prefix, 8);
+                (!items.is_empty()).then_some(Completion {
+                    prefix_start: start,
+                    items,
+                    selected: 0,
+                })
+            })
+        };
+        self.completion = next;
+    }
+
+    /// The `[[note` / `#tag` completion active at `byte` in `text`, if any.
+    ///
+    /// The candidate pools are the live note index's titles and its tag tree —
+    /// the same two pools the notes pane builds. The stored `items` are the
+    /// FINISHED editor text (`[[Title]]` / `#tag`), because `accept_completion`
+    /// splices an item verbatim over `prefix_start..caret`; `notes::completion`
+    /// deliberately leaves that choice to its caller, which is what lets the
+    /// search box expand the same suggestion into `title:"…"` instead.
+    fn notes_sigil_completion(&self, text: &str, byte: usize) -> Option<Completion> {
+        use scribe_core::notes::{completion as notes_completion, tag_tree};
+
+        let tag_pool: Vec<String> =
+            tag_tree::build(self.note_index.iter().map(|d| d.tags.as_slice()))
+                .iter()
+                .map(|n| n.tag.clone())
+                .collect();
+        let title_pool: Vec<String> = self.note_index.iter().map(|d| d.title.clone()).collect();
+        let s = notes_completion::complete(text, byte, &tag_pool, &title_pool, 8)?;
+        Some(Completion {
+            // Already a byte offset, and `accept_completion` re-validates it
+            // against a char boundary before splicing.
+            prefix_start: s.start,
+            items: s
+                .candidates
+                .iter()
+                .map(|c| super::notes_ui::suggestion_chip_label(s.trigger, c))
+                .collect(),
             selected: 0,
-        });
+        })
     }
 
     /// Insert the selected completion, replacing the typed prefix.
@@ -1141,5 +1185,150 @@ mod minimap_geom_tests {
         // at natural_h ≈ (BASE/MIN) × panel_h.
         let ratio = MINIMAP_BASE_PT / MINIMAP_MIN_PT;
         assert!((ratio - 3.0).abs() < EPS);
+    }
+}
+
+/// Editor `[[note` / `#tag` completion, asserted on the text that is actually
+/// inserted into the buffer.
+///
+/// The candidates come from the VAULT, not the buffer, so a suggestion that
+/// appears nowhere in the open document is proof the notes source is really
+/// wired — a `completion.is_some()` assertion would pass just as happily with
+/// the old buffer-word source still in place.
+#[cfg(test)]
+mod notes_sigil_completion_tests {
+    use crate::app::ScribeApp;
+    use scribe_core::config::Config;
+    use std::path::{Path, PathBuf};
+
+    struct Vault {
+        _root: tempfile::TempDir,
+        path: PathBuf,
+    }
+
+    fn vault() -> Vault {
+        let root = tempfile::tempdir().expect("temp root");
+        let path = root.path().join("vault");
+        std::fs::create_dir_all(&path).expect("vault dir");
+        Vault { _root: root, path }
+    }
+
+    fn app_with_vault(v: &Path) -> ScribeApp {
+        let mut cfg = Config::default();
+        cfg.editor.first_run_completed = true;
+        cfg.notes.vault_dir = Some(v.to_path_buf());
+        let mut app = ScribeApp::new_test(cfg);
+        app.notes_ensure_index();
+        app
+    }
+
+    /// Type `text` into tab 0, open completion at its end, accept the first
+    /// suggestion, and return the resulting buffer.
+    fn complete_at_end(app: &mut ScribeApp, text: &str) -> String {
+        app.tabs[0].text = text.to_string();
+        let ci = text.chars().count();
+        app.open_completion(0, Some(ci));
+        app.accept_completion(0, Some(ci));
+        app.tabs[0].text.clone()
+    }
+
+    #[test]
+    fn an_open_double_bracket_completes_a_vault_note_title_into_a_finished_link() {
+        let v = vault();
+        std::fs::write(v.path.join("Roadmap.md"), "# Roadmap\n\nbody\n").unwrap();
+        let mut app = app_with_vault(&v.path);
+        assert_eq!(
+            app.note_index.len(),
+            1,
+            "precondition: the vault is indexed"
+        );
+
+        assert_eq!(
+            complete_at_end(&mut app, "see [[Road"),
+            "see [[Roadmap]]",
+            "the accepted candidate must replace the whole `[[Road` token with a \
+             CLOSED link — `Roadmap` appears nowhere in the buffer, so this can \
+             only have come from the note index"
+        );
+    }
+
+    #[test]
+    fn an_open_hash_completes_a_vault_tag() {
+        let v = vault();
+        std::fs::write(v.path.join("Work.md"), "# Work\n\n#project/frontend\n").unwrap();
+        let mut app = app_with_vault(&v.path);
+
+        assert_eq!(
+            complete_at_end(&mut app, "note #proj"),
+            "note #project",
+            "the tag tree materialises the `project` ancestor and the sigil is \
+             replaced along with the typed body"
+        );
+    }
+
+    /// An OPEN sigil wins over the buffer-word source even when that source has
+    /// a perfectly good match for the same prefix.
+    ///
+    /// `Roadster` is a buffer word matching `Road`, so with the two sources in
+    /// the other order the user typing `[[Road` would get a bare `Roadster`
+    /// spliced over their `[[` — a broken link, from the wrong pool. Precedence
+    /// is behaviour, not tidiness.
+    #[test]
+    fn an_open_sigil_beats_a_matching_buffer_word() {
+        let v = vault();
+        std::fs::write(v.path.join("Roadmap.md"), "# Roadmap\n").unwrap();
+        let mut app = app_with_vault(&v.path);
+
+        assert_eq!(
+            complete_at_end(&mut app, "Roadster see [[Road"),
+            "Roadster see [[Roadmap]]",
+            "the open `[[` owns the caret; the buffer word `Roadster` must not \
+             claim it"
+        );
+    }
+
+    #[test]
+    fn a_closed_link_is_no_longer_a_sigil_context_and_falls_back_to_buffer_words() {
+        // `[[Roadmap]]` is closed, so the caret is outside it: the notes source
+        // must decline and the ORIGINAL buffer-word source must still run. This
+        // is the regression guard for the fallback the sigil branch now precedes.
+        let v = vault();
+        std::fs::write(v.path.join("Roadmap.md"), "# Roadmap\n").unwrap();
+        let mut app = app_with_vault(&v.path);
+
+        assert_eq!(
+            complete_at_end(&mut app, "banana [[Roadmap]] ban"),
+            "banana [[Roadmap]] banana",
+            "buffer-word completion still works when no sigil is open"
+        );
+    }
+
+    #[test]
+    fn a_sigil_with_no_matching_note_opens_no_popup() {
+        let v = vault();
+        std::fs::write(v.path.join("Roadmap.md"), "# Roadmap\n").unwrap();
+        let mut app = app_with_vault(&v.path);
+        app.tabs[0].text = "see [[zzzz".to_string();
+        app.open_completion(0, Some(10));
+        assert!(
+            app.completion.is_none(),
+            "an unmatched query is no suggestion, not an empty popup"
+        );
+    }
+
+    #[test]
+    fn with_no_vault_the_sigil_branch_is_inert_and_the_word_source_still_serves() {
+        // Empty pools => `notes::completion::complete` yields nothing, so the
+        // fallback must carry the case rather than the popup going dead.
+        let mut cfg = Config::default();
+        cfg.editor.first_run_completed = true;
+        let mut app = ScribeApp::new_test(cfg);
+        assert!(app.config.notes.vault_dir.is_none());
+
+        assert_eq!(
+            complete_at_end(&mut app, "banana ban"),
+            "banana banana",
+            "no vault must not disable identifier completion"
+        );
     }
 }
