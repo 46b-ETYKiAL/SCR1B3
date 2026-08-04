@@ -619,16 +619,15 @@ pub fn parse(src: &str) -> Vec<MdBlock> {
                 );
             }
             Event::Start(Tag::FootnoteDefinition(label)) => {
-                // `pulldown-cmark` never nests definitions, but closing any
-                // still-open one keeps the state machine total rather than
-                // silently discarding its accumulated body.
-                if let Some(prev) = footnote.take() {
-                    footnotes.push(MdBlock::FootnoteDef {
-                        number: prev.number,
-                        label: prev.label,
-                        body: prev.body,
-                    });
-                }
+                // `pulldown-cmark` emits definitions FLAT (a definition written
+                // inside another becomes a sibling) and always closes one before
+                // opening the next, so no definition can be open here. Asserted
+                // rather than "defensively" reconciled: a branch no input can
+                // reach is dead weight that no test can ever prove correct.
+                debug_assert!(
+                    footnote.is_none(),
+                    "parser opened a footnote definition while one was still open"
+                );
                 let number = footnote_number(&mut footnote_numbers, &mut next_footnote, &label);
                 runs.clear();
                 footnote = Some(PendingFootnote {
@@ -731,14 +730,14 @@ pub fn parse(src: &str) -> Vec<MdBlock> {
         let block = MdBlock::Paragraph(std::mem::take(&mut runs));
         push_block(&mut blocks, &mut footnote, block);
     }
-    // Close a footnote definition left open by truncated input.
-    if let Some(f) = footnote.take() {
-        footnotes.push(MdBlock::FootnoteDef {
-            number: f.number,
-            label: f.label,
-            body: f.body,
-        });
-    }
+    // No post-loop reconciliation of `footnote`: `pulldown-cmark` closes every
+    // open tag at end of input, so `End(TagEnd::FootnoteDefinition)` has already
+    // fired even for a document that stops mid-definition (covered by
+    // `a_truncated_footnote_definition_is_still_emitted`).
+    debug_assert!(
+        footnote.is_none(),
+        "parser ended with a footnote definition still open"
+    );
 
     // Footnote definitions render as a section at the END of the document,
     // ordered by number and separated by a rule — GitHub's layout, and the only
@@ -1619,7 +1618,10 @@ mod tests {
                 render_blocks(ui, std::slice::from_ref(&table), &mut ctx, 0);
             });
         h.run();
-        assert!(h.query_by_label("onlyhead").is_some(), "header cell renders");
+        assert!(
+            h.query_by_label("onlyhead").is_some(),
+            "header cell renders"
+        );
         assert!(h.query_by_label("solo").is_some(), "body cell renders");
     }
 
@@ -1870,9 +1872,8 @@ mod tests {
     fn to_html_exports_tables_footnotes_and_math() {
         // The export used the DEFAULT option set, so none of these rendered —
         // the stylesheet even carried table CSS that nothing could ever match.
-        let html = to_html(
-            "| a | b |\n|---|--:|\n| 1 | 2 |\n\nnote[^k]\n\n$x^2$\n\n[^k]: body text\n",
-        );
+        let html =
+            to_html("| a | b |\n|---|--:|\n| 1 | 2 |\n\nnote[^k]\n\n$x^2$\n\n[^k]: body text\n");
         assert!(html.contains("<table>"), "table element missing:\n{html}");
         assert!(html.contains("<th>a</th>"), "header cell missing:\n{html}");
         assert!(
@@ -1923,7 +1924,10 @@ mod tests {
         );
         // The safe structure around the stripped content is still exported.
         assert!(html.contains("<table>"), "table still rendered:\n{html}");
-        assert!(html.contains("footnote-definition"), "note rendered:\n{html}");
+        assert!(
+            html.contains("footnote-definition"),
+            "note rendered:\n{html}"
+        );
         assert!(html.contains(">ok<"), "safe cell text kept:\n{html}");
     }
 

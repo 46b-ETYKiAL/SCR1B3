@@ -591,17 +591,33 @@ mod tests {
     }
 
     #[test]
-    fn deep_nesting_is_capped_and_still_terminates() {
-        // Past MAX_DEPTH the fragment is emitted verbatim instead of recursing
+    fn deep_nesting_stops_expanding_at_the_cap_and_emits_the_rest_verbatim() {
+        // Past MAX_DEPTH the fragment is emitted VERBATIM instead of recursing
         // further — the guard against a hostile deeply-nested document.
-        let deep = format!(
-            "{}x{}",
-            "\\sqrt{".repeat(MAX_DEPTH as usize + 4),
-            "}".repeat(MAX_DEPTH as usize + 4)
-        );
+        //
+        // Asserting only "the output still contains x and √" would be vacuous:
+        // that holds whether or not the cap exists. The discriminating signal is
+        // that the un-expanded tail is still raw TeX — with no cap, every level
+        // expands and no backslash or brace can remain.
+        let n = MAX_DEPTH as usize + 4;
+        let deep = format!("{}x{}", "\\sqrt{".repeat(n), "}".repeat(n));
         let out = math_to_unicode(&deep);
         assert!(out.contains('x'), "content survived: {out}");
-        assert!(out.contains('√'), "outer sqrt still expanded: {out}");
+        assert!(out.starts_with('√'), "outer levels still expanded: {out}");
+        assert!(
+            out.contains("\\sqrt"),
+            "levels past the cap must stay raw TeX (no cap => fully expanded): {out}"
+        );
+        assert!(
+            out.contains('{'),
+            "the verbatim tail keeps its braces: {out}"
+        );
+        // Exactly the levels within the cap expanded.
+        assert_eq!(
+            out.matches('√').count(),
+            MAX_DEPTH as usize + 1,
+            "one √ per level up to and including the cap: {out}"
+        );
     }
 
     #[test]
