@@ -1321,10 +1321,22 @@ pub fn apply_event(
     // flag explicitly in their arms.
     let len_before = rope.len_chars();
 
+    // Record the pre-edit snapshot for an edit of `$kind`.
+    //
+    // The snapshot is built LAZILY (`History::record_with`) because a
+    // coalescing record — every keystroke of a typing run after the first —
+    // DISCARDS it. Built eagerly, `rope.to_string()` copied the entire buffer
+    // on every keypress and then threw the copy away, which is worst exactly at
+    // the multi-MiB sizes the rope path exists to make fast. `record_with` is
+    // defined in terms of the same predicate `record` uses, so the coalescing
+    // (and therefore undo/redo) semantics are unchanged — only the cost is.
     macro_rules! record_before {
         ($kind:expr) => {{
-            let before = Snapshot::new(rope.to_string(), state.edit.cursor);
-            state.history.record(before, $kind);
+            let cursor = state.edit.cursor;
+            let rope_ref = &*rope;
+            state
+                .history
+                .record_with($kind, || Snapshot::new(rope_ref.to_string(), cursor));
         }};
     }
 

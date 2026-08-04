@@ -32,39 +32,88 @@
 #![allow(clippy::wildcard_imports)]
 use super::*;
 
-/// The pointer-position band the titlebar occupied on the most recent frame, in
-/// egui logical points, plus the union of the caption buttons laid out inside
-/// it. Recorded by [`caption_btn`] so the titlebar right-click -> system-menu
-/// check can exclude clicks that landed on a caption button (right-clicking a
-/// caption button pops nothing on a native window either).
-static TITLEBAR_BAND: std::sync::Mutex<Option<egui::Rect>> = std::sync::Mutex::new(None);
-static CAPTION_BTN_UNION: std::sync::Mutex<Option<egui::Rect>> = std::sync::Mutex::new(None);
+// ───────────────────── per-`Context` titlebar chrome state ─────────────────────
+//
+// The titlebar band, the caption-button union and the two pass latches below
+// are all answers to per-CONTEXT questions ("did THIS context's titlebar
+// publish on THIS pass?"), so they live in `egui::Context::data` — the
+// per-context store egui already provides, and the same one the rope editor
+// uses for its action requests.
+//
+// They were process-globals (a `static Mutex` pair + a `static AtomicU64`
+// pair). A test binary is ONE process but MANY egui `Context`s: `chrome_tests`,
+// `e2e.rs` and `e2e_overlays.rs` each build their own harness, on their own
+// thread, each with its own independent `cumulative_pass_nr`. Sharing one latch
+// across them corrupted the retraction decision three different ways, all
+// reproducible at `--test-threads=32`:
+//
+//   * a sibling storing ITS pass number between this context's publish and this
+//     context's end-of-pass made `classify_end_pass` say `RetractNow`, so the
+//     retractor retracted a rect that WAS on screen;
+//   * a sibling whose pass number happened to EQUAL ours read as
+//     `PublishedThisPass`, so a retraction that was due never happened;
+//   * a sibling that had just retracted (`u64::MAX`) read as `AlreadyLatched`,
+//     same outcome.
+//
+// A file-scoped lock cannot fix that — the siblings are in other files and
+// legitimately render titlebars. Scoping the state to the context that owns it
+// removes the interference entirely. Production drives exactly one `Context`,
+// so its behaviour is unchanged.
 
-/// `cumulative_pass_nr` of the pass in which the maximize button last published
-/// its rect. `u64::MAX` = never / retracted. Read by [`MaximizeRectRetractor`]
-/// to decide whether the titlebar rendered this pass.
-static LAST_MAX_RECT_PASS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(u64::MAX);
+/// Namespaced `Id` for one piece of per-context chrome state.
+fn chrome_state_id(key: &'static str) -> egui::Id {
+    egui::Id::new(("scr1b3::chrome", key))
+}
 
-/// `cumulative_pass_nr` of the pass whose titlebar band + caption-button union
-/// are currently recorded, so only the FIRST caption button of a pass resets
-/// them. Distinct from [`LAST_MAX_RECT_PASS`] because the maximize button is not
-/// the first button drawn.
-static LAST_BAND_PASS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+/// `cumulative_pass_nr` of the pass in which THIS context's maximize button
+/// last published its rect. `u64::MAX` = never / retracted. Read by
+/// [`MaximizeRectRetractor`] to decide whether the titlebar rendered this pass.
+fn last_max_rect_pass(ctx: &egui::Context) -> u64 {
+    ctx.data(|d| d.get_temp::<u64>(chrome_state_id("last_max_rect_pass")))
+        .unwrap_or(u64::MAX)
+}
 
-/// Put both pass latches back to their initial "never published" state.
+fn set_last_max_rect_pass(ctx: &egui::Context, pass: u64) {
+    ctx.data_mut(|d| d.insert_temp(chrome_state_id("last_max_rect_pass"), pass));
+}
+
+/// Set the band-pass latch and return the PREVIOUS value — the per-context
+/// equivalent of the `AtomicU64::swap` this replaced, so the "first caption
+/// button of this pass wins" test stays a single read-modify-write.
 ///
-/// These are PROCESS-globals and a test binary is one process, so every test
-/// that runs a pass mutates the same two counters. Without a reset, a test's
-/// starting latch state is whatever a sibling left behind — which made
-/// `the_retraction_happens_once_and_then_latches` pass alone and fail in the
-/// suite. Tests pair this with `chrome_tests::CHROME_GLOBALS_LOCK` so the reset
-/// is not immediately undone by a concurrent sibling.
-#[cfg(test)]
-pub(super) fn reset_pass_latches_for_test() {
-    use std::sync::atomic::Ordering;
-    LAST_MAX_RECT_PASS.store(u64::MAX, Ordering::Relaxed);
-    LAST_BAND_PASS.store(u64::MAX, Ordering::Relaxed);
+/// `cumulative_pass_nr` of the pass whose titlebar band + caption-button union
+/// are currently recorded. Distinct from [`last_max_rect_pass`] because the
+/// maximize button is not the first button drawn.
+fn swap_last_band_pass(ctx: &egui::Context, pass: u64) -> u64 {
+    ctx.data_mut(|d| {
+        let id = chrome_state_id("last_band_pass");
+        let prev = d.get_temp::<u64>(id).unwrap_or(u64::MAX);
+        d.insert_temp(id, pass);
+        prev
+    })
+}
+
+/// The pointer-position band the titlebar occupied on the most recent frame, in
+/// egui logical points. Recorded by [`caption_btn`] so the titlebar right-click
+/// -> system-menu check can exclude clicks that landed on a caption button
+/// (right-clicking a caption button pops nothing on a native window either).
+fn titlebar_band(ctx: &egui::Context) -> Option<egui::Rect> {
+    ctx.data(|d| d.get_temp::<Option<egui::Rect>>(chrome_state_id("titlebar_band")))
+        .flatten()
+}
+
+fn set_titlebar_band(ctx: &egui::Context, band: Option<egui::Rect>) {
+    ctx.data_mut(|d| d.insert_temp(chrome_state_id("titlebar_band"), band));
+}
+
+/// Union of the caption buttons laid out inside [`titlebar_band`] this pass.
+fn caption_btn_union(ctx: &egui::Context) -> Option<egui::Rect> {
+    ctx.data(|d| d.get_temp::<Option<egui::Rect>>(chrome_state_id("caption_btn_union")))
+        .flatten()
+}
+
+fn set_caption_btn_union(ctx: &egui::Context, union: Option<egui::Rect>) {
+    ctx.data_mut(|d| d.insert_temp(chrome_state_id("caption_btn_union"), union));
 }
 
 #[cfg(test)]
@@ -199,18 +248,15 @@ pub(super) struct MaximizeRectRetractor;
 
 /// What an end-of-pass should do, given the latch state and the current pass.
 ///
-/// Extracted as a PURE decision because the state it reads
-/// ([`LAST_MAX_RECT_PASS`]) is a process-global, and a test binary is one
-/// process: any test anywhere that renders a frameless titlebar advances it.
-/// "Run two idle passes and observe that nothing was re-stored" is therefore not
-/// decidable from a live harness — a concurrent pass in another test file
-/// (`e2e.rs`, `e2e_overlays.rs`) legitimately un-latches it mid-assertion, which
-/// is exactly how that test failed intermittently in a plain `cargo test` while
-/// passing under `--test-threads=1`.
+/// Extracted as a PURE decision so the latching property can be pinned over
+/// `(last_pass, pass)` — where it is total and deterministic — in all three
+/// cases, rather than only the one an idling harness could observe.
 ///
-/// Over `(last_pass, pass)` the decision is total and deterministic, so the
-/// latching property is pinned here instead — all three cases, rather than the
-/// one the harness could observe.
+/// Both inputs must come from the SAME [`egui::Context`]: `pass` is that
+/// context's `cumulative_pass_nr` and `last_pass` is [`last_max_rect_pass`] for
+/// that same context. While the latch was a process-global the two could come
+/// from different contexts, and every mismatched pairing here decodes to a wrong
+/// answer — see the module-level note on the per-context state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum EndPassAction {
     /// The titlebar published this very pass — the button is on screen.
@@ -238,17 +284,18 @@ impl egui::Plugin for MaximizeRectRetractor {
     }
 
     fn on_end_pass(&mut self, ui: &mut egui::Ui) {
-        use std::sync::atomic::Ordering;
-        let pass = ui.ctx().cumulative_pass_nr();
+        let ctx = ui.ctx().clone();
+        let pass = ctx.cumulative_pass_nr();
         // One load, one decision, one transition — so the branch the tests pin is
-        // the branch production takes.
-        match classify_end_pass(LAST_MAX_RECT_PASS.load(Ordering::Relaxed), pass) {
+        // the branch production takes. Both the latch and the pass number now
+        // come from the SAME context, so no other context can answer for it.
+        match classify_end_pass(last_max_rect_pass(&ctx), pass) {
             EndPassAction::PublishedThisPass | EndPassAction::AlreadyLatched => {}
             EndPassAction::RetractNow => {
-                LAST_MAX_RECT_PASS.store(u64::MAX, Ordering::Relaxed);
+                set_last_max_rect_pass(&ctx, u64::MAX);
                 retract_maximize_rect();
-                *TITLEBAR_BAND.lock().unwrap_or_else(|e| e.into_inner()) = None;
-                *CAPTION_BTN_UNION.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                set_titlebar_band(&ctx, None);
+                set_caption_btn_union(&ctx, None);
             }
         }
     }
@@ -322,21 +369,20 @@ pub(super) fn caption_btn(
     let ctx = ui.ctx().clone();
     let pass = ctx.cumulative_pass_nr();
     {
-        use std::sync::atomic::Ordering;
         // First caption button OF THIS PASS starts a fresh band + union; the
         // later ones only extend the union. Tracked on its own counter — the
         // maximize button is the SECOND button drawn, so keying this off
-        // `LAST_MAX_RECT_PASS` would reset the union after Close was recorded.
-        if LAST_BAND_PASS.swap(pass, Ordering::Relaxed) != pass {
-            *TITLEBAR_BAND.lock().unwrap_or_else(|e| e.into_inner()) = Some(ui.max_rect());
-            *CAPTION_BTN_UNION.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        // `last_max_rect_pass` would reset the union after Close was recorded.
+        if swap_last_band_pass(&ctx, pass) != pass {
+            set_titlebar_band(&ctx, Some(ui.max_rect()));
+            set_caption_btn_union(&ctx, None);
         }
     }
     let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
-    {
-        let mut union = CAPTION_BTN_UNION.lock().unwrap_or_else(|e| e.into_inner());
-        *union = Some(union.map_or(rect, |u| u.union(rect)));
-    }
+    set_caption_btn_union(
+        &ctx,
+        Some(caption_btn_union(&ctx).map_or(rect, |u| u.union(rect))),
+    );
     // ---- win32 chrome wiring (see the module docs) ----
     // The maximize/restore button is the one region `WM_NCHITTEST` claims. Publish
     // its rect every frame it is laid out so the Snap Layouts flyout can trigger,
@@ -346,7 +392,7 @@ pub(super) fn caption_btn(
         apply_chrome_policy();
         ctx.add_plugin(MaximizeRectRetractor);
         publish_maximize_rect(rect, ctx.pixels_per_point());
-        LAST_MAX_RECT_PASS.store(pass, std::sync::atomic::Ordering::Relaxed);
+        set_last_max_rect_pass(&ctx, pass);
         // Exactly ONE caption button runs this per frame — `show_system_menu`
         // spins a MODAL `TrackPopupMenu` loop, so running it once per button
         // would pop the menu four times over.
@@ -357,7 +403,7 @@ pub(super) fn caption_btn(
         // already using for its own popup (the tab / editor context menus), and
         // skip entirely when the backend reports no `inner_rect` rather than pop
         // the menu in the wrong place.
-        let band = *TITLEBAR_BAND.lock().unwrap_or_else(|e| e.into_inner());
+        let band = titlebar_band(&ctx);
         let popup_open = ctx.memory(|m| m.any_popup_open());
         let click_pos = ctx.input(|i| {
             i.pointer
@@ -369,7 +415,7 @@ pub(super) fn caption_btn(
         if let (false, Some(band), Some(pos), Some(inner)) =
             (popup_open, band, click_pos, inner_rect)
         {
-            let union = *CAPTION_BTN_UNION.lock().unwrap_or_else(|e| e.into_inner());
+            let union = caption_btn_union(&ctx);
             if let Some((x, y)) = system_menu_point(pos, band, union, inner, ctx.pixels_per_point())
             {
                 scribe_win32_chrome::show_system_menu(x, y);

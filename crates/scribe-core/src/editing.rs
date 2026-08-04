@@ -773,20 +773,52 @@ impl History {
         }
     }
 
+    /// Whether a `record` of `kind` right now would COALESCE into the open
+    /// group — i.e. the snapshot handed to it would be discarded unused.
+    ///
+    /// Exposed so a caller whose snapshot is expensive to build (the rope
+    /// editor's is a full-buffer `to_string()`) can skip building it. Pure: it
+    /// reads the latch, it does not advance it. `record` itself is defined in
+    /// terms of this, so the predicate and the behaviour cannot drift apart.
+    #[must_use]
+    pub fn would_coalesce(&self, kind: EditKind) -> bool {
+        matches!(kind, EditKind::Insert | EditKind::Delete)
+            && self.last_kind == Some(kind)
+            && !self.undo.is_empty()
+    }
+
     /// Record the pre-edit `before` snapshot for an edit of `kind`. Coalesces:
     /// a run of consecutive `Insert` (or consecutive `Delete`) edits keeps only
     /// the FIRST pre-edit snapshot, so undo reverts the whole run. `Other`
     /// always starts a new group. Recording clears the redo stack.
     pub fn record(&mut self, before: Snapshot, kind: EditKind) {
+        self.record_with(kind, || before);
+    }
+
+    /// [`record`](Self::record), but the `before` snapshot is built LAZILY and
+    /// only when it will actually be kept.
+    ///
+    /// A coalescing `record` discards its argument, so an eager caller pays for
+    /// a snapshot nobody stores. On the rope path that snapshot is a full-buffer
+    /// `Rope::to_string()`, so at the multi-MiB sizes the rope exists to make
+    /// fast, EVERY keystroke of a typing run copied the whole buffer for
+    /// nothing. `before` is invoked at most once, and never on a coalescing
+    /// record.
+    ///
+    /// The redo-clear and the `last_kind` advance happen either way — they are
+    /// what makes a run coalesce at all, and skipping them would change undo
+    /// semantics rather than just cost.
+    pub fn record_with<F>(&mut self, kind: EditKind, before: F)
+    where
+        F: FnOnce() -> Snapshot,
+    {
         self.redo.clear();
-        let coalesce = matches!(kind, EditKind::Insert | EditKind::Delete)
-            && self.last_kind == Some(kind)
-            && !self.undo.is_empty();
+        let coalesce = self.would_coalesce(kind);
         self.last_kind = Some(kind);
         if coalesce {
             return;
         }
-        self.undo.push(before);
+        self.undo.push(before());
         self.enforce_limits();
     }
 
@@ -1097,6 +1129,81 @@ mod tests {
         // Three inserts coalesced → ONE undo step back to "".
         assert_eq!(h.undo(Snapshot::new("abc", 3)).unwrap().text, "");
         assert!(!h.can_undo());
+    }
+
+    /// `record_with` must not BUILD a snapshot it is only going to discard.
+    ///
+    /// This is the whole point of the lazy form: on the rope path that snapshot
+    /// is a full-buffer `to_string()`, so a run of typing used to copy the
+    /// entire buffer once per keypress and throw every copy away. Counting
+    /// closure invocations is what pins it — the resulting undo stack is
+    /// identical either way, so no correctness assertion can see the difference.
+    #[test]
+    fn record_with_only_builds_the_snapshot_it_keeps() {
+        let mut h = History::new(8);
+        let mut built = 0_usize;
+
+        h.record_with(EditKind::Insert, || {
+            built += 1;
+            Snapshot::new("", 0)
+        });
+        assert_eq!(built, 1, "the first insert opens a group and IS kept");
+
+        for (text, cursor) in [("a", 1), ("ab", 2), ("abc", 3)] {
+            h.record_with(EditKind::Insert, || {
+                built += 1;
+                Snapshot::new(text, cursor)
+            });
+        }
+        assert_eq!(
+            built, 1,
+            "every later keystroke of the run coalesces, so its snapshot must \
+             never be built"
+        );
+
+        // …and the run is still ONE undo step back to the pre-run text.
+        assert_eq!(h.undo(Snapshot::new("abcd", 4)).unwrap().text, "");
+        assert!(!h.can_undo());
+
+        // A kind change opens a new group, so the snapshot IS built again.
+        h.record_with(EditKind::Insert, || {
+            built += 1;
+            Snapshot::new("x", 1)
+        });
+        assert_eq!(built, 2, "a fresh group must build its snapshot");
+    }
+
+    /// The public predicate and the actual behaviour cannot drift: whenever
+    /// `would_coalesce` says yes, `record` really does discard the snapshot.
+    #[test]
+    fn would_coalesce_agrees_with_what_record_does() {
+        for kinds in [
+            [EditKind::Insert, EditKind::Insert],
+            [EditKind::Delete, EditKind::Delete],
+            [EditKind::Insert, EditKind::Delete],
+            [EditKind::Other, EditKind::Other],
+            [EditKind::Insert, EditKind::Other],
+        ] {
+            let mut h = History::new(8);
+            // An empty history never coalesces, whatever the kind.
+            assert!(
+                !h.would_coalesce(kinds[0]),
+                "an empty history has no group to coalesce into ({kinds:?})"
+            );
+            h.record(Snapshot::new("first", 0), kinds[0]);
+
+            let predicted = h.would_coalesce(kinds[1]);
+            let depth_before = h.undo.len();
+            h.record(Snapshot::new("second", 0), kinds[1]);
+            let grew = h.undo.len() > depth_before;
+            assert_eq!(
+                predicted,
+                !grew,
+                "would_coalesce said {predicted} for {kinds:?} but record \
+                 {} a checkpoint",
+                if grew { "pushed" } else { "discarded" }
+            );
+        }
     }
 
     #[test]

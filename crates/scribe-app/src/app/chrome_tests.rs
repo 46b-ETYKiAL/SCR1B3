@@ -26,20 +26,24 @@ use scribe_core::Config;
 
 // ───────────────────────── the titlebar render path ─────────────────────────
 
-/// Serialises every test that runs a titlebar pass.
+/// Serialises every test in THIS file that runs a titlebar pass.
 ///
-/// `chrome.rs` tracks "did the titlebar publish this pass?" in two PROCESS-global
-/// `AtomicU64` latches, and a test binary is one process — so passes driven by
-/// concurrent tests interleave on the same two counters. That is not theoretical:
-/// `the_retraction_happens_once_and_then_latches` passed alone and failed in the
-/// suite, because a sibling's pass cleared the latch this test had just set and
-/// the retractor then re-stored the empty rect it was asserting had NOT been
-/// re-stored.
+/// `chrome.rs`'s own pass latches are per-`egui::Context` now, so they no longer
+/// interleave between tests. What remains process-global is the layer BELOW
+/// them: `scribe-win32-chrome`'s published maximize-button rect and
+/// `apply_chrome_policy`'s `Once` are real process-wide state on Windows. Two
+/// titlebar passes racing each other still both drive that one crate, so the
+/// tests that assert what was handed to it stay serialised.
+///
+/// This lock cannot — and no longer has to — cover `e2e.rs` / `e2e_overlays.rs`,
+/// which render frameless titlebars of their own without taking it. That is
+/// exactly why the pass latches had to stop being process-global rather than be
+/// wrapped in a wider lock: a lock only one file honours is not a lock.
 static CHROME_GLOBALS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Take [`CHROME_GLOBALS_LOCK`] and reset the pass latches to their initial
-/// state, so a test starts from a known point rather than from whatever a
-/// sibling left behind.
+/// Take [`CHROME_GLOBALS_LOCK`] and clear this thread's publish recorder, so a
+/// test starts from a known point rather than from whatever a sibling left
+/// behind.
 ///
 /// Poison-tolerant: one failing test must not cascade into every other test in
 /// the file reporting a poisoned-mutex panic instead of its own result.
@@ -47,7 +51,6 @@ fn chrome_globals_guard() -> std::sync::MutexGuard<'static, ()> {
     let g = CHROME_GLOBALS_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    super::chrome::reset_pass_latches_for_test();
     TEST_PUBLISHED_MAX_RECT.with(|c| c.set(None));
     g
 }
@@ -156,6 +159,77 @@ fn the_published_rect_is_retracted_once_the_titlebar_stops_rendering() {
     );
 }
 
+/// A SECOND live `egui::Context` cannot answer for this one's retraction.
+///
+/// This is the race that made the two harness-driven tests above fail ~4 runs in
+/// 10 under `--test-threads=32`, reproduced DETERMINISTICALLY on one thread.
+///
+/// The retraction decision reads "the pass in which the titlebar last published"
+/// and compares it to "the pass we are ending now". While that latch was a
+/// process-global `AtomicU64` those two numbers could come from DIFFERENT
+/// contexts, because `cumulative_pass_nr` is per-`Context` and a test binary
+/// runs many (`e2e.rs`, `e2e_overlays.rs`, and this file all render frameless
+/// titlebars). Three ways it went wrong, all observed at HEAD:
+///
+///   * sibling pass == our pass  -> read as `PublishedThisPass`, so a retraction
+///     that was DUE never happened (this test's shape);
+///   * sibling pass != our pass  -> read as `RetractNow`, so the retractor
+///     retracted a rect that WAS on screen, between our own publish and our own
+///     end-of-pass (`the_titlebar_publishes_the_maximize_button_rect`'s shape);
+///   * sibling had just retracted -> `u64::MAX` read as `AlreadyLatched`, same
+///     outcome as the first.
+///
+/// Here the sibling context is stepped one pass AHEAD, so its pass number equals
+/// the victim's next one — the collision — and the victim is then asked to
+/// retract. With the latch scoped to its own context the sibling is invisible to
+/// it. With the latch process-global this fails on every run, not 2 in 10.
+#[test]
+fn a_sibling_context_cannot_answer_this_contexts_retraction() {
+    let (_chrome, mut victim) = harness(frameless_app());
+    // A second, independent context+app on this same thread — the single-thread
+    // stand-in for the concurrent `e2e.rs` harness that caused the real flake.
+    let mut sibling = Harness::builder()
+        .with_size(vec2(1100.0, 760.0))
+        .build_state(
+            |ctx, app: &mut ScribeApp| app.frame_tick(ctx),
+            frameless_app(),
+        );
+
+    victim.step();
+    let live = published().expect("precondition: the victim's titlebar published");
+    assert!(
+        live.right > live.left,
+        "precondition: a live rect: {live:?}"
+    );
+
+    // Step the sibling's own frameless titlebar until it sits exactly ONE pass
+    // ahead of the victim: its publish then stamps the pass number the victim is
+    // about to end on.
+    let mut guard = 0;
+    while sibling.ctx.cumulative_pass_nr() <= victim.ctx.cumulative_pass_nr() {
+        sibling.step();
+        guard += 1;
+        assert!(guard < 64, "the sibling context never advanced its passes");
+    }
+    assert_eq!(
+        sibling.ctx.cumulative_pass_nr(),
+        victim.ctx.cumulative_pass_nr() + 1,
+        "the collision this pins needs the sibling exactly one pass ahead"
+    );
+
+    // Take the victim's titlebar away and end its next pass — the one whose
+    // number the sibling just stamped.
+    victim.state_mut().config.appearance.frameless = false;
+    victim.step();
+
+    assert_eq!(
+        published(),
+        Some(scribe_win32_chrome::RectPx::new(0, 0, 0, 0)),
+        "a sibling context's pass number must not read as THIS context's \
+         publish — the rect has to retract"
+    );
+}
+
 /// The retraction latches: once retracted it is not re-stored on every
 /// subsequent idle pass.
 ///
@@ -163,18 +237,17 @@ fn the_published_rect_is_retracted_once_the_titlebar_stops_rendering() {
 /// nothing changed; re-publishing an empty rect each time would be a per-frame
 /// cross-crate store for no reason.
 ///
-/// Asserted over the PURE decision rather than by idling a live harness. The
-/// latch lives in a process-global pass counter, and a test binary is one
-/// process: `e2e.rs` and `e2e_overlays.rs` also render frameless titlebars, so a
-/// concurrent pass there legitimately un-latches it while this test idles. That
-/// made the harness form fail intermittently under a plain `cargo test` (victim
-/// rotating between this test and its siblings) while passing under
-/// `--test-threads=1` — a red that meant "a sibling rendered", not "the latch
-/// broke". No file-scoped lock can fix that; the property simply is not
-/// decidable from a live harness.
+/// Asserted over the PURE decision rather than by idling a live harness: an
+/// idling harness can only ever reach ONE of the three branches, and only after
+/// however many passes it takes to get there. Over `(last_pass, pass)` the
+/// decision is total, so all THREE branches get pinned here.
 ///
-/// Over `(last_pass, pass)` it IS decidable, and all THREE branches get pinned
-/// instead of the single one the harness could reach.
+/// (This form was originally forced by the latch being a process-global that
+/// `e2e.rs` / `e2e_overlays.rs` could un-latch mid-assertion. The latch is now
+/// per-`Context`, so that pressure is gone —
+/// `a_sibling_context_cannot_answer_this_contexts_retraction` pins the absence
+/// of the interference directly — but the three-branch coverage is worth more
+/// than the one-branch harness form either way, so it stays.)
 #[test]
 fn the_retraction_happens_once_and_then_latches() {
     use super::chrome::{classify_end_pass, EndPassAction};
