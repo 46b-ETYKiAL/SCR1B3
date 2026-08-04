@@ -61,6 +61,41 @@
                 Part="last"
                 Action="set"
                 System="no" />
+              <!--
+                Uninstall directory cleanup, stated explicitly instead of being
+                left to the installer's implicit empty-directory sweep.
+
+                Both directories are created by this package inside the user
+                profile, which is exactly what ICE64 flags when they are absent
+                from the RemoveFile table. Authoring them is what lets the
+                msi-build CI job stop suppressing ICE64, so a FUTURE edit that
+                adds an uncleaned user-profile directory is caught instead of
+                silently waved through.
+
+                Measured, not assumed: on Windows 11 an uninstall already
+                removed both directories without these rows, so this is not a
+                repair of a leak that was happening. What it buys is that the
+                cleanup is now a declared part of the package rather than a
+                behaviour of the installer, and that the ICE stays enabled.
+
+                Removal is EMPTY-ONLY: a RemoveFile folder row deletes the
+                directory only when nothing is left in it. So the SHARED
+                %LOCALAPPDATA%\Programs directory survives whenever any other
+                per-user app (VS Code, Obsidian, ...) still lives there, and
+                anything the in-app self-updater leaves in the install
+                directory likewise keeps that directory. Verified against a
+                package carrying these rows with a foreign occupant planted in
+                the parent: the occupant and its directory were untouched.
+
+                Deeper directory first, because the rows are processed in table
+                order: SCR1B3 has to be emptied before Programs is tested.
+              -->
+              <RemoveFolder Id="RemoveApplicationFolder"
+                Directory="APPLICATIONFOLDER"
+                On="uninstall" />
+              <RemoveFolder Id="RemoveProgramsFolder"
+                Directory="ProgramsFolder"
+                On="uninstall" />
             </Component>
 
             <!--
