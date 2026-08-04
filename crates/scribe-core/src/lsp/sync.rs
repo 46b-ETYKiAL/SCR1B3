@@ -66,7 +66,10 @@ impl TextDocumentSyncKind {
     /// the number — so both are decoded here. Returns `None` when the server
     /// declared nothing (the spec's "unspecified" case).
     pub fn from_initialize_result(msg: &Value) -> Option<Self> {
-        let sync = msg.get("result")?.get("capabilities")?.get("textDocumentSync")?;
+        let sync = msg
+            .get("result")?
+            .get("capabilities")?
+            .get("textDocumentSync")?;
         if let Some(n) = sync.as_i64() {
             return Self::from_wire(n);
         }
@@ -399,7 +402,10 @@ mod tests {
             TextDocumentSyncKind::Full,
             TextDocumentSyncKind::Incremental,
         ] {
-            assert_eq!(TextDocumentSyncKind::from_wire(i64::from(k.to_wire())), Some(k));
+            assert_eq!(
+                TextDocumentSyncKind::from_wire(i64::from(k.to_wire())),
+                Some(k)
+            );
         }
     }
 
@@ -592,7 +598,11 @@ mod tests {
         // rest of the editor does not believe in.
         let text = "one\r\ntwo\rthree\n\nfive é😀\n";
         let idx = LineIndex::new(text);
-        assert_eq!(idx.line_count(), 6, "\\r\\n, lone \\r, blank line, trailing \\n");
+        assert_eq!(
+            idx.line_count(),
+            6,
+            "\\r\\n, lone \\r, blank line, trailing \\n"
+        );
         for line in 0..8u32 {
             for ch in [0u32, 1, 3, 99] {
                 assert_eq!(
@@ -620,7 +630,10 @@ mod tests {
         let t0 = Instant::now();
         let mut d = ChangeDebouncer::with_idle(Duration::from_millis(100));
         d.note("a", t0);
-        assert!(d.take_due(t0).is_none(), "due immediately would be no debounce");
+        assert!(
+            d.take_due(t0).is_none(),
+            "due immediately would be no debounce"
+        );
         assert!(d.take_due(t0 + Duration::from_millis(99)).is_none());
         assert!(d.is_pending(), "the edit is still waiting, not dropped");
     }
@@ -710,7 +723,9 @@ mod tests {
     fn an_untouched_debouncer_is_never_due() {
         let mut d = ChangeDebouncer::new();
         assert!(!d.is_pending());
-        assert!(d.take_due(Instant::now() + Duration::from_secs(3600)).is_none());
+        assert!(d
+            .take_due(Instant::now() + Duration::from_secs(3600))
+            .is_none());
     }
 
     #[test]
@@ -724,7 +739,9 @@ mod tests {
         let t0 = Instant::now();
         let mut d = ChangeDebouncer::new();
         d.note("x", t0);
-        assert!(d.take_due(t0 + DEBOUNCE - Duration::from_millis(1)).is_none());
+        assert!(d
+            .take_due(t0 + DEBOUNCE - Duration::from_millis(1))
+            .is_none());
         assert!(d.take_due(t0 + DEBOUNCE).is_some());
     }
 }

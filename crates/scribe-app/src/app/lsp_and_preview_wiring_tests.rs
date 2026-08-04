@@ -274,10 +274,7 @@ fn frame_tick_publishes_the_unsaved_verdict_to_the_updater_every_frame() {
     let ctx = egui::Context::default();
 
     run_frame(&mut app, &ctx);
-    assert!(
-        !app.updater.unsaved_work,
-        "a clean app must publish false"
-    );
+    assert!(!app.updater.unsaved_work, "a clean app must publish false");
 
     let path = temp_dir("unsaved-publish").join("note.txt");
     std::fs::write(&path, "on disk\n").unwrap();

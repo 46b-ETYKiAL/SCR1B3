@@ -3268,16 +3268,10 @@ impl ScribeApp {
                         if !diag_spans.is_empty() {
                             let text_ref = &self.tabs[active].text;
                             let painter = ui.painter();
-                            let err_c = ui_color(
-                                &self.theme,
-                                "error",
-                                Rgba::new(0xe5, 0x3e, 0x3e, 255),
-                            );
-                            let warn_c = ui_color(
-                                &self.theme,
-                                "warning",
-                                Rgba::new(0xf2, 0xb3, 0x3d, 255),
-                            );
+                            let err_c =
+                                ui_color(&self.theme, "error", Rgba::new(0xe5, 0x3e, 0x3e, 255));
+                            let warn_c =
+                                ui_color(&self.theme, "warning", Rgba::new(0xf2, 0xb3, 0x3d, 255));
                             let info_c = accent;
                             let origin = out.galley_pos.to_vec2();
                             // Rects actually painted, so the hover test is
@@ -3295,8 +3289,7 @@ impl ScribeApp {
                                 let c1 = byte_to_char_index(text_ref, span.end);
                                 let mut row_start = 0usize;
                                 for prow in &out.galley.rows {
-                                    let row_end =
-                                        row_start + prow.char_count_including_newline();
+                                    let row_end = row_start + prow.char_count_including_newline();
                                     let s = c0.max(row_start);
                                     let e = c1.min(row_end);
                                     if s < e {
@@ -3322,15 +3315,12 @@ impl ScribeApp {
                             // under the pointer, not merely to the same line.
                             if let Some(p) = ui.ctx().pointer_hover_pos() {
                                 if painted.iter().any(|r| r.contains(p)) {
-                                    let cursor =
-                                        out.galley.cursor_from_pos(p - out.galley_pos);
+                                    let cursor = out.galley.cursor_from_pos(p - out.galley_pos);
                                     let byte = char_to_byte(text_ref, cursor.index);
-                                    if let Some(text) =
-                                        crate::app::diagnostics_overlay::hover_text(
-                                            &diag_spans,
-                                            byte,
-                                        )
-                                    {
+                                    if let Some(text) = crate::app::diagnostics_overlay::hover_text(
+                                        &diag_spans,
+                                        byte,
+                                    ) {
                                         egui::show_tooltip_at_pointer(
                                             ui.ctx(),
                                             out.response.layer_id,

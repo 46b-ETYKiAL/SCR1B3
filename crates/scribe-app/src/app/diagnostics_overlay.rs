@@ -252,10 +252,7 @@ mod tests {
                 diag(1, 12, 1, 27, 1, "cannot find value"),
             ],
         );
-        let covered: Vec<&str> = spans
-            .iter()
-            .map(|s| &SRC[s.start..s.end])
-            .collect();
+        let covered: Vec<&str> = spans.iter().map(|s| &SRC[s.start..s.end]).collect();
         assert_eq!(covered, vec!["main", "x", "undefined_thing"]);
     }
 
@@ -280,7 +277,10 @@ mod tests {
             diag(2, 0, 2, 1, 1, "a"),
             diag(11, 0, 11, 1, 1, "b"),
         ]);
-        assert_eq!(marks.iter().map(|(l, _)| *l).collect::<Vec<_>>(), vec![2, 11, 30]);
+        assert_eq!(
+            marks.iter().map(|(l, _)| *l).collect::<Vec<_>>(),
+            vec![2, 11, 30]
+        );
     }
 
     #[test]
@@ -327,7 +327,11 @@ mod tests {
         assert_eq!(severity_prefix(SEVERITY_WARNING), "warning: ");
         assert_eq!(severity_prefix(SEVERITY_INFO), "info: ");
         assert_eq!(severity_prefix(4), "hint: ");
-        assert_eq!(severity_prefix(99), "hint: ", "an unknown severity is a hint");
+        assert_eq!(
+            severity_prefix(99),
+            "hint: ",
+            "an unknown severity is a hint"
+        );
     }
 
     #[test]

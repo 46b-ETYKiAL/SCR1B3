@@ -358,9 +358,8 @@ impl Updater {
             return false;
         }
         tracing::info!("update apply held ({route}): the app holds unsaved work");
-        self.unsaved_hold_notice = Some(
-            "Save your open files first — installing the update restarts SCR1B3.".to_string(),
-        );
+        self.unsaved_hold_notice =
+            Some("Save your open files first — installing the update restarts SCR1B3.".to_string());
         true
     }
 

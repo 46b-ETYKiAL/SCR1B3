@@ -246,7 +246,10 @@ Some prose with several words in it.
         // `metrics_for` is what the preview header calls. It must go through the
         // cache — a version that called `scan` directly would be correct and
         // useless, and no value assertion could tell the difference.
-        let unique = format!("# live-entry-point {:?}\n- [x] a\n", std::time::Instant::now());
+        let unique = format!(
+            "# live-entry-point {:?}\n- [x] a\n",
+            std::time::Instant::now()
+        );
         let first = metrics_for(&unique);
         assert_eq!((first.headings, first.done, first.total), (1, 1, 1));
         let before = NOTE_METRICS.with(|c| c.borrow().scans());

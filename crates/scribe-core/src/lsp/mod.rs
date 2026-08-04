@@ -1049,9 +1049,10 @@ mod tests {
         let Some(mut client) = live_client() else {
             return;
         };
-        client
-            .sync_kind
-            .store(TextDocumentSyncKind::Incremental.to_wire(), Ordering::Relaxed);
+        client.sync_kind.store(
+            TextDocumentSyncKind::Incremental.to_wire(),
+            Ordering::Relaxed,
+        );
         let t0 = Instant::now();
         let msgs = wire_after(&mut client, |c| {
             c.did_open("file:///x.rs", "rust", "fn mai() {}\n").unwrap();
@@ -1201,9 +1202,10 @@ mod tests {
         let Some(mut client) = live_client() else {
             return;
         };
-        client
-            .sync_kind
-            .store(TextDocumentSyncKind::Incremental.to_wire(), Ordering::Relaxed);
+        client.sync_kind.store(
+            TextDocumentSyncKind::Incremental.to_wire(),
+            Ordering::Relaxed,
+        );
         let t0 = Instant::now();
         let msgs = wire_after(&mut client, |c| {
             c.did_open("file:///x.rs", "rust", "ab\n").unwrap();
@@ -1344,9 +1346,7 @@ mod tests {
             c.note_change("aaa edited\n", t0);
             // No flush — the user switched files first.
             c.did_open("file:///b.rs", "rust", "bbb\n").unwrap();
-            assert!(!c
-                .flush_pending_change(t0 + sync::DEBOUNCE * 4)
-                .unwrap());
+            assert!(!c.flush_pending_change(t0 + sync::DEBOUNCE * 4).unwrap());
         });
         assert!(
             did_changes(&msgs).is_empty(),
