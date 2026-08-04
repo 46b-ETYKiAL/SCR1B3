@@ -15,7 +15,12 @@ use super::scan_guard::assert_advanced;
 use std::collections::BTreeSet;
 
 /// True if `c` may appear in a tag body.
-fn is_tag_char(c: char) -> bool {
+///
+/// Crate-visible so [`super::completion`] recognises a half-typed `#tag` with
+/// the SAME character class the extractor accepts — a second copy of this
+/// predicate would let the two drift and suggest completions for text that can
+/// never parse as a tag.
+pub(crate) fn is_tag_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '/'
 }
 

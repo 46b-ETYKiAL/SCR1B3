@@ -13,11 +13,12 @@
 //! wrong constant would still look right. The literals below are the contract.
 
 use super::notes_ui::{
-    backlink_rows, body_cap_end, collect_backlinks, dedup_link_targets, filter_docs, is_active_row,
-    notes_list_height, scan_vault, show_no_match_hint, NoteDoc,
+    backlink_rows, body_cap_end, collect_backlinks, filter_docs, filter_replacement, is_active_row,
+    notes_list_height, outgoing_links, scan_vault, selected_tag_from_filter, show_no_match_hint,
+    suggestion_chip_label, tag_filter_for, NoteDoc,
 };
 use super::ScribeApp;
-use scribe_core::notes::query;
+use scribe_core::notes::{completion, query};
 use scribe_core::Config;
 use std::path::{Path, PathBuf};
 
@@ -245,19 +246,60 @@ fn indexed_links_exclude_embeds_and_target_less_links() {
     );
 }
 
-/// `dedup_link_targets` — the active note's "links out" list — keeps the first
+/// `outgoing_links` — the active note's "links out" list — keeps the first
 /// occurrence of each distinct target and drops embeds and target-less links.
 #[test]
-fn dedup_link_targets_keeps_first_seen_and_drops_embeds_and_empties() {
-    let out = dedup_link_targets(
-        "[[Home]] ![[cover.png]] [[Ideas]] [[Home]] [[#Section]] [[Ideas|alias]]",
-    );
+fn outgoing_links_keep_first_seen_and_drop_embeds_and_empties() {
+    let out =
+        outgoing_links("[[Home]] ![[cover.png]] [[Ideas]] [[Home]] [[#Section]] [[Ideas|alias]]");
     assert_eq!(
-        out,
-        vec!["Home".to_string(), "Ideas".to_string()],
+        out.iter().map(|l| l.target.as_str()).collect::<Vec<_>>(),
+        vec!["Home", "Ideas"],
         "distinct targets in first-seen order; no embed, no empty target, and an \
          aliased link folds onto its target"
     );
+    assert_eq!(
+        out.iter().map(|l| l.label.as_str()).collect::<Vec<_>>(),
+        vec!["Home", "Ideas"],
+        "the FIRST spelling's label wins — the later `|alias` does not rename the row"
+    );
+}
+
+/// The row SHOWS the author's label but OPENS the raw target. Conflating the two
+/// either throws the alias away (showing `projects/roadmap`) or resolves a note
+/// that does not exist (opening `Q3 plan`).
+#[test]
+fn an_aliased_link_shows_its_alias_and_still_targets_the_real_note() {
+    let out = outgoing_links("[[projects/roadmap|Q3 plan]]");
+    assert_eq!(out.len(), 1);
+    assert_eq!(
+        out[0].label, "Q3 plan",
+        "the row reads as the author wrote it"
+    );
+    assert_eq!(
+        out[0].target, "projects/roadmap",
+        "but the followed target is the raw path, never the label"
+    );
+    assert_eq!(out[0].display_text(), "Q3 plan");
+}
+
+/// A `#heading` anchor is part of what a link names, so it must be visible:
+/// without it, two links into different sections of one note render identically.
+#[test]
+fn a_heading_anchor_is_shown_alongside_the_label() {
+    let out = outgoing_links("[[Roadmap#Q3]] and [[Notes#Q4|Later]]");
+    assert_eq!(
+        out.iter().map(|l| l.display_text()).collect::<Vec<_>>(),
+        vec!["Roadmap › Q3".to_string(), "Later › Q4".to_string()],
+        "the anchor rides along with the label (aliased or not)"
+    );
+    assert_eq!(
+        out[0].target, "Roadmap",
+        "the anchor is NOT part of the target that gets opened"
+    );
+    assert_eq!(out[1].target, "Notes");
+    // A link with no anchor shows the bare label — the ` › ` is not unconditional.
+    assert_eq!(outgoing_links("[[Plain]]")[0].display_text(), "Plain");
 }
 
 // ───────────────────────────── search / filter ──────────────────────────────
@@ -588,6 +630,114 @@ fn only_the_open_note_is_the_active_row() {
     );
 }
 
+// ──────────────── tag tree + completion: the pure decisions ─────────────────
+
+/// The tree's highlight is read back OUT of the filter string, so it can only
+/// ever agree with what the list is actually showing. Anything more complex than
+/// a single positive `tag:` clause leaves NO node highlighted — no node
+/// describes that result.
+#[test]
+fn a_node_is_selected_only_for_a_lone_positive_tag_clause() {
+    assert_eq!(
+        selected_tag_from_filter("tag:project"),
+        Some("project".to_string())
+    );
+    assert_eq!(
+        selected_tag_from_filter("tag:project/frontend"),
+        Some("project/frontend".to_string()),
+        "a nested node is selectable too"
+    );
+    assert_eq!(
+        selected_tag_from_filter("tag:Project"),
+        Some("project".to_string()),
+        "the operator VALUE is case-folded by the parser, and the tree's nodes are \
+         lowercase too, so the two meet"
+    );
+    assert_eq!(
+        selected_tag_from_filter("TAG:project"),
+        None,
+        "the operator KEY is case-SENSITIVE — `TAG:` is free text, and highlighting a \
+         node for it would claim a selection the list does not have"
+    );
+    assert_eq!(
+        selected_tag_from_filter(""),
+        None,
+        "an empty filter selects nothing"
+    );
+    assert_eq!(
+        selected_tag_from_filter("-tag:project"),
+        None,
+        "an EXCLUDED tag must not highlight as if it were the selection"
+    );
+    assert_eq!(
+        selected_tag_from_filter("tag:project roadmap"),
+        None,
+        "extra typed terms narrow the result past what the node claims"
+    );
+    assert_eq!(
+        selected_tag_from_filter("title:project"),
+        None,
+        "a different operator is not a tag selection"
+    );
+}
+
+/// Clicking a node applies its filter; clicking the SELECTED node clears it, so
+/// the tree can undo itself without the user reaching for the text box.
+#[test]
+fn clicking_the_selected_node_clears_the_filter_and_any_other_node_replaces_it() {
+    assert_eq!(tag_filter_for("project", None), "tag:project");
+    assert_eq!(
+        tag_filter_for("project", Some("errand")),
+        "tag:project",
+        "a different selection is replaced, not toggled off"
+    );
+    assert_eq!(
+        tag_filter_for("project", Some("project")),
+        "",
+        "re-clicking the selected node clears the filter"
+    );
+    assert_eq!(
+        tag_filter_for("project", Some("project/frontend")),
+        "tag:project",
+        "a DESCENDANT being selected is not the same node — clicking the parent selects it"
+    );
+}
+
+/// A chip reads as the sigil the user is typing but expands to the operator the
+/// query grammar actually matches on. Expanding to literal sigil text would fall
+/// through to a free-text search and silently return the wrong notes.
+#[test]
+fn a_chip_reads_as_a_sigil_and_expands_to_a_query_operator() {
+    assert_eq!(
+        suggestion_chip_label(completion::Trigger::Tag, "project"),
+        "#project"
+    );
+    assert_eq!(
+        suggestion_chip_label(completion::Trigger::Note, "Roadmap"),
+        "[[Roadmap]]"
+    );
+    assert_eq!(
+        filter_replacement(completion::Trigger::Tag, "project"),
+        "tag:project"
+    );
+    assert_eq!(
+        filter_replacement(completion::Trigger::Note, "Morning Pages"),
+        "title:\"Morning Pages\"",
+        "a title is quoted — unquoted, its spaces would split into a second clause"
+    );
+    // And the expansion really is a query the parser understands as that field.
+    let q = query::parse(&filter_replacement(
+        completion::Trigger::Note,
+        "Morning Pages",
+    ));
+    assert_eq!(q.clauses.len(), 1, "one clause, not one per word");
+    assert_eq!(
+        selected_tag_from_filter(&filter_replacement(completion::Trigger::Tag, "project")),
+        Some("project".to_string()),
+        "an accepted tag chip lands on a filter the tree then highlights"
+    );
+}
+
 // ─────────────────── the pane itself, through the real render loop ──────────
 
 use egui_kittest::kittest::Queryable as _;
@@ -634,4 +784,266 @@ fn the_notes_pane_renders_its_vault_only_while_open() {
             "the open pane lists the vault note {title:?}"
         );
     }
+}
+
+// ─────────────── the tag tree + search box, driven like a user ──────────────
+
+/// A vault whose tags nest, so the tree has a real parent with two children plus
+/// an unrelated root.
+fn tag_vault() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("projects")).unwrap();
+    std::fs::write(
+        dir.path().join("projects").join("roadmap.md"),
+        "# Roadmap\n\n#project/frontend shipping soon\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("projects").join("api.md"),
+        "# API\n\n#project/backend endpoints\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("groceries.md"),
+        "# Groceries\n\n#errand milk and bread\n",
+    )
+    .unwrap();
+    dir
+}
+
+/// Open the pane on `dir` and expand the collapsed section named `section`.
+fn pane_with_section(dir: &Path, section: &str) -> egui_kittest::Harness<'static, ScribeApp> {
+    let mut h = harness(app_with_vault(Some(dir)));
+    h.state_mut().notes_pane_open = true;
+    h.run();
+    h.get_by_label(section).click();
+    h.run();
+    h
+}
+
+/// The note titles currently rendered in the pane's list.
+fn visible_titles(h: &egui_kittest::Harness<'static, ScribeApp>) -> Vec<&'static str> {
+    ["Roadmap", "API", "Groceries"]
+        .into_iter()
+        .filter(|t| h.query_by_label(t).is_some())
+        .collect()
+}
+
+/// The tag tree materialises the PARENT of a tag nobody wrote, and clicking a
+/// node filters the list to it — the whole point of the surface.
+///
+/// `#project` is never written in any note (only `#project/frontend` and
+/// `#project/backend` are), so a tree built from raw tags alone would not offer
+/// it at all, and the two-note filter behind it would be unreachable.
+#[test]
+fn clicking_a_tag_tree_node_filters_the_note_list_to_that_tag_and_its_children() {
+    let dir = tag_vault();
+    let mut h = pane_with_section(dir.path(), "tags (4)");
+
+    assert_eq!(
+        visible_titles(&h),
+        vec!["Roadmap", "API", "Groceries"],
+        "the unfiltered pane lists every note"
+    );
+    for row in ["#errand", "#project", "#frontend", "#backend"] {
+        assert!(
+            h.query_by_label(row).is_some(),
+            "the tag tree renders the row {row:?} (parents materialised, children by segment)"
+        );
+    }
+
+    h.get_by_label("#project").click();
+    h.run();
+
+    assert_eq!(
+        h.state().notes_filter,
+        "tag:project",
+        "the click writes the filter the list is actually driven by"
+    );
+    assert_eq!(
+        visible_titles(&h),
+        vec!["Roadmap", "API"],
+        "both notes nested under #project survive; the #errand note is filtered out"
+    );
+}
+
+/// Re-clicking the selected node clears the filter — the tree undoes itself.
+#[test]
+fn re_clicking_the_selected_tag_node_restores_the_whole_list() {
+    let dir = tag_vault();
+    let mut h = pane_with_section(dir.path(), "tags (4)");
+
+    h.get_by_label("#errand").click();
+    h.run();
+    assert_eq!(h.state().notes_filter, "tag:errand");
+    assert_eq!(visible_titles(&h), vec!["Groceries"]);
+
+    h.get_by_label("#errand").click();
+    h.run();
+    assert_eq!(
+        h.state().notes_filter,
+        "",
+        "clicking the selected node again clears the filter"
+    );
+    assert_eq!(
+        visible_titles(&h),
+        vec!["Roadmap", "API", "Groceries"],
+        "and the whole vault is listed again"
+    );
+}
+
+/// Typed search text must SURVIVE the frame. The filter string is moved out of
+/// the app for the text field to borrow and moved back afterwards; if that
+/// round-trip breaks, every keystroke is swallowed and the box appears frozen —
+/// a failure no assertion over `parse`/`filter_docs` can see.
+#[test]
+fn text_typed_into_the_search_box_survives_the_frame_and_filters_the_list() {
+    let dir = tag_vault();
+    let mut h = harness(app_with_vault(Some(dir.path())));
+    h.state_mut().notes_pane_open = true;
+    h.run();
+
+    search_box(&h).focus();
+    h.run();
+    search_box(&h).type_text("tag:errand");
+    h.run();
+
+    assert_eq!(
+        h.state().notes_filter,
+        "tag:errand",
+        "the typed text is written back onto the app, not dropped with the frame"
+    );
+    assert_eq!(
+        visible_titles(&h),
+        vec!["Groceries"],
+        "and it really drives the list"
+    );
+}
+
+/// The pane's single-line search field. It is the only single-line text input in
+/// the app while the find bar / palette / settings are closed.
+fn search_box<'a>(h: &'a egui_kittest::Harness<'static, ScribeApp>) -> egui_kittest::Node<'a> {
+    let mut inputs = h.get_all_by_role(egui::accesskit::Role::TextInput);
+    let first = inputs.next().expect("the notes search field");
+    assert!(
+        inputs.next().is_none(),
+        "fixture assumption: exactly one single-line text input is on screen"
+    );
+    first
+}
+
+/// Typing `#…` offers tag chips, and accepting one expands the sigil into the
+/// `tag:` operator that actually filters. A chip that inserted literal `#project`
+/// would fall through to a free-text body search and return the wrong notes.
+#[test]
+fn a_typed_tag_sigil_offers_a_chip_that_expands_into_a_working_filter() {
+    let dir = tag_vault();
+    let mut h = harness(app_with_vault(Some(dir.path())));
+    h.state_mut().notes_pane_open = true;
+    h.run();
+
+    search_box(&h).focus();
+    h.run();
+    search_box(&h).type_text("#front");
+    h.run();
+
+    assert!(
+        h.query_by_label("#project/frontend").is_some(),
+        "the half-typed tag offers its completion as a chip"
+    );
+    assert!(
+        h.query_by_label("#errand").is_none(),
+        "a tag that does not match the typed prefix is not offered"
+    );
+
+    h.get_by_label("#project/frontend").click();
+    h.run();
+
+    assert_eq!(
+        h.state().notes_filter,
+        "tag:project/frontend",
+        "accepting the chip replaces the whole `#front` token with the operator"
+    );
+    assert_eq!(visible_titles(&h), vec!["Roadmap"]);
+}
+
+/// Typing `[[…` offers note-title chips, and accepting one expands to a quoted
+/// `title:` operator.
+#[test]
+fn a_typed_link_sigil_offers_a_chip_that_expands_into_a_title_filter() {
+    let dir = tag_vault();
+    let mut h = harness(app_with_vault(Some(dir.path())));
+    h.state_mut().notes_pane_open = true;
+    h.run();
+
+    search_box(&h).focus();
+    h.run();
+    search_box(&h).type_text("[[Road");
+    h.run();
+
+    assert!(
+        h.query_by_label("[[Roadmap]]").is_some(),
+        "the open `[[` offers matching note titles"
+    );
+    assert!(
+        h.query_by_label("[[Groceries]]").is_none(),
+        "a title that does not match the typed prefix is not offered"
+    );
+
+    h.get_by_label("[[Roadmap]]").click();
+    h.run();
+
+    assert_eq!(
+        h.state().notes_filter,
+        "title:\"Roadmap\"",
+        "accepting the chip replaces the whole `[[Road` token with a quoted operator"
+    );
+    assert_eq!(visible_titles(&h), vec!["Roadmap"]);
+}
+
+/// The "links out" row is drawn with the link's own LABEL and still opens its
+/// raw target. Both halves are load-bearing: rendering the target throws the
+/// author's alias away, and following the label would resolve a note that does
+/// not exist (and, worse, CREATE it).
+#[test]
+fn the_links_out_row_shows_the_alias_and_opens_the_real_target() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("projects")).unwrap();
+    std::fs::write(
+        dir.path().join("projects").join("roadmap.md"),
+        "# Roadmap\n\nthe plan\n",
+    )
+    .unwrap();
+    let hub = dir.path().join("Hub.md");
+    std::fs::write(&hub, "# Hub\n\nSee [[projects/roadmap|Q3 plan]].\n").unwrap();
+
+    let mut app = app_with_vault(Some(dir.path()));
+    app.open_path(hub);
+    let mut h = harness(app);
+    h.state_mut().notes_pane_open = true;
+    h.run();
+    h.get_by_label("links out (1)").click();
+    h.run();
+
+    assert!(
+        h.query_by_label("Q3 plan").is_some(),
+        "the row reads as the author's alias"
+    );
+    h.get_by_label("Q3 plan").click();
+    h.run();
+
+    let opened: Vec<String> = h
+        .state()
+        .tabs
+        .iter()
+        .filter_map(|t| t.doc.path().map(|p| p.display().to_string()))
+        .collect();
+    assert!(
+        opened.iter().any(|p| p.ends_with("roadmap.md")),
+        "clicking the aliased row opens the TARGET note, got {opened:?}"
+    );
+    assert!(
+        !dir.path().join("Q3 plan.md").exists(),
+        "the label must never be followed as a target — that would create a phantom note"
+    );
 }

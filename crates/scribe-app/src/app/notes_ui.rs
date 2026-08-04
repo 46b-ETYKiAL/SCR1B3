@@ -16,7 +16,7 @@
 
 use super::*;
 use egui::{Color32, RichText};
-use scribe_core::notes::{meta, query, vault_path, wikilink};
+use scribe_core::notes::{completion, meta, query, tag_tree, vault_path, wikilink};
 use std::path::{Path, PathBuf};
 
 /// Note-like file extensions the vault walk indexes. A vault holds prose notes,
@@ -367,15 +367,23 @@ impl ScribeApp {
             .tabs
             .get(active)
             .and_then(|t| t.doc.path().map(Path::to_path_buf));
-        let outgoing = dedup_link_targets(&active_text);
+        let outgoing = outgoing_links(&active_text);
         let backlinks: Vec<(PathBuf, String)> =
             backlink_rows(&self.note_index, vault.as_deref(), active_path.as_deref());
+
+        // The tag tree + the completion pools it feeds. Both are derived from the
+        // index (no stored state), so they can never go stale against it.
+        let tag_nodes = tag_tree::build(self.note_index.iter().map(|d| d.tags.as_slice()));
+        let selected_tag = selected_tag_from_filter(&self.notes_filter);
+        let tag_pool: Vec<String> = tag_nodes.iter().map(|n| n.tag.clone()).collect();
+        let title_pool: Vec<String> = self.note_index.iter().map(|d| d.title.clone()).collect();
 
         // Take the filter string out so the text field can borrow it mutably
         // without touching `self` inside the closure.
         let mut filter = std::mem::take(&mut self.notes_filter);
         let mut open_target: Option<PathBuf> = None;
         let mut follow_link: Option<String> = None;
+        let mut set_filter: Option<String> = None;
         let mut pick_folder = false;
         let mut do_refresh = false;
         let mut close_pane = false;
@@ -427,9 +435,32 @@ impl ScribeApp {
                     ui.label(RichText::new("search").color(muted).small().monospace());
                     ui.text_edit_singleline(&mut filter)
                         .on_hover_text(
-                            "Filter notes. Operators: tag:x  path:x  title:x  \"quoted phrase\"  -negation",
+                            "Filter notes. Operators: tag:x  path:x  title:x  \"quoted phrase\"  -negation.  \
+                             Type #… or [[… for completions.",
                         );
                 });
+                // ---- completions for a half-typed `#tag` / `[[note` ----
+                // The caret is the end of the box (a single-line field the user
+                // is typing into), so the trailing token is what gets completed.
+                if let Some(suggestion) =
+                    completion::complete(&filter, filter.len(), &tag_pool, &title_pool, MAX_SUGGESTIONS)
+                {
+                    ui.horizontal_wrapped(|ui| {
+                        for candidate in &suggestion.candidates {
+                            if ui
+                                .small_button(suggestion_chip_label(suggestion.trigger, candidate))
+                                .on_hover_text("Complete this into a search operator")
+                                .clicked()
+                            {
+                                set_filter = Some(completion::apply(
+                                    &filter,
+                                    &suggestion,
+                                    &filter_replacement(suggestion.trigger, candidate),
+                                ));
+                            }
+                        }
+                    });
+                }
                 ui.label(
                     RichText::new(format!("{} of {} notes", filtered.len(), total))
                         .color(muted)
@@ -457,6 +488,50 @@ impl ScribeApp {
                         }
                     });
 
+                // ---- the nested tag tree (click a node to filter the list) ----
+                ui.separator();
+                ui.collapsing(
+                    RichText::new(format!("tags ({})", tag_nodes.len()))
+                        .color(accent)
+                        .small()
+                        .monospace(),
+                    |ui| {
+                        if tag_nodes.is_empty() {
+                            ui.label(RichText::new("no #tags in this vault").color(muted).small());
+                        }
+                        for node in &tag_nodes {
+                            ui.horizontal(|ui| {
+                                #[allow(clippy::cast_precision_loss)]
+                                ui.add_space(node.depth as f32 * TAG_TREE_INDENT);
+                                let is_selected = selected_tag.as_deref() == Some(node.tag.as_str());
+                                let clicked = ui
+                                    .selectable_label(
+                                        is_selected,
+                                        RichText::new(format!("#{}", node.segment))
+                                            .monospace()
+                                            .small(),
+                                    )
+                                    .on_hover_text(format!(
+                                        "Filter the list to #{} (and anything nested under it)",
+                                        node.tag
+                                    ))
+                                    .clicked();
+                                ui.label(
+                                    RichText::new(node.note_count.to_string())
+                                        .color(muted)
+                                        .small(),
+                                );
+                                if clicked {
+                                    set_filter = Some(tag_filter_for(
+                                        &node.tag,
+                                        selected_tag.as_deref(),
+                                    ));
+                                }
+                            });
+                        }
+                    },
+                );
+
                 // ---- outgoing links + backlinks for the active note ----
                 ui.separator();
                 ui.collapsing(
@@ -468,15 +543,20 @@ impl ScribeApp {
                         if outgoing.is_empty() {
                             ui.label(RichText::new("no [[wiki-links]] here").color(muted).small());
                         }
-                        for target in &outgoing {
+                        for link in &outgoing {
                             if ui
                                 .add(egui::Label::new(
-                                    RichText::new(format!("[[{target}]]")).monospace().small(),
+                                    RichText::new(link.display_text()).monospace().small(),
                                 ).sense(egui::Sense::click()))
-                                .on_hover_text("Open (creating it if missing)")
+                                // The hover names the TARGET, not the label: an
+                                // aliased link must not hide where it goes.
+                                .on_hover_text(format!(
+                                    "Open [[{}]] (creating it if missing)",
+                                    link.target
+                                ))
                                 .clicked()
                             {
-                                follow_link = Some(target.clone());
+                                follow_link = Some(link.target.clone());
                             }
                         }
                     },
@@ -505,7 +585,10 @@ impl ScribeApp {
             });
 
         // Restore the (possibly edited) filter and apply the deferred actions.
-        self.notes_filter = filter;
+        // A tag-tree / completion click OVERRIDES what the text box held this
+        // frame: both were computed from the same string the user is looking at,
+        // and the click is the newer intent.
+        self.notes_filter = set_filter.unwrap_or(filter);
         if close_pane {
             self.notes_pane_open = false;
         }
@@ -530,9 +613,42 @@ impl ScribeApp {
     }
 }
 
-/// The distinct, non-embed, non-empty wiki-link targets in `text`, in first-seen
-/// order. Used to list the active note's outgoing links.
-pub(crate) fn dedup_link_targets(text: &str) -> Vec<String> {
+/// One row of the active note's "links out" list: what to SHOW and what to OPEN.
+///
+/// The two are deliberately separate. `[[projects/roadmap|Q3 plan]]` should read
+/// as "Q3 plan" (its author-chosen label) while still opening
+/// `projects/roadmap` — showing the raw target throws the alias away, and
+/// following the label would resolve a note that does not exist.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OutgoingLink {
+    /// The raw link target — the string that goes through the vault-safety gate
+    /// and is opened. Never derived from the label.
+    pub target: String,
+    /// The `#heading` anchor the link points at, if any.
+    pub heading: Option<String>,
+    /// [`wikilink::WikiLink::label`]: the `|alias` when the author wrote one,
+    /// otherwise the target.
+    pub label: String,
+}
+
+impl OutgoingLink {
+    /// The text the row displays: the link's label, plus its `#heading` anchor
+    /// when it points into a section (otherwise the anchor is invisible and two
+    /// links into different sections of one note look identical).
+    pub(crate) fn display_text(&self) -> String {
+        match &self.heading {
+            Some(h) => format!("{} › {h}", self.label),
+            None => self.label.clone(),
+        }
+    }
+}
+
+/// The distinct, non-embed, non-empty wiki-links in `text`, in first-seen order.
+/// Used to list the active note's outgoing links.
+///
+/// De-duplication is by TARGET, not by label: `[[Ideas]]` and `[[Ideas|notions]]`
+/// open the same note, so they are one row (the first spelling's label wins).
+pub(crate) fn outgoing_links(text: &str) -> Vec<OutgoingLink> {
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
     for link in wikilink::extract_wikilinks(text) {
@@ -540,11 +656,77 @@ pub(crate) fn dedup_link_targets(text: &str) -> Vec<String> {
             continue;
         }
         if seen.insert(link.target.clone()) {
-            out.push(link.target);
+            out.push(OutgoingLink {
+                label: link.label(),
+                heading: link.heading.clone(),
+                target: link.target,
+            });
         }
     }
     out
 }
+
+/// The tag currently selected in the tag tree, read back OUT of the filter
+/// string so the tree's highlight can never disagree with what the list shows.
+///
+/// A tag is "selected" only when the filter is exactly one un-negated `tag:`
+/// clause — the shape [`tag_filter_for`] writes. Anything the user has typed on
+/// top of it (`tag:project roadmap`, `-tag:project`) leaves no node highlighted,
+/// because no single node describes that result.
+///
+/// Deliberately parses with `query::parse` rather than string-matching `tag:`:
+/// a second grammar here would drift from the one that actually filters.
+pub(crate) fn selected_tag_from_filter(filter: &str) -> Option<String> {
+    match query::parse(filter).clauses.as_slice() {
+        [query::Clause {
+            negated: false,
+            term: query::Term::Tag(tag),
+        }] => Some(tag.clone()),
+        _ => None,
+    }
+}
+
+/// The filter string a click on tag-tree node `node_tag` should produce.
+/// Clicking the already-selected node CLEARS the filter (toggle off) rather than
+/// re-applying it, so the tree can undo itself without reaching for the text box.
+pub(crate) fn tag_filter_for(node_tag: &str, selected: Option<&str>) -> String {
+    if selected == Some(node_tag) {
+        String::new()
+    } else {
+        format!("tag:{node_tag}")
+    }
+}
+
+/// The label a completion chip shows: the candidate in the sigil form the user
+/// is typing, so the chip reads as a continuation of the token rather than as
+/// the query operator it will expand to.
+pub(crate) fn suggestion_chip_label(trigger: completion::Trigger, candidate: &str) -> String {
+    match trigger {
+        completion::Trigger::Tag => format!("#{candidate}"),
+        completion::Trigger::Note => format!("[[{candidate}]]"),
+    }
+}
+
+/// The search-filter text an accepted completion expands to. The sigils are
+/// SHORTHAND for the operators the query grammar already understands — `#x`
+/// means `tag:x`, `[[Name` means `title:"Name"` — so accepting a chip produces
+/// a filter the parser genuinely matches on rather than literal sigil text that
+/// would fall through to a free-text search.
+///
+/// The note form is quoted because a title may contain spaces, which would
+/// otherwise tokenise into a second, unrelated clause.
+pub(crate) fn filter_replacement(trigger: completion::Trigger, candidate: &str) -> String {
+    match trigger {
+        completion::Trigger::Tag => format!("tag:{candidate}"),
+        completion::Trigger::Note => format!("title:\"{candidate}\""),
+    }
+}
+
+/// How many completion chips the search box offers at once.
+const MAX_SUGGESTIONS: usize = 6;
+
+/// Indent, in points, per tag-tree nesting level.
+const TAG_TREE_INDENT: f32 = 10.0;
 
 #[cfg(test)]
 mod tests {
