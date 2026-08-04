@@ -1101,3 +1101,1076 @@ fn scene_tabbar_left_two_lines() {
     );
     render_scene("tabbar_left_two_lines", 900.0, 480.0, app);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Inline LSP diagnostics — the overlay that had never been LOOKED at.
+//
+// `diagnostics_overlay.rs` unit-tests the placement rules against the covered
+// TEXT, and `lsp_and_preview_wiring_tests` proves a frame carrying diagnostics
+// does not panic. Neither of those can see a squiggle painted under the WRONG
+// span, on the wrong row, or in the wrong colour — a paint bug there produces a
+// perfectly green suite and a visibly wrong editor.
+//
+// So these scenes render the REAL frame and then MEASURE it. The measurement is
+// differential: every scene renders twice, once with the diagnostics and once
+// with an otherwise identical app carrying NONE, and classifies the difference.
+// The overlay composites `alpha * severity_colour` over exactly the control
+// pixel, so the added colour vector at an inked pixel is PARALLEL to
+// `severity_colour - control_pixel` — which makes "is this pixel error-red ink"
+// a decidable question rather than a colour-distance guess, and makes it
+// impossible for existing chrome (or the spell squiggle, which happens to be the
+// SAME red) to be counted as diagnostic ink.
+//
+// Geometry is likewise never hard-coded: a CALIBRATION render underlines one
+// whole known-length line, and the character-cell width plus the text origin are
+// read back off that render. Every expected x is then `origin + column * width`
+// in PRODUCTION geometry — if the editor font, padding, or gutter width changes,
+// the calibration moves with it and the assertions stay true.
+// ═══════════════════════════════════════════════════════════════════════════
+
+use image::RgbaImage;
+
+/// Four lines of EXACTLY 32 characters, so a column index maps to an x offset by
+/// a single multiply and a mis-placed squiggle is arithmetic, not opinion.
+const DIAG_SRC: &str = "0123456789abcdefghijklmnopqrstuv\n\
+                        second line holds the error span\n\
+                        third line holds a warning token\n\
+                        fourth line holds the info notic\n";
+const DIAG_LINE_LEN: u32 = 32;
+
+/// `error` occupies columns 22..27 of line 1 of [`DIAG_SRC`].
+const ERR_COLS: (u32, u32) = (22, 27);
+/// `warning` occupies columns 19..26 of line 2.
+const WARN_COLS: (u32, u32) = (19, 26);
+/// `info` occupies columns 22..26 of line 3.
+const INFO_COLS: (u32, u32) = (22, 26);
+
+fn diag(line: u32, ch: u32, end_line: u32, end_ch: u32, severity: u8, message: &str) -> Diagnostic {
+    Diagnostic {
+        uri: "file:///qa-diagnostics.txt".into(),
+        line,
+        character: ch,
+        end_line,
+        end_character: end_ch,
+        severity,
+        message: message.into(),
+    }
+}
+
+/// The three diagnostics the inline scene publishes, one per severity, each
+/// covering a word whose columns are known.
+fn inline_diags() -> Vec<Diagnostic> {
+    vec![
+        diag(
+            1,
+            ERR_COLS.0,
+            1,
+            ERR_COLS.1,
+            super::diagnostics_overlay::SEVERITY_ERROR,
+            "cannot find value `error` in this scope",
+        ),
+        diag(
+            2,
+            WARN_COLS.0,
+            2,
+            WARN_COLS.1,
+            super::diagnostics_overlay::SEVERITY_WARNING,
+            "unused variable: `warning`",
+        ),
+        diag(
+            3,
+            INFO_COLS.0,
+            3,
+            INFO_COLS.1,
+            super::diagnostics_overlay::SEVERITY_INFO,
+            "consider naming this",
+        ),
+    ]
+}
+
+/// Config for the diagnostic scenes.
+///
+/// Spellcheck is OFF deliberately: its squiggle is painted in the SAME
+/// `#e53e3e` as the default error colour, so leaving it on would put
+/// error-coloured ink in the CONTROL frame and hollow out the zero-ink
+/// assertion. The minimap is OFF so the editor width — and therefore the soft
+/// wrap point — depends only on the window size.
+fn diag_config(word_wrap: bool) -> Config {
+    let mut cfg = qa_config();
+    cfg.spellcheck.enabled = false;
+    cfg.editor.show_minimap = false;
+    cfg.editor.word_wrap = word_wrap;
+    cfg
+}
+
+/// A scratch tab holding `text` with `diags` published against it. Both
+/// baselines match the text so the change bar (amber — the SAME colour as a
+/// warning) never paints and cannot be counted as diagnostic ink.
+fn diag_app(text: &str, diags: Vec<Diagnostic>, word_wrap: bool) -> ScribeApp {
+    let mut app = ScribeApp::new_test(diag_config(word_wrap));
+    app.tabs.clear();
+    let mut t = EditorTab::scratch();
+    t.text = text.to_string();
+    t.session_baseline = text.to_string();
+    t.saved_baseline = text.to_string();
+    app.tabs.push(t);
+    app.active = 0;
+    app.diagnostics = diags;
+    app
+}
+
+/// The severity colours the overlay actually resolves, read through the same
+/// theme lookup `frame_tick` uses — NOT re-declared hex constants, which would
+/// silently desync from the app the moment a theme defined an `error` key.
+fn severity_colors(app: &ScribeApp) -> [Color32; 3] {
+    [
+        ui_color(&app.theme, "error", Rgba::new(0xe5, 0x3e, 0x3e, 255)),
+        ui_color(&app.theme, "warning", Rgba::new(0xf2, 0xb3, 0x3d, 255)),
+        ui_color(&app.theme, "accent", Rgba::new(0x6f, 0xb8, 0x9a, 255)),
+    ]
+}
+
+/// Render a frame and also hand back the pixels. Saves the PNG so it can be
+/// READ — the whole point of the exercise.
+fn render_frame(name: &str, w: f32, h: f32, app: ScribeApp) -> Option<RgbaImage> {
+    if !gpu_available() {
+        eprintln!("[visual-qa] no GPU adapter; skipping `{name}` (NOT a pass)");
+        return None;
+    }
+    let mut harness: Harness<'static, ScribeApp> = Harness::builder()
+        .with_size(egui::vec2(w, h))
+        .wgpu()
+        .build_state(|ctx, app: &mut ScribeApp| app.frame_tick(ctx), app);
+    for _ in 0..5 {
+        harness.step();
+    }
+    let img = harness
+        .render()
+        .expect("kittest wgpu render of the real ScribeApp frame must succeed");
+    let path = out_dir().join(format!("{name}.png"));
+    img.save(&path).expect("save visual-qa png");
+    eprintln!(
+        "[visual-qa] wrote {} ({}x{})",
+        path.display(),
+        img.width(),
+        img.height()
+    );
+    Some(img)
+}
+
+/// Rows to consider when hunting for ink: everything between the tab strip and
+/// the status bar. The status bar legitimately turns the diagnostic COUNT amber
+/// when errors are present — that is chrome, not overlay.
+fn analysis_rows(img: &RgbaImage) -> std::ops::Range<u32> {
+    60..img.height().saturating_sub(60)
+}
+
+/// Least-squares fit of the per-pixel difference onto `target - control`.
+///
+/// Returns `(alpha, residual)`. An alpha-composited overlay gives residual ~0
+/// with alpha in `0..=1`; anything else (a glyph that moved, another overlay's
+/// colour) leaves a large residual.
+fn ink_fit(shot: &RgbaImage, control: &RgbaImage, x: u32, y: u32, target: Color32) -> (f32, f32) {
+    let a = shot.get_pixel(x, y).0;
+    let b = control.get_pixel(x, y).0;
+    let d = [
+        f32::from(a[0]) - f32::from(b[0]),
+        f32::from(a[1]) - f32::from(b[1]),
+        f32::from(a[2]) - f32::from(b[2]),
+    ];
+    let dir = [
+        f32::from(target.r()) - f32::from(b[0]),
+        f32::from(target.g()) - f32::from(b[1]),
+        f32::from(target.b()) - f32::from(b[2]),
+    ];
+    let dd = dir[0].mul_add(dir[0], dir[1].mul_add(dir[1], dir[2] * dir[2]));
+    if dd < 400.0 {
+        // Target and background are the same colour here: undecidable.
+        return (0.0, f32::MAX);
+    }
+    let alpha = d[0].mul_add(dir[0], d[1].mul_add(dir[1], d[2] * dir[2])) / dd;
+    let resid = (alpha.mul_add(-dir[0], d[0]).powi(2)
+        + alpha.mul_add(-dir[1], d[1]).powi(2)
+        + alpha.mul_add(-dir[2], d[2]).powi(2))
+    .sqrt();
+    (alpha, resid)
+}
+
+/// Smallest per-channel change that counts as ink at all (below this it is
+/// GPU/driver dither, not paint).
+const MIN_INK_DELTA: f32 = 20.0;
+/// Faintest alpha accepted as deliberate ink.
+const MIN_INK_ALPHA: f32 = 0.30;
+/// Largest off-axis residual an alpha-composited pixel may carry.
+const MAX_INK_RESID: f32 = 12.0;
+
+fn changed_enough(shot: &RgbaImage, control: &RgbaImage, x: u32, y: u32) -> bool {
+    let a = shot.get_pixel(x, y).0;
+    let b = control.get_pixel(x, y).0;
+    (0..3)
+        .map(|c| (f32::from(a[c]) - f32::from(b[c])).abs())
+        .fold(0.0f32, f32::max)
+        >= MIN_INK_DELTA
+}
+
+/// Every pixel in the analysis band that reads as ink of `targets[which]` AND
+/// reads better as that severity than as either of the other two. The
+/// best-of-three rule is what makes "the error squiggle is red, not amber" a
+/// real assertion rather than a colour-distance coincidence.
+fn ink_pixels(
+    shot: &RgbaImage,
+    control: &RgbaImage,
+    targets: &[Color32; 3],
+    which: usize,
+) -> Vec<(u32, u32)> {
+    assert_eq!(
+        shot.dimensions(),
+        control.dimensions(),
+        "the shot and its control must be the same size"
+    );
+    let mut out = Vec::new();
+    for y in analysis_rows(shot) {
+        for x in 0..shot.width() {
+            if !changed_enough(shot, control, x, y) {
+                continue;
+            }
+            let fits: Vec<(f32, f32)> = targets
+                .iter()
+                .map(|t| ink_fit(shot, control, x, y, *t))
+                .collect();
+            let (alpha, resid) = fits[which];
+            if !(MIN_INK_ALPHA..=1.30).contains(&alpha) || resid > MAX_INK_RESID {
+                continue;
+            }
+            let best_other = fits
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != which)
+                .map(|(_, (_, r))| *r)
+                .fold(f32::MAX, f32::min);
+            if best_other <= resid.mul_add(2.0, 4.0) {
+                continue; // not decisively THIS severity
+            }
+            out.push((x, y));
+        }
+    }
+    out
+}
+
+/// Group ink into horizontal bands (one per painted galley row). A gap of more
+/// than `gap` blank scanlines starts a new band.
+fn ink_bands(pixels: &[(u32, u32)], gap: u32) -> Vec<(u32, u32)> {
+    let mut ys: Vec<u32> = pixels.iter().map(|(_, y)| *y).collect();
+    ys.sort_unstable();
+    ys.dedup();
+    let mut bands: Vec<(u32, u32)> = Vec::new();
+    for y in ys {
+        match bands.last_mut() {
+            Some(b) if y <= b.1 + gap => b.1 = y,
+            _ => bands.push((y, y)),
+        }
+    }
+    bands
+}
+
+/// The x extent of the ink inside one band, restricted to `x_range`.
+fn band_x_extent(
+    pixels: &[(u32, u32)],
+    band: (u32, u32),
+    x_range: &std::ops::Range<u32>,
+) -> Option<(u32, u32)> {
+    let xs: Vec<u32> = pixels
+        .iter()
+        .filter(|(x, y)| *y >= band.0 && *y <= band.1 && x_range.contains(x))
+        .map(|(x, _)| *x)
+        .collect();
+    Some((*xs.iter().min()?, *xs.iter().max()?))
+}
+
+/// First column of the editor TEXT, split off the gutter.
+///
+/// A diagnostic inks two well-separated things: a short bar at the gutter's left
+/// edge and the squiggle in the text area. The widest horizontal gap between
+/// inked columns is the gutter-to-text boundary, so the text origin is measured,
+/// not assumed — and forgetting to exclude the gutter (which is exactly how the
+/// first draft of the soft-wrap scene mis-measured the character cell by 50%) is
+/// no longer possible by construction.
+fn text_origin(ink: &[(u32, u32)]) -> u32 {
+    let mut xs: Vec<u32> = ink.iter().map(|(x, _)| *x).collect();
+    assert!(!xs.is_empty(), "no ink to split");
+    xs.sort_unstable();
+    xs.dedup();
+    let (mut split, mut best_gap) = (xs[0], 0u32);
+    for pair in xs.windows(2) {
+        if pair[1] - pair[0] > best_gap {
+            best_gap = pair[1] - pair[0];
+            split = pair[1];
+        }
+    }
+    assert!(
+        best_gap > 10,
+        "expected a clear horizontal gap between the gutter mark and the \
+         squiggle; the largest gap between inked columns was {best_gap}px \
+         (is the gutter mark missing?)"
+    );
+    split
+}
+
+/// Text-origin x and character-cell width, READ OFF a render in which one whole
+/// known-length line is underlined. Everything downstream is expressed in these
+/// production-measured units, never in constants copied out of the paint code.
+#[derive(Debug, Clone, Copy)]
+struct CellGeometry {
+    /// x of the first character cell's left edge (as the squiggle paints it).
+    origin_x: f32,
+    /// Width of one monospace character cell, in pixels.
+    cell_w: f32,
+}
+
+impl CellGeometry {
+    fn x_of(self, column: u32) -> f32 {
+        f32::from(u16::try_from(column).expect("column fits")).mul_add(self.cell_w, self.origin_x)
+    }
+}
+
+/// Screen columns of the gutter — everything left of the text origin.
+fn gutter_range(geom: CellGeometry) -> std::ops::Range<u32> {
+    0..(geom.origin_x as u32).saturating_sub(4)
+}
+
+/// Screen columns of the editor text area.
+fn text_range(geom: CellGeometry, width: u32) -> std::ops::Range<u32> {
+    (geom.origin_x as u32).saturating_sub(3)..width
+}
+
+const SCENE_W: f32 = 900.0;
+const SCENE_H: f32 = 400.0;
+
+/// Render the control frame (no diagnostics) for [`DIAG_SRC`].
+fn diag_control(name: &str, word_wrap: bool, text: &str) -> Option<RgbaImage> {
+    render_frame(
+        &format!("{name}_control"),
+        SCENE_W,
+        SCENE_H,
+        diag_app(text, Vec::new(), word_wrap),
+    )
+}
+
+/// Underline ALL of line 0 and read the character-cell geometry back off the
+/// pixels. This is the production-geometry anchor for every x assertion below.
+fn calibrate(control: &RgbaImage) -> Option<CellGeometry> {
+    let app = diag_app(
+        DIAG_SRC,
+        vec![diag(
+            0,
+            0,
+            0,
+            DIAG_LINE_LEN,
+            super::diagnostics_overlay::SEVERITY_ERROR,
+            "whole first line",
+        )],
+        false,
+    );
+    let targets = severity_colors(&app);
+    let shot = render_frame("diagnostics_calibration", SCENE_W, SCENE_H, app)?;
+    let ink = ink_pixels(&shot, control, &targets, 0);
+    assert!(
+        !ink.is_empty(),
+        "the calibration render underlined a whole line and produced NO \
+         error-red ink — the overlay painted nothing at all"
+    );
+    // The gutter bar is ink too; split it off before measuring the cell.
+    let split = text_origin(&ink);
+    let max_x = ink.iter().map(|(x, _)| *x).max().expect("ink columns");
+    let geom = CellGeometry {
+        origin_x: f32::from(u16::try_from(split).expect("x fits")),
+        cell_w: (max_x - split) as f32 / DIAG_LINE_LEN as f32,
+    };
+    eprintln!(
+        "[diag-cal] gutter|text split={split} right={max_x} cell_w={:.3}px",
+        geom.cell_w
+    );
+    Some(geom)
+}
+
+fn assert_close(what: &str, observed: f32, expected: f32, tol: f32) {
+    assert!(
+        (observed - expected).abs() <= tol,
+        "{what}: observed {observed:.1}px, expected {expected:.1}px (tolerance {tol}px)"
+    );
+}
+
+/// Tolerance on a single measured edge: the squiggle is antialiased, so its
+/// inked extent spreads about a pixel beyond the geometric endpoint, and the
+/// calibration carries the same spread on both sides.
+const EDGE_TOL: f32 = 3.0;
+
+// ─────────────────────────── the scenes ───────────────────────────
+
+/// THE scene: one diagnostic per severity, each under a known word. Read the
+/// PNG — three squiggles under `error`, `warning` and `info` on lines 2/3/4,
+/// three coloured bars in the gutter, and NOTHING under the other words.
+#[test]
+#[ignore = "GPU render; run with --ignored on a host with a wgpu adapter"]
+fn diag_scene_inline_overlay() {
+    let Some(control) = diag_control("diagnostics_inline", false, DIAG_SRC) else {
+        return;
+    };
+    let app = diag_app(DIAG_SRC, inline_diags(), false);
+    let targets = severity_colors(&app);
+    let Some(shot) = render_frame("diagnostics_inline", SCENE_W, SCENE_H, app) else {
+        return;
+    };
+    for (i, name) in ["error", "warning", "info"].iter().enumerate() {
+        let n = ink_pixels(&shot, &control, &targets, i).len();
+        eprintln!("[diag-inline] {name} ink pixels: {n}");
+        assert!(n > 0, "no {name}-coloured ink was painted anywhere");
+    }
+}
+
+/// The single most important property, and the one a text-level unit test
+/// cannot see: the squiggle covers the diagnostic's RANGE, not the whole line.
+///
+/// Every expected x comes from the calibration render (origin + column ×
+/// cell-width), so this stays true across font, padding and gutter changes —
+/// and fails loudly if the paint path ever underlines the full row again.
+#[test]
+#[ignore = "GPU render; run with --ignored on a host with a wgpu adapter"]
+fn diag_squiggle_covers_the_range_not_the_whole_line() {
+    let Some(control) = diag_control("diagnostics_range", false, DIAG_SRC) else {
+        return;
+    };
+    let Some(geom) = calibrate(&control) else {
+        return;
+    };
+    let app = diag_app(DIAG_SRC, inline_diags(), false);
+    let targets = severity_colors(&app);
+    let Some(shot) = render_frame("diagnostics_range", SCENE_W, SCENE_H, app) else {
+        return;
+    };
+    let text = text_range(geom, shot.width());
+    let full_line_w = geom.cell_w * DIAG_LINE_LEN as f32;
+
+    for (i, (name, cols)) in [
+        ("error", ERR_COLS),
+        ("warning", WARN_COLS),
+        ("info", INFO_COLS),
+    ]
+    .iter()
+    .enumerate()
+    {
+        // Text area only: the gutter bar is ink too, and it sits on the same
+        // rows, so counting it would blur "one underlined row" into "one
+        // marked line".
+        let ink: Vec<(u32, u32)> = ink_pixels(&shot, &control, &targets, i)
+            .into_iter()
+            .filter(|(x, _)| text.contains(x))
+            .collect();
+        let bands = ink_bands(&ink, 3);
+        assert_eq!(
+            bands.len(),
+            1,
+            "{name}: a single-line diagnostic must underline exactly one row, \
+             got bands {bands:?}"
+        );
+        let (x0, x1) = band_x_extent(&ink, bands[0], &text)
+            .unwrap_or_else(|| panic!("{name}: no ink in the text area"));
+        eprintln!("[diag-range] {name} band={:?} x={x0}..{x1}", bands[0]);
+        assert_close(
+            &format!("{name} squiggle start (column {})", cols.0),
+            x0 as f32,
+            geom.x_of(cols.0),
+            EDGE_TOL,
+        );
+        assert_close(
+            &format!("{name} squiggle end (column {})", cols.1),
+            x1 as f32,
+            geom.x_of(cols.1),
+            EDGE_TOL,
+        );
+        // Stated the other way round, so a regression that underlined the whole
+        // row is named as such instead of as an off-by-N.
+        let width = (x1 - x0) as f32;
+        assert!(
+            width < full_line_w * 0.5,
+            "{name}: the squiggle is {width:.0}px wide out of a {full_line_w:.0}px \
+             line — it is underlining the LINE, not the {}-character range",
+            cols.1 - cols.0
+        );
+    }
+}
+
+/// The control render must contain ZERO diagnostic ink. Paired with the scene
+/// above it makes every "there is ink here" assertion meaningful: the ink is
+/// caused by the diagnostics and by nothing else on the frame.
+#[test]
+#[ignore = "GPU render; run with --ignored on a host with a wgpu adapter"]
+fn diag_free_frame_paints_no_diagnostic_ink() {
+    let Some(control) = diag_control("diagnostics_zero", false, DIAG_SRC) else {
+        return;
+    };
+    // A second render of the SAME zero-diagnostic app. Differencing two control
+    // frames must yield no ink at all — if it does, the classifier is picking up
+    // render noise and every positive result below would be worthless.
+    let Some(control2) = render_frame(
+        "diagnostics_zero_b",
+        SCENE_W,
+        SCENE_H,
+        diag_app(DIAG_SRC, Vec::new(), false),
+    ) else {
+        return;
+    };
+    let targets = severity_colors(&diag_app(DIAG_SRC, Vec::new(), false));
+    for (i, name) in ["error", "warning", "info"].iter().enumerate() {
+        let n = ink_pixels(&control2, &control, &targets, i).len();
+        assert_eq!(
+            n, 0,
+            "two diagnostic-free renders differ by {n} {name}-coloured pixels; \
+             the ink classifier is reading noise"
+        );
+    }
+
+    // …and CONTAINMENT, which is the half that is not a tautology. Publishing
+    // diagnostics on lines 2, 3 and 4 must change nothing on line 1 — not its
+    // glyphs (no reflow), not its gutter (no mark on an undiagnosed line), not
+    // the row where its own underline would sit. "Zero ink in the control" only
+    // says the classifier is quiet; this says the overlay stays inside the lines
+    // it was published for.
+    let Some(shot) = render_frame(
+        "diagnostics_zero_shot",
+        SCENE_W,
+        SCENE_H,
+        diag_app(DIAG_SRC, inline_diags(), false),
+    ) else {
+        return;
+    };
+    // Row pitch measured from two DIAGNOSED rows, so line 1's band is derived
+    // from the render rather than from the editor's line-height constant.
+    let err = ink_bands(&ink_pixels(&shot, &control, &targets, 0), 3);
+    let warn = ink_bands(&ink_pixels(&shot, &control, &targets, 1), 3);
+    assert_eq!(err.len(), 1, "error ink bands: {err:?}");
+    assert_eq!(warn.len(), 1, "warning ink bands: {warn:?}");
+    let pitch = warn[0].0 - err[0].0;
+    assert!(pitch > 4, "implausible row pitch {pitch}px");
+    // One whole row above the first diagnosed row: line 1, top to underline.
+    let y0 = err[0].1 - 2 * pitch + 2;
+    let y1 = err[0].1 - pitch;
+    let untouched = changed_pixels_in(
+        &shot,
+        &control,
+        egui::Rect::from_min_max(
+            egui::pos2(0.0, y0 as f32),
+            egui::pos2(shot.width() as f32, y1 as f32),
+        ),
+    );
+    eprintln!("[diag-zero] pitch={pitch} undiagnosed row y={y0}..{y1} changed={untouched}");
+    assert_eq!(
+        untouched, 0,
+        "publishing diagnostics on lines 2-4 changed {untouched} pixels on the \
+         UNDIAGNOSED line 1 (rows {y0}..{y1}, full width) — the overlay is \
+         painting outside the lines it was given"
+    );
+}
+
+/// Severities must be visually distinguishable, not three shades of the same
+/// thing. Each band is classified against ALL THREE colours and must win as its
+/// own severity — an overlay that painted every squiggle red passes a
+/// "there is ink" check and fails this one.
+#[test]
+#[ignore = "GPU render; run with --ignored on a host with a wgpu adapter"]
+fn diag_each_severity_paints_its_own_colour() {
+    let Some(control) = diag_control("diagnostics_severity", false, DIAG_SRC) else {
+        return;
+    };
+    let Some(geom) = calibrate(&control) else {
+        return;
+    };
+    let app = diag_app(DIAG_SRC, inline_diags(), false);
+    let targets = severity_colors(&app);
+    let Some(shot) = render_frame("diagnostics_severity", SCENE_W, SCENE_H, app) else {
+        return;
+    };
+    let text = text_range(geom, shot.width());
+    let mut rows: Vec<(usize, u32)> = Vec::new();
+    for i in 0..3 {
+        let ink: Vec<(u32, u32)> = ink_pixels(&shot, &control, &targets, i)
+            .into_iter()
+            .filter(|(x, _)| text.contains(x))
+            .collect();
+        assert!(
+            !ink.is_empty(),
+            "severity {i} produced no ink that classifies decisively as its own \
+             colour — the three severities are not visually distinguishable"
+        );
+        let bands = ink_bands(&ink, 3);
+        assert_eq!(bands.len(), 1, "severity {i} bands: {bands:?}");
+        rows.push((i, bands[0].0));
+    }
+    // Each severity sits on its own row, in source order (error line 1, warning
+    // line 2, info line 3).
+    assert!(
+        rows[0].1 < rows[1].1 && rows[1].1 < rows[2].1,
+        "the severities must land on descending source lines, got {rows:?}"
+    );
+}
+
+/// The gutter bar marks the START line of a diagnostic and no other. A gutter
+/// mark on the wrong line sends the user to the wrong place in the file, and the
+/// unit test for `gutter_marks` cannot see which row it was actually drawn on.
+#[test]
+#[ignore = "GPU render; run with --ignored on a host with a wgpu adapter"]
+fn diag_gutter_bar_marks_the_start_line_only() {
+    let Some(control) = diag_control("diagnostics_gutter", false, DIAG_SRC) else {
+        return;
+    };
+    let Some(geom) = calibrate(&control) else {
+        return;
+    };
+    // One multi-line error, lines 1 → 3. The squiggle covers three rows; the
+    // gutter must mark exactly ONE.
+    let app = diag_app(
+        DIAG_SRC,
+        vec![diag(
+            1,
+            10,
+            3,
+            8,
+            super::diagnostics_overlay::SEVERITY_ERROR,
+            "unclosed delimiter",
+        )],
+        false,
+    );
+    let targets = severity_colors(&app);
+    let Some(shot) = render_frame("diagnostics_gutter", SCENE_W, SCENE_H, app) else {
+        return;
+    };
+    let ink = ink_pixels(&shot, &control, &targets, 0);
+    let gutter = gutter_range(geom);
+    let text = text_range(geom, shot.width());
+
+    let gutter_ink: Vec<(u32, u32)> = ink
+        .iter()
+        .copied()
+        .filter(|(x, _)| gutter.contains(x))
+        .collect();
+    let text_ink: Vec<(u32, u32)> = ink
+        .iter()
+        .copied()
+        .filter(|(x, _)| text.contains(x))
+        .collect();
+    let gutter_bands = ink_bands(&gutter_ink, 3);
+    let text_bands = ink_bands(&text_ink, 3);
+    eprintln!("[diag-gutter] gutter bands={gutter_bands:?} text bands={text_bands:?}");
+    assert_eq!(
+        gutter_bands.len(),
+        1,
+        "a diagnostic spanning three lines must leave ONE gutter mark (on its \
+         start line), got {gutter_bands:?}"
+    );
+    assert_eq!(
+        text_bands.len(),
+        3,
+        "the same diagnostic must underline all THREE rows it covers, got \
+         {text_bands:?}"
+    );
+    // …and that one mark is level with the FIRST underlined row, to well inside
+    // a row height. Row height is measured from the spacing of the underlined
+    // rows, so this does not encode the editor's line height either. The gutter
+    // bar is centred on its row while the squiggle sits at the row's bottom, so
+    // the expected offset between them is half a row — which makes a mark drawn
+    // one line off (the classic gutter regression) a full row out of tolerance.
+    let row_h = (text_bands[1].0 - text_bands[0].0) as f32;
+    let gutter_mid = (gutter_bands[0].0 + gutter_bands[0].1) as f32 / 2.0;
+    let squiggle_mid = (text_bands[0].0 + text_bands[0].1) as f32 / 2.0;
+    assert_close(
+        "gutter mark centre vs the first underlined row (half a row apart)",
+        squiggle_mid - gutter_mid,
+        row_h * 0.5,
+        row_h * 0.35,
+    );
+}
+
+/// A multi-line range underlines every row it covers, starting at the diagnostic
+/// column on the first row, spanning the whole middle row, and stopping at the
+/// diagnostic column on the last — the behaviour the per-row paint loop exists
+/// for, and the one an "underline the span" implementation gets wrong by
+/// dropping the diagnostic entirely.
+#[test]
+#[ignore = "GPU render; run with --ignored on a host with a wgpu adapter"]
+fn diag_multi_line_range_underlines_each_row_from_the_right_column() {
+    let Some(control) = diag_control("diagnostics_multiline", false, DIAG_SRC) else {
+        return;
+    };
+    let Some(geom) = calibrate(&control) else {
+        return;
+    };
+    const START_COL: u32 = 10;
+    const END_COL: u32 = 8;
+    let app = diag_app(
+        DIAG_SRC,
+        vec![diag(
+            1,
+            START_COL,
+            3,
+            END_COL,
+            super::diagnostics_overlay::SEVERITY_ERROR,
+            "unclosed delimiter",
+        )],
+        false,
+    );
+    let targets = severity_colors(&app);
+    let Some(shot) = render_frame("diagnostics_multiline", SCENE_W, SCENE_H, app) else {
+        return;
+    };
+    let text = text_range(geom, shot.width());
+    let ink: Vec<(u32, u32)> = ink_pixels(&shot, &control, &targets, 0)
+        .into_iter()
+        .filter(|(x, _)| text.contains(x))
+        .collect();
+    let bands = ink_bands(&ink, 3);
+    assert_eq!(
+        bands.len(),
+        3,
+        "expected three underlined rows, got {bands:?}"
+    );
+
+    let e0 = band_x_extent(&ink, bands[0], &text).expect("row 0 ink");
+    let e1 = band_x_extent(&ink, bands[1], &text).expect("row 1 ink");
+    let e2 = band_x_extent(&ink, bands[2], &text).expect("row 2 ink");
+    eprintln!("[diag-multiline] rows: {e0:?} {e1:?} {e2:?}");
+
+    assert_close(
+        "first row starts at the diagnostic column",
+        e0.0 as f32,
+        geom.x_of(START_COL),
+        EDGE_TOL,
+    );
+    assert_close(
+        "first row runs to the end of the line",
+        e0.1 as f32,
+        geom.x_of(DIAG_LINE_LEN),
+        EDGE_TOL,
+    );
+    assert_close(
+        "middle row starts at column 0",
+        e1.0 as f32,
+        geom.x_of(0),
+        EDGE_TOL,
+    );
+    assert_close(
+        "middle row runs to the end of the line",
+        e1.1 as f32,
+        geom.x_of(DIAG_LINE_LEN),
+        EDGE_TOL,
+    );
+    assert_close(
+        "last row starts at column 0",
+        e2.0 as f32,
+        geom.x_of(0),
+        EDGE_TOL,
+    );
+    assert_close(
+        "last row stops at the diagnostic end column",
+        e2.1 as f32,
+        geom.x_of(END_COL),
+        EDGE_TOL,
+    );
+}
+
+/// Soft wrapping: with word-wrap on, a range that crosses a wrap boundary must
+/// continue on the next VISUAL row. This is the case most likely to be wrong,
+/// because a soft-wrapped row is not a source line and nothing in the text-level
+/// unit tests models one.
+///
+/// The wrap point itself is measured from a calibration render that underlines
+/// the WHOLE long line, so the assertion does not encode a guess about where the
+/// editor happens to break.
+#[test]
+#[ignore = "GPU render; run with --ignored on a host with a wgpu adapter"]
+fn diag_soft_wrapped_range_continues_on_the_next_visual_row() {
+    let src = format!("{}\n", "abcdefghij".repeat(20));
+    let Some(control) = diag_control("diagnostics_wrapped", true, &src) else {
+        return;
+    };
+    // Calibration: underline the entire (wrapped) line to learn where the rows
+    // are and how wide each visual row's text runs.
+    let cal_app = diag_app(
+        &src,
+        vec![diag(
+            0,
+            0,
+            0,
+            200,
+            super::diagnostics_overlay::SEVERITY_ERROR,
+            "the whole wrapped line",
+        )],
+        true,
+    );
+    let targets = severity_colors(&cal_app);
+    let Some(cal) = render_frame("diagnostics_wrapped_calibration", SCENE_W, SCENE_H, cal_app)
+    else {
+        return;
+    };
+    let cal_ink = ink_pixels(&cal, &control, &targets, 0);
+    // Split the gutter bar off FIRST — including it in the row extents is what
+    // made the first draft of this scene measure a 12.8px character cell for an
+    // 8.4px font and then pick two columns that never straddled anything.
+    let split = text_origin(&cal_ink);
+    let text = split.saturating_sub(3)..cal.width();
+    let cal_ink: Vec<(u32, u32)> = cal_ink
+        .into_iter()
+        .filter(|(x, _)| text.contains(x))
+        .collect();
+    let cal_bands = ink_bands(&cal_ink, 3);
+    assert!(
+        cal_bands.len() >= 2,
+        "the wrap scene needs a line that actually wraps; the whole-line \
+         underline occupied {} row(s)",
+        cal_bands.len()
+    );
+    let full_x = cal_bands
+        .iter()
+        .map(|b| band_x_extent(&cal_ink, *b, &text).expect("calibration row ink"))
+        .collect::<Vec<_>>();
+    // Row 0 of the calibration spans the whole first visual row, so its right
+    // edge IS the wrap point.
+    let (row0_left, row0_right) = full_x[0];
+    eprintln!("[diag-wrap] text origin={split} calibration rows: {full_x:?}");
+
+    // A range that starts a few characters before the wrap and ends a few after
+    // it. Chars-per-row is read off the calibration, never assumed.
+    let text_left = row0_left as f32;
+    let text_right = row0_right as f32;
+    let cell_w = {
+        // Underline exactly ten characters at the start of the line and measure.
+        let ten = diag_app(
+            &src,
+            vec![diag(
+                0,
+                0,
+                0,
+                10,
+                super::diagnostics_overlay::SEVERITY_ERROR,
+                "ten characters",
+            )],
+            true,
+        );
+        let Some(ten_shot) = render_frame("diagnostics_wrapped_ten", SCENE_W, SCENE_H, ten) else {
+            return;
+        };
+        let ten_ink: Vec<(u32, u32)> = ink_pixels(&ten_shot, &control, &targets, 0)
+            .into_iter()
+            .filter(|(x, _)| text.contains(x))
+            .collect();
+        let bands = ink_bands(&ten_ink, 3);
+        assert_eq!(
+            bands.len(),
+            1,
+            "a ten-character range fits one row: {bands:?}"
+        );
+        let e = band_x_extent(&ten_ink, bands[0], &text).expect("ten ink");
+        (e.1 - e.0) as f32 / 10.0
+    };
+    let chars_per_row = ((text_right - text_left) / cell_w).round() as u32;
+    eprintln!("[diag-wrap] cell_w={cell_w:.3} chars_per_row={chars_per_row}");
+    assert!(
+        chars_per_row > 8,
+        "implausible wrap width {chars_per_row} characters"
+    );
+
+    // Eight characters either side of the estimated wrap column, so the range
+    // still straddles even if the estimate is a character or two out.
+    const HALF: u32 = 8;
+    let c0 = chars_per_row - HALF;
+    let c1 = chars_per_row + HALF;
+    let app = diag_app(
+        &src,
+        vec![diag(
+            0,
+            c0,
+            0,
+            c1,
+            super::diagnostics_overlay::SEVERITY_ERROR,
+            "a range straddling the wrap",
+        )],
+        true,
+    );
+    let Some(shot) = render_frame("diagnostics_wrapped", SCENE_W, SCENE_H, app) else {
+        return;
+    };
+    let ink: Vec<(u32, u32)> = ink_pixels(&shot, &control, &targets, 0)
+        .into_iter()
+        .filter(|(x, _)| text.contains(x))
+        .collect();
+    let bands = ink_bands(&ink, 3);
+    assert_eq!(
+        bands.len(),
+        2,
+        "a range straddling a soft wrap must underline TWO visual rows, got \
+         {bands:?} — a span-based painter drops it or runs it off the edge"
+    );
+    let a = band_x_extent(&ink, bands[0], &text).expect("upper row ink");
+    let b = band_x_extent(&ink, bands[1], &text).expect("lower row ink");
+    eprintln!("[diag-wrap] straddling rows: {a:?} {b:?}");
+    // The upper row runs INTO the wrap: it stops exactly where the whole-line
+    // calibration stopped, i.e. at the last character that fits.
+    assert_close(
+        "upper row runs to the wrap point",
+        a.1 as f32,
+        text_right,
+        EDGE_TOL,
+    );
+    // …and it does NOT start at the row origin — a painter that gave up and
+    // underlined the whole visual row would.
+    assert!(
+        (a.0 as f32) > cell_w.mul_add(f32::from(HALF as u16), text_left),
+        "the upper row's underline starts at x={} — it is underlining the whole \
+         visual row, not the last {HALF} characters before the wrap",
+        a.0
+    );
+    // The lower row restarts at the left margin: the continuation begins at the
+    // wrapped row's first character, not at the source column.
+    assert_close(
+        "lower row restarts at the left margin",
+        b.0 as f32,
+        text_left,
+        EDGE_TOL,
+    );
+    // The strongest statement, and the one that does not depend on knowing the
+    // exact wrap column: across the two rows the underline is exactly as long as
+    // the range is wide. Nothing is lost at the seam and nothing is drawn twice.
+    let painted = (a.1 - a.0) as f32 + (b.1 - b.0) as f32;
+    let expected = cell_w * f32::from(u16::try_from(c1 - c0).expect("range fits"));
+    assert_close(
+        "total underlined width across the two wrapped rows",
+        painted,
+        expected,
+        EDGE_TOL + cell_w,
+    );
+}
+
+/// Hovering the squiggle opens the tooltip; hovering a character that is NOT
+/// underlined does not. The paired negative is what makes this a test of the
+/// galley-resolved hit test rather than of "a tooltip exists".
+#[test]
+#[ignore = "GPU render; run with --ignored on a host with a wgpu adapter"]
+fn diag_hover_opens_the_tooltip_on_the_squiggle_only() {
+    let Some(control) = diag_control("diagnostics_hover", false, DIAG_SRC) else {
+        return;
+    };
+    let Some(geom) = calibrate(&control) else {
+        return;
+    };
+    let app = diag_app(DIAG_SRC, inline_diags(), false);
+    let Some(base) = render_frame("diagnostics_hover_base", SCENE_W, SCENE_H, app) else {
+        return;
+    };
+    // Row y of the error squiggle, from the un-hovered render.
+    let targets = severity_colors(&diag_app(DIAG_SRC, inline_diags(), false));
+    let ink: Vec<(u32, u32)> = ink_pixels(&base, &control, &targets, 0)
+        .into_iter()
+        .filter(|(x, _)| text_range(geom, base.width()).contains(x))
+        .collect();
+    let band = ink_bands(&ink, 3)[0];
+    // Aim a couple of pixels ABOVE the underline, i.e. at the glyph itself.
+    let on = egui::pos2(
+        geom.x_of(ERR_COLS.0 + 1),
+        (band.0 + band.1) as f32 / 2.0 - 6.0,
+    );
+    let off = egui::pos2(geom.x_of(2), (band.0 + band.1) as f32 / 2.0 - 6.0);
+
+    let on_shot = render_hover_frame(
+        "diagnostics_hover_on",
+        SCENE_W,
+        SCENE_H,
+        diag_app(DIAG_SRC, inline_diags(), false),
+        on,
+    );
+    let off_shot = render_hover_frame(
+        "diagnostics_hover_off",
+        SCENE_W,
+        SCENE_H,
+        diag_app(DIAG_SRC, inline_diags(), false),
+        off,
+    );
+    let (Some(on_shot), Some(off_shot)) = (on_shot, off_shot) else {
+        return;
+    };
+    // Count changes ONLY where a tooltip would sit: the panel egui opens below
+    // and to the right of the pointer. Deliberately NOT a whole-frame diff — a
+    // hover also draws the mouse cursor and reveals the scroll bar, which is
+    // ~2,200 changed pixels of pure noise that swamped the first draft of this
+    // assertion and made a correct app look broken.
+    let region = |p: egui::Pos2| {
+        egui::Rect::from_min_max(
+            egui::pos2(p.x + 18.0, p.y + 10.0),
+            egui::pos2(p.x + 360.0, p.y + 45.0),
+        )
+    };
+    let on_changed = changed_pixels_in(&on_shot, &base, region(on));
+    let off_changed = changed_pixels_in(&off_shot, &base, region(off));
+    eprintln!("[diag-hover] tooltip-region changes: on={on_changed} off={off_changed}");
+    // Measured margin on a correct build: 2,200 changed pixels on, 0 off. The
+    // floor is set well below the former and the ceiling well above the latter,
+    // so neither is a hair-trigger — but a tooltip that fails to open, or one
+    // that opens anywhere on the line, moves the number by three orders of
+    // magnitude and is caught.
+    assert!(
+        on_changed > 800,
+        "hovering the underlined identifier changed only {on_changed} pixels in \
+         the tooltip region — the diagnostic tooltip did not open"
+    );
+    assert!(
+        off_changed < 200,
+        "hovering column 2 of the SAME line — a character the diagnostic does \
+         NOT cover — changed {off_changed} pixels in the tooltip region; the \
+         hover is following the line, not the span"
+    );
+}
+
+/// Render with the pointer parked at `hover`.
+fn render_hover_frame(
+    name: &str,
+    w: f32,
+    h: f32,
+    app: ScribeApp,
+    hover: egui::Pos2,
+) -> Option<RgbaImage> {
+    if !gpu_available() {
+        eprintln!("[visual-qa] no GPU adapter; skipping `{name}` (NOT a pass)");
+        return None;
+    }
+    let mut harness: Harness<'static, ScribeApp> = Harness::builder()
+        .with_size(egui::vec2(w, h))
+        .wgpu()
+        .build_state(|ctx, app: &mut ScribeApp| app.frame_tick(ctx), app);
+    for _ in 0..5 {
+        harness.step();
+    }
+    harness.hover_at(hover);
+    for _ in 0..4 {
+        harness.step();
+    }
+    let img = harness.render().expect("kittest wgpu render must succeed");
+    let path = out_dir().join(format!("{name}.png"));
+    img.save(&path).expect("save visual-qa png");
+    eprintln!("[visual-qa] wrote {} (hover {hover:?})", path.display());
+    Some(img)
+}
+
+/// How many pixels differ meaningfully between two frames inside `rect`.
+fn changed_pixels_in(a: &RgbaImage, b: &RgbaImage, rect: egui::Rect) -> usize {
+    let x0 = rect.min.x.max(0.0) as u32;
+    let y0 = rect.min.y.max(0.0) as u32;
+    let x1 = (rect.max.x.max(0.0) as u32).min(a.width());
+    let y1 = (rect.max.y.max(0.0) as u32).min(a.height());
+    let mut n = 0;
+    for y in y0..y1 {
+        for x in x0..x1 {
+            if changed_enough(a, b, x, y) {
+                n += 1;
+            }
+        }
+    }
+    n
+}
