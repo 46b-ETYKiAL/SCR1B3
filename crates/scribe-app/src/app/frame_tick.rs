@@ -165,6 +165,21 @@ pub(super) fn active_editor_mode(ctx: &egui::Context) -> EditorMode {
         .unwrap_or(EditorMode::Standard)
 }
 
+/// What the user chose in the unsaved-changes close prompt.
+///
+/// The three answers a close guard must offer: keep the work, knowingly drop it,
+/// or stay. `Cancel` is the safe default (Esc maps to it) and is the ONLY one
+/// that leaves the window alive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CloseChoice {
+    /// Save every unsaved buffer, then close — but only if every save landed.
+    Save,
+    /// Close and lose the unsaved changes, deliberately.
+    Discard,
+    /// Abort the close entirely.
+    Cancel,
+}
+
 impl ScribeApp {
     /// Apply the Wave-2 scroll knobs and drive middle-click autoscroll. Called
     /// at the very top of [`Self::frame_tick`], before any `ScrollArea` shows.
@@ -316,6 +331,154 @@ impl ScribeApp {
             .effective_enabled(os_reduced_motion_now())
     }
 
+    /// Does ANY open tab hold unsaved edits? The close guard's whole predicate.
+    pub(super) fn has_unsaved_tabs(&self) -> bool {
+        self.tabs.iter().any(EditorTab::is_dirty)
+    }
+
+    /// Titles of the tabs holding unsaved edits, for the close prompt. Listing
+    /// them is what makes the prompt actionable — "some file is unsaved" leaves
+    /// the user unable to judge whether Discard is safe.
+    pub(super) fn unsaved_tab_names(&self) -> Vec<String> {
+        self.tabs
+            .iter()
+            .filter(|t| t.is_dirty())
+            .map(|t| t.doc.file_name().to_string())
+            .collect()
+    }
+
+    /// Save every dirty tab through the REAL single-tab save path (so save-time
+    /// hygiene, encoding, change-bar baselines and save hooks all behave exactly
+    /// as a manual save), restoring the active tab afterwards.
+    ///
+    /// Deliberately reports nothing: the caller re-asks [`has_unsaved_tabs`]
+    /// instead. An untitled buffer routes through Save-As, which the user can
+    /// cancel, and a write can fail — in both cases the tab is STILL dirty and
+    /// the close must not proceed. Trusting a "saved everything" return value
+    /// here is precisely how a cancelled Save-As would silently become a discard.
+    pub(super) fn save_all_dirty(&mut self) {
+        let prev_active = self.active;
+        for i in 0..self.tabs.len() {
+            if !self.tabs[i].is_dirty() {
+                continue;
+            }
+            self.active = i;
+            self.save_active();
+        }
+        self.active = prev_active.min(self.tabs.len().saturating_sub(1));
+    }
+
+    /// Enter phase 1 of the two-phase close: hide the window now, so phase 2
+    /// (next frame, via the `self.closing` branch) can destroy it without the
+    /// DWM keeping the last composited frame on screen as a ghost (T19.1).
+    pub(super) fn begin_hide_then_close(&mut self, ctx: &egui::Context) {
+        self.closing = true;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        ctx.request_repaint();
+    }
+
+    /// Apply a resolved [`CloseChoice`]. Returns `true` when the close has been
+    /// started (the window is now hidden and the frame should be abandoned).
+    ///
+    /// Split out of the rendering so the CONSEQUENCE of each button is
+    /// unit-testable without driving pixels — and, in particular, so the
+    /// "Save-As cancelled ⇒ still dirty ⇒ do NOT close" path can be pinned.
+    pub(super) fn apply_close_choice(&mut self, ctx: &egui::Context, choice: CloseChoice) -> bool {
+        match choice {
+            CloseChoice::Save => {
+                self.save_all_dirty();
+                if self.has_unsaved_tabs() {
+                    // A Save-As was cancelled or a write failed. The prompt stays
+                    // up: proceeding here would turn "Save" into "Discard".
+                    self.status =
+                        "Still unsaved — the save didn't complete, so SCR1B3 stayed open.".into();
+                    false
+                } else {
+                    self.close_confirm_open = false;
+                    self.begin_hide_then_close(ctx);
+                    true
+                }
+            }
+            CloseChoice::Discard => {
+                // Explicit, informed discard: bypass the guard rather than
+                // re-entering it through `want_close` (which would re-raise this
+                // same prompt forever).
+                self.close_confirm_open = false;
+                self.begin_hide_then_close(ctx);
+                true
+            }
+            CloseChoice::Cancel => {
+                // A real abort: no hide, no `closing` latch, nothing destroyed.
+                self.close_confirm_open = false;
+                false
+            }
+        }
+    }
+
+    /// The unsaved-changes close prompt. Returns `true` when the user's choice
+    /// started the close (see [`apply_close_choice`](Self::apply_close_choice)).
+    ///
+    /// A modal — the same `egui::Modal` shape as the update / crash-consent /
+    /// report-issue dialogs — because the question must be answered before
+    /// anything else happens, and Esc-to-cancel matches those dialogs too.
+    pub(super) fn render_close_confirm(&mut self, ctx: &egui::Context) -> bool {
+        let names = self.unsaved_tab_names();
+        let mut choice: Option<CloseChoice> = None;
+        egui::Modal::new(egui::Id::new("scr1b3_close_confirm")).show(ctx, |ui| {
+            ui.set_max_width(420.0);
+            ui.heading("Unsaved changes");
+            ui.add_space(8.0);
+            ui.label(if names.len() == 1 {
+                "1 file has unsaved changes:".to_string()
+            } else {
+                format!("{} files have unsaved changes:", names.len())
+            });
+            ui.add_space(4.0);
+            for n in &names {
+                // Indented with a spacer rather than padded text so each file's
+                // ACCESSIBLE name is exactly the file name (a screen reader — and
+                // the kittest a11y query that pins this list — reads the label).
+                ui.horizontal(|ui| {
+                    ui.add_space(12.0);
+                    ui.label(n);
+                });
+            }
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                if ui
+                    .button("Save and close")
+                    .on_hover_text("Save every unsaved file, then close SCR1B3.")
+                    .clicked()
+                {
+                    choice = Some(CloseChoice::Save);
+                }
+                if ui
+                    .button("Discard and close")
+                    .on_hover_text("Close SCR1B3 and lose these unsaved changes.")
+                    .clicked()
+                {
+                    choice = Some(CloseChoice::Discard);
+                }
+                if ui
+                    .button("Cancel")
+                    .on_hover_text("Stay open and keep editing.")
+                    .clicked()
+                {
+                    choice = Some(CloseChoice::Cancel);
+                }
+            });
+        });
+        // Esc cancels, mirroring the other dialogs. Cancel is the safe answer, so
+        // it is the one the dismissal gesture maps to.
+        if choice.is_none() && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            choice = Some(CloseChoice::Cancel);
+        }
+        match choice {
+            Some(c) => self.apply_close_choice(ctx, c),
+            None => false,
+        }
+    }
+
     pub(crate) fn frame_tick(&mut self, ctx: &egui::Context) {
         // Resolve the effective motion gate ONCE per frame (the OS reduced-motion
         // preference AND the in-app toggle), before any borrow of `self` fields —
@@ -400,6 +563,13 @@ impl ScribeApp {
         // Phase 1: on any close request (custom ✕ or OS close) cancel the
         // immediate close, hide the window, repaint. Phase 2 (next frame): the
         // window is hidden, so issue the real Close.
+        //
+        // The UNSAVED-CHANGES GUARD sits in front of phase 1, not instead of it.
+        // The two-phase sequence is unchanged for every close that proceeds; the
+        // guard only decides WHETHER a close proceeds. Before it existed, closing
+        // with dirty buffers hid and destroyed the window unconditionally and the
+        // unsaved text was gone with no prompt (the hot-exit backup is opt-in and
+        // throttled, so it is not a substitute for asking).
         if self.closing {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
@@ -407,13 +577,27 @@ impl ScribeApp {
         let os_close = ctx.input(|i| i.viewport().close_requested());
         if os_close || self.want_close {
             self.want_close = false;
-            self.closing = true;
             if os_close {
                 // Stop eframe acting on the OS close THIS frame; we drive it.
+                // Sent on BOTH branches: whether we close or prompt, eframe must
+                // not destroy the window out from under us this frame.
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             }
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-            ctx.request_repaint();
+            if self.has_unsaved_tabs() {
+                // Do NOT latch `closing` and do NOT hide: raise the prompt and
+                // fall through so this frame renders it. Cancel genuinely aborts.
+                self.close_confirm_open = true;
+                ctx.request_repaint();
+            } else {
+                self.begin_hide_then_close(ctx);
+                return;
+            }
+        }
+        // The prompt renders every frame it is open (not only the frame the close
+        // was requested), and returns true once the user's choice has started the
+        // close — in which case the window is already hidden and the rest of this
+        // frame is skipped exactly as the direct path skips it.
+        if self.close_confirm_open && self.render_close_confirm(ctx) {
             return;
         }
 

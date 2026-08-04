@@ -632,6 +632,12 @@ pub struct ScribeApp {
     /// (the T19.1 root cause). On the first close request we hide + cancel, then
     /// issue the real Close on the next frame.
     closing: bool,
+    /// Unsaved-changes close guard: set when a close request arrived while at
+    /// least one tab held unsaved edits. While set, the confirm modal renders and
+    /// the two-phase close is NOT started — closing used to hide-and-destroy
+    /// unconditionally, silently discarding every dirty buffer. Cleared by any of
+    /// Save / Discard / Cancel.
+    close_confirm_open: bool,
     /// Wave-5: project-wide find ("find in files") results pane. Opened with
     /// Ctrl+Shift+F; searches the open folder (`file_tree_root`) via the same
     /// regex engine as the in-buffer find bar.
@@ -1317,6 +1323,7 @@ impl ScribeApp {
             applied_note_theme: String::new(),
             want_close: false,
             closing: false,
+            close_confirm_open: false,
             find_in_files_open: false,
             find_in_files_query: String::new(),
             find_in_files_regex: false,
@@ -2399,3 +2406,6 @@ mod error_message_tests;
 
 #[cfg(test)]
 mod tabbar_layout_tests;
+
+#[cfg(test)]
+mod close_guard_tests;

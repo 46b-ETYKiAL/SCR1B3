@@ -16,6 +16,9 @@
 //! - **macOS** — the bundle's `Info.plist` declares the document types; the user
 //!   sets the default via Finder ▸ Get Info ▸ Open With ▸ Change All (no
 //!   third-party CLI / no `unsafe` objc2 call from this `forbid(unsafe_code)` crate).
+//!   Because there is no write to perform, `register` VERIFIES the running
+//!   bundle's declaration and reports only the groups it really finds — it never
+//!   asserts a registration it did not perform (see `macos::summarize_bundle`).
 
 use scribe_core::config::ClaimType;
 
@@ -39,6 +42,11 @@ pub struct RegisterReport {
 // "linux")`-gated.
 #[cfg(any(test, target_os = "linux"))]
 mod linux;
+// `macos` compiles on every OS under `test` for the same reason `linux` does:
+// its decision half (`summarize_bundle`) is pure, so the fake-success regression
+// it fixes is pinned by tests that run on ALL hosts, not only a mac runner.
+#[cfg(any(test, target_os = "macos"))]
+mod macos;
 #[cfg(windows)]
 mod windows;
 
@@ -59,7 +67,7 @@ pub fn register(types: &[ClaimType]) -> RegisterReport {
     }
     #[cfg(target_os = "macos")]
     {
-        macos_register(types)
+        macos::register(types)
     }
     #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
     {
@@ -121,24 +129,6 @@ pub fn reregister_on_startup(config: &scribe_core::config::IntegrationConfig) {
     #[cfg(not(windows))]
     {
         let _ = types;
-    }
-}
-
-/// macOS: the document types are declared in the app bundle's `Info.plist`, so
-/// SCR1B3 already appears in Finder's "Open With". Setting the default is a
-/// one-time manual step (Get Info ▸ Open With ▸ Change All) — we return the
-/// guidance rather than make an `unsafe` Launch-Services call from this
-/// `forbid(unsafe_code)` crate.
-#[cfg(target_os = "macos")]
-fn macos_register(types: &[ClaimType]) -> RegisterReport {
-    RegisterReport {
-        registered: types.iter().map(|t| t.key().to_string()).collect(),
-        failed: Vec::new(),
-        needs_user_action: true,
-        message: "SCR1B3 is registered for these file types. To make it the \
-                  default, select a file in Finder, press ⌘I, expand \"Open \
-                  with\", choose SCR1B3, and click \"Change All…\"."
-            .into(),
     }
 }
 
