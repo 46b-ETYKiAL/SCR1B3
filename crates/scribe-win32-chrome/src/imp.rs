@@ -25,7 +25,8 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     TrackMouseEvent, TME_LEAVE, TME_NONCLIENT, TRACKMOUSEEVENT,
 };
 use windows_sys::Win32::UI::Shell::{
-    DefSubclassProc, SHAppBarMessage, SetWindowSubclass, ABM_GETSTATE, ABS_AUTOHIDE, APPBARDATA,
+    DefSubclassProc, SHAppBarMessage, SHChangeNotify, SetWindowSubclass, ABM_GETSTATE,
+    ABS_AUTOHIDE, APPBARDATA, SHCNE_ASSOCCHANGED, SHCNF_IDLIST,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AllowSetForegroundWindow, EnableMenuItem, EnumWindows, GetClientRect, GetSystemMenu,
@@ -309,6 +310,49 @@ pub fn allow_foreground_handoff() {
     // no handles). No-ops harmlessly if this process is not the foreground.
     unsafe {
         AllowSetForegroundWindow(ASFW_ANY);
+    }
+}
+
+/// Broadcast `SHCNE_ASSOCCHANGED` so the shell re-reads file associations.
+///
+/// ## Why the item pointers are null, and why `SHCNF_IDLIST`
+///
+/// `SHCNE_ASSOCCHANGED` is one of the events Microsoft documents as taking NO
+/// item: "`dwItem1` and `dwItem2` are not used and must be `NULL`" — the event
+/// says *"associations changed"*, not *"this one file changed"*, so there is no
+/// item to name. `SHCNF_IDLIST` (`0`) is the flag the docs pair with it: the
+/// flags word tells `SHChangeNotify` how to INTERPRET `dwItem1`/`dwItem2`, and
+/// `SHCNF_IDLIST` means "they are PIDLs". Two null PIDLs is the well-formed way
+/// to say "no item", and it is the pairing the documented `SHCNE_ASSOCCHANGED`
+/// usage (and every shell-integration implementation that follows it) uses. The
+/// `PATH`/`PRINTER` flag variants would promise string or printer arguments we
+/// are not passing, so they are wrong here even though the pointers are null
+/// either way.
+///
+/// ## It is fire-and-forget — there is no success to report
+///
+/// `SHChangeNotify` returns `()`. It sets no last-error, gives no handle, and
+/// hands the event to the shell's own notification queue, which delivers it to
+/// listeners asynchronously. **Whether Explorer actually refreshed is not
+/// observable from this process**, so this function has no return value and no
+/// caller can branch on whether it "worked" — inventing a boolean here would be
+/// a fabricated success signal, not a measurement.
+pub fn notify_assoc_changed() {
+    // SAFETY: `SHChangeNotify` with `SHCNE_ASSOCCHANGED` takes no item
+    // arguments — MS documents `dwItem1`/`dwItem2` as unused and required to be
+    // NULL for this event — so nothing is borrowed, owned, aliased, or required
+    // to outlive the call, and there is no buffer for the callee to write into.
+    // The other two arguments are compile-time constants. The cast is
+    // width-safe: `SHCNE_ASSOCCHANGED` is `0x0800_0000` (134_217_728), well
+    // inside `i32::MAX`, and only exists because windows-sys types the constant
+    // as `u32` while the parameter is `i32`.
+    unsafe {
+        SHChangeNotify(
+            SHCNE_ASSOCCHANGED as i32,
+            SHCNF_IDLIST,
+            std::ptr::null(),
+            std::ptr::null(),
+        );
     }
 }
 
@@ -852,6 +896,24 @@ mod tests {
     fn os_reduced_motion_query_runs() {
         let v = os_reduced_motion();
         assert!(v == v, "returns a definite bool");
+    }
+
+    /// Smoke: the association-change broadcast links against the real
+    /// `shell32.dll` export and completes without panicking or aborting.
+    ///
+    /// This is the CEILING of what is testable here, and it is deliberately not
+    /// dressed up as more. `SHChangeNotify` returns nothing and sets no
+    /// last-error, so there is no success to assert: this proves the symbol
+    /// resolves and the null-PIDL + `SHCNF_IDLIST` argument shape is accepted,
+    /// NOT that Explorer refreshed. The DECISION of when to call it is tested
+    /// where it lives, in `scribe-app`'s `windows_entries::shell_notify_tests`.
+    ///
+    /// It does fire a real event at the host shell. That is harmless and
+    /// self-healing — an association re-read changes no state of ours — and it
+    /// is the only way to exercise the shipped call rather than a stand-in.
+    #[test]
+    fn notify_assoc_changed_reaches_the_real_shell_export() {
+        notify_assoc_changed();
     }
 
     fn rect(left: i32, top: i32, right: i32, bottom: i32) -> RECT {

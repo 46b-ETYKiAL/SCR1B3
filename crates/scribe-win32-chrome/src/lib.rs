@@ -74,6 +74,12 @@
 //! need a rendered frame on the target OS; this crate's tests prove the inputs
 //! to those behaviours are correct, not the behaviours themselves.
 //!
+//! [`notify_assoc_changed`] belongs to that second list, and unusually it is
+//! unverifiable even WITH a real window: `SHChangeNotify` returns nothing, so
+//! whether the shell received or acted on the event is not observable from this
+//! process at all. Its caller tests the DECISION (notify iff a registration
+//! actually landed); nothing tests the refresh.
+//!
 //! ## Extensions: Snap Layouts, system menu, rounded corners, backdrop
 //!
 //! Everything above is unchanged. Layered on top:
@@ -108,8 +114,10 @@
 //!
 //! ## Call-site status (honest inventory)
 //!
-//! `scribe-app` currently calls [`ensure_caption_stripped`], [`set_main_hwnd`]
-//! and [`allow_foreground_handoff`]. Inside this crate,
+//! `scribe-app` currently calls [`ensure_caption_stripped`], [`set_main_hwnd`],
+//! [`allow_foreground_handoff`] and — from
+//! `scribe-app/src/integration/windows_entries.rs`, after a registration pass
+//! that actually landed — [`notify_assoc_changed`]. Inside this crate,
 //! [`apply_rounded_corners`] and the backdrop push are called from
 //! `imp::ensure_borderless`, so they run on the app's existing per-frame call.
 //!
@@ -433,6 +441,41 @@ pub fn set_backdrop(backdrop: Backdrop) {
 #[cfg(not(windows))]
 pub fn set_backdrop(_backdrop: Backdrop) {}
 
+// ---------------------------------------------------------------------------
+// Shell notification: "file associations changed"
+// ---------------------------------------------------------------------------
+
+/// Tell the Windows shell that this app's file associations changed, so Explorer
+/// re-reads them instead of serving stale icons and verbs.
+///
+/// Registering associations writes registry keys; it does not tell the shell to
+/// look at them. Until something invalidates the shell's cached association
+/// data, Explorer can keep showing the previous icon and the previous
+/// "Open with" entry for a type SCR1B3 has just claimed. `SHCNE_ASSOCCHANGED`
+/// is the documented invalidation. (`scribe-app` used to get this refresh only
+/// as a SIDE EFFECT of deep-linking the user into the Default Apps window; the
+/// SILENT startup re-registration got no refresh at all.)
+///
+/// **Fire-and-forget: there is no success to report.** The underlying
+/// `SHChangeNotify` returns nothing, sets no last-error, and hands the event to
+/// the shell's asynchronous notification queue — so whether Explorer actually
+/// refreshed is NOT observable from this process. This returns `()`, and no
+/// caller can branch on whether it "worked"; a boolean here would be a
+/// fabricated success signal. See `imp::notify_assoc_changed` for the
+/// flag/null-pointer rationale.
+///
+/// Windows-only; a no-op everywhere else.
+// The Windows body is RE-EXPORTED from `imp` rather than wrapped here, for the
+// reason recorded on `STUBS_THAT_MUST_STAY_GATED`: a `#[cfg(windows)] pub fn`
+// wrapper would need a name-keyed mutation pardon, and re-exporting instead puts
+// the definition inside `imp.rs`, which is already excluded as a whole file.
+#[cfg(windows)]
+pub use imp::notify_assoc_changed;
+
+/// No-op on non-Windows platforms (there is no Windows shell to notify).
+#[cfg(not(windows))]
+pub fn notify_assoc_changed() {}
+
 /// The Windows-only implementation, in its own file so a single `#[cfg(windows)]`
 /// governs all of it — see `imp.rs` for why that matters to the mutation gate.
 #[cfg(windows)]
@@ -470,18 +513,30 @@ mod tests {
         "set_backdrop",
     ];
 
-    /// The `#[cfg(not(windows))]` stubs. These ARE compiled on the ubuntu
-    /// runner, so their mutants are real signal and must never be excluded —
-    /// `off_windows_the_query_stubs_answer_false` is what kills them.
+    /// The `#[cfg(not(windows))]` stubs whose Windows halves are RE-EXPORTS
+    /// (`#[cfg(windows)] pub use imp::NAME;`) rather than wrappers, so they are
+    /// deliberately absent from [`MUTATION_EXCLUDED_WRAPPERS`]. Two distinct
+    /// reasons put a name here, and both end in the same structure:
     ///
-    /// Their Windows halves are RE-EXPORTS (`#[cfg(windows)] pub use imp::NAME;`),
-    /// NOT wrappers, so they are deliberately absent from
-    /// [`MUTATION_EXCLUDED_WRAPPERS`]. That is the whole point: a name-keyed
-    /// exclusion cannot tell a vacuous `#[cfg(windows)]` wrapper from the REAL
-    /// stub that shares its name, so excluding these two by name would have
-    /// silenced mutants that are currently CAUGHT. Re-exporting puts the
-    /// Windows definition inside the already-excluded `imp.rs` instead.
-    const STUBS_THAT_MUST_STAY_GATED: [&str; 2] = ["os_reduced_motion", "maximize_button_hovered"];
+    /// * `os_reduced_motion` / `maximize_button_hovered` return a REAL value, so
+    ///   the stub IS compiled on the ubuntu runner and its mutants are real
+    ///   signal that `off_windows_the_query_stubs_answer_false` kills. A
+    ///   name-keyed exclusion cannot tell a vacuous `#[cfg(windows)]` wrapper
+    ///   from the real stub sharing its name, so excluding them by name would
+    ///   have silenced mutants that are currently CAUGHT.
+    /// * `notify_assoc_changed` returns `()` and its stub body is EMPTY, so it
+    ///   generates no mutant of its own — but a `#[cfg(windows)]` wrapper would
+    ///   have needed a new name-keyed pardon in `.cargo/mutants.toml`.
+    ///   Re-exporting needs none: the definition lands inside `imp.rs`, which is
+    ///   already excluded as a whole file. Fewer pardons, same coverage.
+    ///
+    /// Either way the Windows definition lives in the already-excluded `imp.rs`
+    /// and the exclusion surface does not grow.
+    const STUBS_THAT_MUST_STAY_GATED: [&str; 3] = [
+        "os_reduced_motion",
+        "maximize_button_hovered",
+        "notify_assoc_changed",
+    ];
 
     /// Every `#[cfg(..)]` attribute governing a top-level `fn <name>` in `src`.
     ///
@@ -613,9 +668,10 @@ mod tests {
         let windows_gated = src.lines().filter(|l| *l == "#[cfg(windows)]").count();
         let stub_gated = src.lines().filter(|l| *l == "#[cfg(not(windows))]").count();
         assert_eq!(
-            stub_gated, 12,
-            "the number of off-Windows stubs changed; each new one carries a \
-             REAL mutant that needs a killing assertion in this module"
+            stub_gated, 13,
+            "the number of off-Windows stubs changed; each new one that returns \
+             a REAL value carries a mutant that needs a killing assertion in \
+             this module (an EMPTY `-> ()` stub body generates none)"
         );
         // Every `#[cfg(windows)]` in this file is accounted for by exactly one of
         // three roles, so a NEW one cannot appear without failing here:

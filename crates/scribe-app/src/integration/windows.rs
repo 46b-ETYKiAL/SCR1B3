@@ -5,8 +5,9 @@
 //! first-class choice) and deep-link the user to the Default Apps UI to confirm.
 
 use super::windows_entries::{
-    append_cleanup_note, delete_error_is_benign, registry_entries, summarize, unregister_entries,
-    FailedWrite, RegDelete, RegEntry, APP_NAME, APP_ROOT, CLASS_ROOT,
+    append_cleanup_note, delete_error_is_benign, notify_shell_after_registration, registry_entries,
+    summarize, unregister_entries, FailedWrite, RegDelete, RegEntry, APP_NAME, APP_ROOT,
+    CLASS_ROOT,
 };
 use super::RegisterReport;
 use scribe_core::config::ClaimType;
@@ -124,7 +125,7 @@ pub(crate) fn register_under(
     let message = append_cleanup_note(outcome.message, cleanup_failures.len());
     let mut failed: Vec<(String, String)> = failures.into_iter().map(|f| (f.key, f.err)).collect();
     failed.extend(cleanup_failures);
-    RegisterReport {
+    let report = RegisterReport {
         // Only ask the user to finish in the Default Apps UI if something
         // actually registered; sending them there after a total failure would
         // show them an app that isn't listed.
@@ -132,7 +133,24 @@ pub(crate) fn register_under(
         registered: outcome.registered,
         failed,
         message,
-    }
+    };
+
+    // Writing the keys does not make the shell LOOK at them. Until the shell is
+    // told, Explorer can keep serving the previous icon and "Open with" entry
+    // for a type SCR1B3 has just claimed. Deep-linking the user to the Default
+    // Apps window (the `register` path below) happened to force that re-read as
+    // a side effect; the SILENT startup refresh never opens that window, so it
+    // got no re-read at all. Notify here so both paths converge — and only when
+    // a claim actually landed, so a failed or empty pass broadcasts nothing.
+    // Fire-and-forget: nothing here can observe whether the shell acted. The
+    // notifier is passed in rather than reached for inside the seam so the seam
+    // stays testable with a local sink (see its doc).
+    notify_shell_after_registration(
+        &report.registered,
+        scribe_win32_chrome::notify_assoc_changed,
+    );
+
+    report
 }
 
 /// Register without opening the Default Apps window. Used by the startup

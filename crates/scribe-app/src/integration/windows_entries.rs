@@ -507,6 +507,218 @@ pub(crate) fn summarize(requested: &[ClaimType], failures: &[FailedWrite]) -> Re
     }
 }
 
+/// PURE: whether a finished registration pass warrants telling the shell to
+/// re-read file associations.
+///
+/// The rule is the honest one already used for `needs_user_action`: the shell is
+/// told only when at least one claim ACTUALLY registered. `registered` is empty
+/// when nothing was requested, when the shared app-level keys failed (so no
+/// per-type claim can be called registered), and when every requested claim's
+/// writes failed — i.e. exactly the cases where nothing the shell caches has
+/// changed and a broadcast would be noise.
+///
+/// ## The gap this deliberately does NOT paper over
+///
+/// A pure UNREGISTER — `register_under` called with no claimed types, so the
+/// pass is all removals — does not notify, because `reg.exe delete` exits
+/// successfully both when it removed a key and when the key was already absent
+/// (see `apply_delete`'s benign-error handling). "A removal actually landed" is
+/// therefore not observable from this side, and firing on every removal sweep
+/// would broadcast on every launch of a machine that was never registered.
+/// Registering an empty claim set is reported honestly rather than assumed.
+pub(crate) fn should_notify_shell(registered: &[String]) -> bool {
+    !registered.is_empty()
+}
+
+/// Ask the shell to re-read file associations, but only when
+/// [`should_notify_shell`] says the pass changed something. Returns whether it
+/// dispatched.
+///
+/// This is the wiring seam, kept here (rather than inline in the executor) for
+/// two reasons: this module compiles and is tested on EVERY host, and unlike
+/// `windows.rs` it is not excluded from the mutation gate — so both the decision
+/// and the dispatch stay under test.
+///
+/// `notify` is INJECTED, following `assoc_stamp::startup_refresh` (which takes
+/// the registrar as a closure) and `reporting::log_outcome_with`. Production
+/// passes `scribe_win32_chrome::notify_assoc_changed`; a test passes a local
+/// counting sink. The alternative — a process-global dispatch counter the test
+/// reads before and after — is fragile by construction under a parallel test
+/// runner: a sibling can bump a global between the read and the assert, and no
+/// amount of locking inside this function closes that window. Injection removes
+/// the shared state instead of guarding it, so the count a test observes is its
+/// own and cannot be perturbed.
+///
+/// The return value reports the DECISION, never the outcome:
+/// `scribe_win32_chrome::notify_assoc_changed` is fire-and-forget (the
+/// underlying `SHChangeNotify` returns nothing and reports no error), so
+/// whether the shell actually refreshed cannot be known here. `true` means
+/// "we told the shell", not "the shell listened".
+pub(crate) fn notify_shell_after_registration(
+    registered: &[String],
+    notify: impl FnOnce(),
+) -> bool {
+    if !should_notify_shell(registered) {
+        return false;
+    }
+    notify();
+    true
+}
+
+#[cfg(test)]
+mod shell_notify_tests {
+    use super::*;
+
+    use std::cell::Cell;
+
+    fn keys(k: &[&str]) -> Vec<String> {
+        k.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn nothing_registered_means_nothing_to_tell_the_shell() {
+        assert!(
+            !should_notify_shell(&[]),
+            "an empty `registered` set is the honest signal for 'nothing \
+             landed' — a total write failure, a shared-key failure, and an \
+             empty request all produce it, and none of them changed anything \
+             the shell caches"
+        );
+    }
+
+    #[test]
+    fn a_landed_claim_means_the_shell_must_re_read() {
+        assert!(
+            should_notify_shell(&keys(&["plain_text"])),
+            "one claim registering is enough: the shell is caching the OLD \
+             handler for that type until it is told otherwise"
+        );
+        assert!(
+            should_notify_shell(&keys(&["plain_text", "markdown"])),
+            "several claims landing is still one association change"
+        );
+    }
+
+    /// The wiring test. Cutting the `notify()` call out of
+    /// [`notify_shell_after_registration`] leaves the return value intact but
+    /// stops the sink firing, and this fails.
+    ///
+    /// The sink is a test-LOCAL [`Cell`], so the count is owned by this test
+    /// alone: no other test — in this module or anywhere else in the binary —
+    /// can perturb it, and it is correct under any degree of parallelism
+    /// without a lock.
+    ///
+    /// What it proves: the dispatch happens exactly when a registration landed,
+    /// and does NOT happen when nothing did. What it cannot prove — on any host,
+    /// by any means — is that the shell received or acted on the event;
+    /// `SHChangeNotify` returns nothing (see `scribe_win32_chrome`).
+    #[test]
+    fn the_shell_is_told_exactly_when_a_registration_landed() {
+        let fired = Cell::new(0_usize);
+        let sink = || fired.set(fired.get() + 1);
+
+        assert!(
+            !notify_shell_after_registration(&[], sink),
+            "a pass that registered nothing must report that it did not notify"
+        );
+        assert_eq!(
+            fired.get(),
+            0,
+            "a pass that registered nothing must not dispatch a shell \
+             notification — no association changed, so a broadcast is noise"
+        );
+
+        assert!(
+            notify_shell_after_registration(&keys(&["plain_text"]), sink),
+            "a landed registration must report that it notified"
+        );
+        assert_eq!(
+            fired.get(),
+            1,
+            "a landed registration must dispatch exactly ONE shell \
+             notification — this is the wire between the registry write and \
+             Explorer re-reading it"
+        );
+
+        assert!(notify_shell_after_registration(&keys(&["markdown"]), sink));
+        assert_eq!(
+            fired.get(),
+            2,
+            "each landed pass notifies once; the dispatch must not latch after \
+             the first"
+        );
+    }
+
+    /// The remaining link an injected sink cannot see: `register_under` lives in
+    /// `windows.rs`, which needs a real `reg.exe` + `HKCU` to run and is
+    /// excluded from both the mutation gate and CI. So three things are asserted
+    /// against the source itself — that the executor calls this seam AT ALL,
+    /// that it passes the report's own `registered` list rather than something
+    /// that always notifies, and that the sink it injects is the REAL
+    /// `scribe_win32_chrome::notify_assoc_changed` and not a stub.
+    ///
+    /// Weaker than the sink assertion above and deliberately labelled as such:
+    /// it proves the call is written in the right function, not that it
+    /// executed. It exists so silently deleting the call site fails something
+    /// instead of nothing.
+    #[test]
+    fn the_executor_calls_the_seam_from_register_under() {
+        // ALL whitespace removed, not merely collapsed. rustfmt wraps this call
+        // across four lines, which inserts a space after `(` AND a trailing
+        // comma before `)` — a collapse-to-single-space normalisation still
+        // missed it and read as "the call is gone". Stripping whitespace
+        // entirely makes the guard indifferent to how rustfmt lays the call out.
+        fn flat(s: &str) -> String {
+            s.split_whitespace().collect()
+        }
+
+        // Every needle goes through `flat` too — the source has no whitespace
+        // left in it, so a needle that kept its spaces could never match.
+        let src = flat(include_str!("windows.rs"));
+        let (before_register_under, from_register_under) =
+            src.split_once(&flat("fn register_under(")).expect(
+                "`register_under` is the registration executor; if it was \
+                 renamed, re-point this guard at the new name",
+            );
+        let body = from_register_under
+            .split_once(&flat("fn register_silent("))
+            .expect(
+                "`register_silent` follows `register_under`; if the order \
+                 changed, re-point this guard at the next item",
+            )
+            .0;
+
+        // The CALL form with its arguments, not the bare name. The bare name
+        // also appears in the module's `use` list (above `register_under`), and
+        // pinning the arguments is what proves the executor passes its OWN
+        // `registered` list and injects the REAL FFI notifier rather than a
+        // stub. The CLOSING paren is deliberately left off the needle so a
+        // rustfmt-inserted trailing comma does not break the match.
+        let call = flat(
+            "notify_shell_after_registration(&report.registered, \
+             scribe_win32_chrome::notify_assoc_changed",
+        );
+        assert!(
+            body.contains(&call),
+            "`register_under` no longer calls `{call}`. Without it the registry \
+             is written and the shell is never told, which is exactly the \
+             stale-icon bug this seam exists to fix — and the sink test above \
+             still passes, because it calls the seam directly"
+        );
+        assert!(
+            !before_register_under.contains(&call),
+            "the shell notification moved above `register_under`; it must fire \
+             AFTER a pass, on that pass's own `registered` list"
+        );
+        assert_eq!(
+            src.matches(&call).count(),
+            1,
+            "the notification must be dispatched from exactly ONE place in the \
+             executor — a second call site would broadcast twice per pass"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
