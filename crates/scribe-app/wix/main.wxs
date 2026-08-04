@@ -62,6 +62,377 @@
                 Action="set"
                 System="no" />
             </Component>
+
+            <!--
+              File associations (HKCU, per-user, no admin).
+
+              GENERATED from the app's own registry_entries builder and pinned by
+              wix_installer_registers_what_the_app_registers in
+              src/integration/mod.rs: the installer and the in-app registration
+              write the SAME key/name/value set, so a fresh MSI leaves SCR1B3
+              already present in Open-with and Default Apps instead of doing
+              nothing until the user visits Settings. Because these rows are
+              authored by the MSI they are also REMOVED on uninstall, which the
+              app's own runtime writes never are.
+
+              The exe path is the [APPLICATIONFOLDER] property token; the app
+              writes the identical keys with the resolved absolute path, so the
+              two converge rather than conflict. Do not hand-edit: regenerate and
+              let the drift test confirm parity.
+            -->
+            <Component Id="FileAssociations" Guid="*">
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities" Name="ApplicationName" Value="SCR1B3" Type="string" KeyPath="yes" />
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities" Name="ApplicationDescription" Value="Fast, telemetry-free code &amp; text editor." Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\RegisteredApplications" Name="SCR1B3" Value="Software\SCR1B3\Capabilities" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe" Name="FriendlyAppName" Value="SCR1B3" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe\shell\open\command" Value="&quot;[APPLICATIONFOLDER]scr1b3.exe&quot; &quot;%1&quot;" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\*\shell\SCR1B3" Value="Edit with SCR1B3" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\*\shell\SCR1B3" Name="Icon" Value="[APPLICATIONFOLDER]scr1b3.exe,0" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\*\shell\SCR1B3\command" Value="&quot;[APPLICATIONFOLDER]scr1b3.exe&quot; &quot;%1&quot;" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\SCR1B3.txt\shell\open\command" Value="&quot;[APPLICATIONFOLDER]scr1b3.exe&quot; &quot;%1&quot;" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\SCR1B3.txt\DefaultIcon" Value="[APPLICATIONFOLDER]scr1b3.exe,0" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\SCR1B3.txt" Value="SCR1B3 document" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.txt\OpenWithProgids" Name="SCR1B3.txt" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities\FileAssociations" Name=".txt" Value="SCR1B3.txt" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe\SupportedTypes" Name=".txt" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.txt" Name="PerceivedType" Value="text" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.text\OpenWithProgids" Name="SCR1B3.txt" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities\FileAssociations" Name=".text" Value="SCR1B3.txt" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe\SupportedTypes" Name=".text" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.text" Name="PerceivedType" Value="text" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.log\OpenWithProgids" Name="SCR1B3.txt" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities\FileAssociations" Name=".log" Value="SCR1B3.txt" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe\SupportedTypes" Name=".log" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.log" Name="PerceivedType" Value="text" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.nfo\OpenWithProgids" Name="SCR1B3.txt" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities\FileAssociations" Name=".nfo" Value="SCR1B3.txt" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe\SupportedTypes" Name=".nfo" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.nfo" Name="PerceivedType" Value="text" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\SCR1B3.md\shell\open\command" Value="&quot;[APPLICATIONFOLDER]scr1b3.exe&quot; &quot;%1&quot;" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\SCR1B3.md\DefaultIcon" Value="[APPLICATIONFOLDER]scr1b3.exe,0" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\SCR1B3.md" Value="SCR1B3 document" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.md\OpenWithProgids" Name="SCR1B3.md" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities\FileAssociations" Name=".md" Value="SCR1B3.md" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe\SupportedTypes" Name=".md" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.md" Name="PerceivedType" Value="text" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.markdown\OpenWithProgids" Name="SCR1B3.md" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities\FileAssociations" Name=".markdown" Value="SCR1B3.md" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe\SupportedTypes" Name=".markdown" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.markdown" Name="PerceivedType" Value="text" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.mdown\OpenWithProgids" Name="SCR1B3.md" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities\FileAssociations" Name=".mdown" Value="SCR1B3.md" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe\SupportedTypes" Name=".mdown" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.mdown" Name="PerceivedType" Value="text" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.mkd\OpenWithProgids" Name="SCR1B3.md" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities\FileAssociations" Name=".mkd" Value="SCR1B3.md" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe\SupportedTypes" Name=".mkd" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.mkd" Name="PerceivedType" Value="text" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.mdx\OpenWithProgids" Name="SCR1B3.md" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities\FileAssociations" Name=".mdx" Value="SCR1B3.md" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe\SupportedTypes" Name=".mdx" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.mdx" Name="PerceivedType" Value="text" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\SCR1B3.json\shell\open\command" Value="&quot;[APPLICATIONFOLDER]scr1b3.exe&quot; &quot;%1&quot;" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\SCR1B3.json\DefaultIcon" Value="[APPLICATIONFOLDER]scr1b3.exe,0" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\SCR1B3.json" Value="SCR1B3 document" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.json\OpenWithProgids" Name="SCR1B3.json" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities\FileAssociations" Name=".json" Value="SCR1B3.json" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe\SupportedTypes" Name=".json" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.json" Name="PerceivedType" Value="text" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.jsonc\OpenWithProgids" Name="SCR1B3.json" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities\FileAssociations" Name=".jsonc" Value="SCR1B3.json" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe\SupportedTypes" Name=".jsonc" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.jsonc" Name="PerceivedType" Value="text" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.json5\OpenWithProgids" Name="SCR1B3.json" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities\FileAssociations" Name=".json5" Value="SCR1B3.json" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe\SupportedTypes" Name=".json5" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.json5" Name="PerceivedType" Value="text" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\SCR1B3.config\shell\open\command" Value="&quot;[APPLICATIONFOLDER]scr1b3.exe&quot; &quot;%1&quot;" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\SCR1B3.config\DefaultIcon" Value="[APPLICATIONFOLDER]scr1b3.exe,0" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\SCR1B3.config" Value="SCR1B3 document" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.toml\OpenWithProgids" Name="SCR1B3.config" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities\FileAssociations" Name=".toml" Value="SCR1B3.config" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe\SupportedTypes" Name=".toml" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.toml" Name="PerceivedType" Value="text" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.yaml\OpenWithProgids" Name="SCR1B3.config" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities\FileAssociations" Name=".yaml" Value="SCR1B3.config" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe\SupportedTypes" Name=".yaml" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.yaml" Name="PerceivedType" Value="text" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.yml\OpenWithProgids" Name="SCR1B3.config" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities\FileAssociations" Name=".yml" Value="SCR1B3.config" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe\SupportedTypes" Name=".yml" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.yml" Name="PerceivedType" Value="text" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.ini\OpenWithProgids" Name="SCR1B3.config" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities\FileAssociations" Name=".ini" Value="SCR1B3.config" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe\SupportedTypes" Name=".ini" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.ini" Name="PerceivedType" Value="text" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.cfg\OpenWithProgids" Name="SCR1B3.config" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities\FileAssociations" Name=".cfg" Value="SCR1B3.config" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe\SupportedTypes" Name=".cfg" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.cfg" Name="PerceivedType" Value="text" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.conf\OpenWithProgids" Name="SCR1B3.config" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities\FileAssociations" Name=".conf" Value="SCR1B3.config" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe\SupportedTypes" Name=".conf" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.conf" Name="PerceivedType" Value="text" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.csv\OpenWithProgids" Name="SCR1B3.config" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities\FileAssociations" Name=".csv" Value="SCR1B3.config" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe\SupportedTypes" Name=".csv" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.csv" Name="PerceivedType" Value="text" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.tsv\OpenWithProgids" Name="SCR1B3.config" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities\FileAssociations" Name=".tsv" Value="SCR1B3.config" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe\SupportedTypes" Name=".tsv" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.tsv" Name="PerceivedType" Value="text" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.xml\OpenWithProgids" Name="SCR1B3.config" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities\FileAssociations" Name=".xml" Value="SCR1B3.config" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe\SupportedTypes" Name=".xml" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.xml" Name="PerceivedType" Value="text" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.env\OpenWithProgids" Name="SCR1B3.config" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities\FileAssociations" Name=".env" Value="SCR1B3.config" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe\SupportedTypes" Name=".env" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.env" Name="PerceivedType" Value="text" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.properties\OpenWithProgids" Name="SCR1B3.config" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities\FileAssociations" Name=".properties" Value="SCR1B3.config" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe\SupportedTypes" Name=".properties" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.properties" Name="PerceivedType" Value="text" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.editorconfig\OpenWithProgids" Name="SCR1B3.config" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities\FileAssociations" Name=".editorconfig" Value="SCR1B3.config" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe\SupportedTypes" Name=".editorconfig" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.editorconfig" Name="PerceivedType" Value="text" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\SCR1B3.source\shell\open\command" Value="&quot;[APPLICATIONFOLDER]scr1b3.exe&quot; &quot;%1&quot;" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\SCR1B3.source\DefaultIcon" Value="[APPLICATIONFOLDER]scr1b3.exe,0" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\SCR1B3.source" Value="SCR1B3 document" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.rs\OpenWithProgids" Name="SCR1B3.source" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities\FileAssociations" Name=".rs" Value="SCR1B3.source" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe\SupportedTypes" Name=".rs" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.rs" Name="PerceivedType" Value="text" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.c\OpenWithProgids" Name="SCR1B3.source" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities\FileAssociations" Name=".c" Value="SCR1B3.source" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe\SupportedTypes" Name=".c" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.c" Name="PerceivedType" Value="text" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.h\OpenWithProgids" Name="SCR1B3.source" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities\FileAssociations" Name=".h" Value="SCR1B3.source" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe\SupportedTypes" Name=".h" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.h" Name="PerceivedType" Value="text" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.cpp\OpenWithProgids" Name="SCR1B3.source" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities\FileAssociations" Name=".cpp" Value="SCR1B3.source" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe\SupportedTypes" Name=".cpp" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.cpp" Name="PerceivedType" Value="text" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.cc\OpenWithProgids" Name="SCR1B3.source" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities\FileAssociations" Name=".cc" Value="SCR1B3.source" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe\SupportedTypes" Name=".cc" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.cc" Name="PerceivedType" Value="text" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.cxx\OpenWithProgids" Name="SCR1B3.source" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities\FileAssociations" Name=".cxx" Value="SCR1B3.source" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe\SupportedTypes" Name=".cxx" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.cxx" Name="PerceivedType" Value="text" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.hpp\OpenWithProgids" Name="SCR1B3.source" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities\FileAssociations" Name=".hpp" Value="SCR1B3.source" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe\SupportedTypes" Name=".hpp" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.hpp" Name="PerceivedType" Value="text" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.hh\OpenWithProgids" Name="SCR1B3.source" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities\FileAssociations" Name=".hh" Value="SCR1B3.source" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe\SupportedTypes" Name=".hh" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.hh" Name="PerceivedType" Value="text" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.py\OpenWithProgids" Name="SCR1B3.source" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities\FileAssociations" Name=".py" Value="SCR1B3.source" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe\SupportedTypes" Name=".py" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.py" Name="PerceivedType" Value="text" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.pyi\OpenWithProgids" Name="SCR1B3.source" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities\FileAssociations" Name=".pyi" Value="SCR1B3.source" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe\SupportedTypes" Name=".pyi" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.pyi" Name="PerceivedType" Value="text" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.js\OpenWithProgids" Name="SCR1B3.source" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities\FileAssociations" Name=".js" Value="SCR1B3.source" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe\SupportedTypes" Name=".js" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.js" Name="PerceivedType" Value="text" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.mjs\OpenWithProgids" Name="SCR1B3.source" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities\FileAssociations" Name=".mjs" Value="SCR1B3.source" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe\SupportedTypes" Name=".mjs" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.mjs" Name="PerceivedType" Value="text" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.cjs\OpenWithProgids" Name="SCR1B3.source" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities\FileAssociations" Name=".cjs" Value="SCR1B3.source" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe\SupportedTypes" Name=".cjs" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.cjs" Name="PerceivedType" Value="text" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.ts\OpenWithProgids" Name="SCR1B3.source" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities\FileAssociations" Name=".ts" Value="SCR1B3.source" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe\SupportedTypes" Name=".ts" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.ts" Name="PerceivedType" Value="text" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.tsx\OpenWithProgids" Name="SCR1B3.source" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities\FileAssociations" Name=".tsx" Value="SCR1B3.source" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe\SupportedTypes" Name=".tsx" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.tsx" Name="PerceivedType" Value="text" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.jsx\OpenWithProgids" Name="SCR1B3.source" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities\FileAssociations" Name=".jsx" Value="SCR1B3.source" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe\SupportedTypes" Name=".jsx" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.jsx" Name="PerceivedType" Value="text" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.go\OpenWithProgids" Name="SCR1B3.source" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities\FileAssociations" Name=".go" Value="SCR1B3.source" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe\SupportedTypes" Name=".go" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.go" Name="PerceivedType" Value="text" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.java\OpenWithProgids" Name="SCR1B3.source" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities\FileAssociations" Name=".java" Value="SCR1B3.source" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe\SupportedTypes" Name=".java" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.java" Name="PerceivedType" Value="text" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.rb\OpenWithProgids" Name="SCR1B3.source" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities\FileAssociations" Name=".rb" Value="SCR1B3.source" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe\SupportedTypes" Name=".rb" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.rb" Name="PerceivedType" Value="text" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.php\OpenWithProgids" Name="SCR1B3.source" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities\FileAssociations" Name=".php" Value="SCR1B3.source" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe\SupportedTypes" Name=".php" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.php" Name="PerceivedType" Value="text" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.sh\OpenWithProgids" Name="SCR1B3.source" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities\FileAssociations" Name=".sh" Value="SCR1B3.source" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe\SupportedTypes" Name=".sh" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.sh" Name="PerceivedType" Value="text" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.bash\OpenWithProgids" Name="SCR1B3.source" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities\FileAssociations" Name=".bash" Value="SCR1B3.source" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe\SupportedTypes" Name=".bash" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.bash" Name="PerceivedType" Value="text" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.zsh\OpenWithProgids" Name="SCR1B3.source" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities\FileAssociations" Name=".zsh" Value="SCR1B3.source" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe\SupportedTypes" Name=".zsh" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.zsh" Name="PerceivedType" Value="text" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.ps1\OpenWithProgids" Name="SCR1B3.source" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities\FileAssociations" Name=".ps1" Value="SCR1B3.source" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe\SupportedTypes" Name=".ps1" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.ps1" Name="PerceivedType" Value="text" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.bat\OpenWithProgids" Name="SCR1B3.source" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities\FileAssociations" Name=".bat" Value="SCR1B3.source" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe\SupportedTypes" Name=".bat" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.bat" Name="PerceivedType" Value="text" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.cmd\OpenWithProgids" Name="SCR1B3.source" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities\FileAssociations" Name=".cmd" Value="SCR1B3.source" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe\SupportedTypes" Name=".cmd" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.cmd" Name="PerceivedType" Value="text" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.css\OpenWithProgids" Name="SCR1B3.source" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities\FileAssociations" Name=".css" Value="SCR1B3.source" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe\SupportedTypes" Name=".css" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.css" Name="PerceivedType" Value="text" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.scss\OpenWithProgids" Name="SCR1B3.source" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities\FileAssociations" Name=".scss" Value="SCR1B3.source" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe\SupportedTypes" Name=".scss" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.scss" Name="PerceivedType" Value="text" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.sass\OpenWithProgids" Name="SCR1B3.source" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities\FileAssociations" Name=".sass" Value="SCR1B3.source" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe\SupportedTypes" Name=".sass" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.sass" Name="PerceivedType" Value="text" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.less\OpenWithProgids" Name="SCR1B3.source" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities\FileAssociations" Name=".less" Value="SCR1B3.source" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe\SupportedTypes" Name=".less" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.less" Name="PerceivedType" Value="text" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.html\OpenWithProgids" Name="SCR1B3.source" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities\FileAssociations" Name=".html" Value="SCR1B3.source" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe\SupportedTypes" Name=".html" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.html" Name="PerceivedType" Value="text" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.htm\OpenWithProgids" Name="SCR1B3.source" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities\FileAssociations" Name=".htm" Value="SCR1B3.source" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe\SupportedTypes" Name=".htm" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.htm" Name="PerceivedType" Value="text" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.vue\OpenWithProgids" Name="SCR1B3.source" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities\FileAssociations" Name=".vue" Value="SCR1B3.source" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe\SupportedTypes" Name=".vue" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.vue" Name="PerceivedType" Value="text" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.svelte\OpenWithProgids" Name="SCR1B3.source" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities\FileAssociations" Name=".svelte" Value="SCR1B3.source" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe\SupportedTypes" Name=".svelte" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.svelte" Name="PerceivedType" Value="text" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.lua\OpenWithProgids" Name="SCR1B3.source" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities\FileAssociations" Name=".lua" Value="SCR1B3.source" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe\SupportedTypes" Name=".lua" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.lua" Name="PerceivedType" Value="text" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.sql\OpenWithProgids" Name="SCR1B3.source" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities\FileAssociations" Name=".sql" Value="SCR1B3.source" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe\SupportedTypes" Name=".sql" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.sql" Name="PerceivedType" Value="text" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.kt\OpenWithProgids" Name="SCR1B3.source" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities\FileAssociations" Name=".kt" Value="SCR1B3.source" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe\SupportedTypes" Name=".kt" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.kt" Name="PerceivedType" Value="text" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.kts\OpenWithProgids" Name="SCR1B3.source" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities\FileAssociations" Name=".kts" Value="SCR1B3.source" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe\SupportedTypes" Name=".kts" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.kts" Name="PerceivedType" Value="text" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.swift\OpenWithProgids" Name="SCR1B3.source" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities\FileAssociations" Name=".swift" Value="SCR1B3.source" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe\SupportedTypes" Name=".swift" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.swift" Name="PerceivedType" Value="text" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.dart\OpenWithProgids" Name="SCR1B3.source" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities\FileAssociations" Name=".dart" Value="SCR1B3.source" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe\SupportedTypes" Name=".dart" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.dart" Name="PerceivedType" Value="text" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.zig\OpenWithProgids" Name="SCR1B3.source" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities\FileAssociations" Name=".zig" Value="SCR1B3.source" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe\SupportedTypes" Name=".zig" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.zig" Name="PerceivedType" Value="text" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.pl\OpenWithProgids" Name="SCR1B3.source" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities\FileAssociations" Name=".pl" Value="SCR1B3.source" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe\SupportedTypes" Name=".pl" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.pl" Name="PerceivedType" Value="text" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.pm\OpenWithProgids" Name="SCR1B3.source" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities\FileAssociations" Name=".pm" Value="SCR1B3.source" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe\SupportedTypes" Name=".pm" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.pm" Name="PerceivedType" Value="text" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.r\OpenWithProgids" Name="SCR1B3.source" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities\FileAssociations" Name=".r" Value="SCR1B3.source" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe\SupportedTypes" Name=".r" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.r" Name="PerceivedType" Value="text" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.jl\OpenWithProgids" Name="SCR1B3.source" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities\FileAssociations" Name=".jl" Value="SCR1B3.source" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe\SupportedTypes" Name=".jl" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.jl" Name="PerceivedType" Value="text" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.ex\OpenWithProgids" Name="SCR1B3.source" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities\FileAssociations" Name=".ex" Value="SCR1B3.source" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe\SupportedTypes" Name=".ex" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.ex" Name="PerceivedType" Value="text" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.exs\OpenWithProgids" Name="SCR1B3.source" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities\FileAssociations" Name=".exs" Value="SCR1B3.source" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe\SupportedTypes" Name=".exs" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.exs" Name="PerceivedType" Value="text" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.erl\OpenWithProgids" Name="SCR1B3.source" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities\FileAssociations" Name=".erl" Value="SCR1B3.source" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe\SupportedTypes" Name=".erl" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.erl" Name="PerceivedType" Value="text" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.hs\OpenWithProgids" Name="SCR1B3.source" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities\FileAssociations" Name=".hs" Value="SCR1B3.source" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe\SupportedTypes" Name=".hs" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.hs" Name="PerceivedType" Value="text" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.scala\OpenWithProgids" Name="SCR1B3.source" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities\FileAssociations" Name=".scala" Value="SCR1B3.source" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe\SupportedTypes" Name=".scala" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.scala" Name="PerceivedType" Value="text" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.clj\OpenWithProgids" Name="SCR1B3.source" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities\FileAssociations" Name=".clj" Value="SCR1B3.source" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe\SupportedTypes" Name=".clj" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.clj" Name="PerceivedType" Value="text" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.vim\OpenWithProgids" Name="SCR1B3.source" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities\FileAssociations" Name=".vim" Value="SCR1B3.source" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe\SupportedTypes" Name=".vim" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.vim" Name="PerceivedType" Value="text" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.asm\OpenWithProgids" Name="SCR1B3.source" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities\FileAssociations" Name=".asm" Value="SCR1B3.source" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe\SupportedTypes" Name=".asm" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.asm" Name="PerceivedType" Value="text" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.s\OpenWithProgids" Name="SCR1B3.source" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities\FileAssociations" Name=".s" Value="SCR1B3.source" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe\SupportedTypes" Name=".s" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.s" Name="PerceivedType" Value="text" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.cmake\OpenWithProgids" Name="SCR1B3.source" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities\FileAssociations" Name=".cmake" Value="SCR1B3.source" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe\SupportedTypes" Name=".cmake" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.cmake" Name="PerceivedType" Value="text" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.gradle\OpenWithProgids" Name="SCR1B3.source" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities\FileAssociations" Name=".gradle" Value="SCR1B3.source" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe\SupportedTypes" Name=".gradle" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.gradle" Name="PerceivedType" Value="text" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.tf\OpenWithProgids" Name="SCR1B3.source" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities\FileAssociations" Name=".tf" Value="SCR1B3.source" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe\SupportedTypes" Name=".tf" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.tf" Name="PerceivedType" Value="text" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.proto\OpenWithProgids" Name="SCR1B3.source" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\SCR1B3\Capabilities\FileAssociations" Name=".proto" Value="SCR1B3.source" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\Applications\scr1b3.exe\SupportedTypes" Name=".proto" Value="" Type="string" KeyPath="no" />
+              <RegistryValue Root="HKCU" Key="Software\Classes\.proto" Name="PerceivedType" Value="text" Type="string" KeyPath="no" />
+            </Component>
           </Directory>
         </Directory>
       </Directory>
@@ -92,6 +463,7 @@
       Display="expand"
       Absent="disallow">
       <ComponentRef Id="MainExecutable" />
+      <ComponentRef Id="FileAssociations" />
       <ComponentRef Id="StartMenuShortcut" />
     </Feature>
 

@@ -51,6 +51,8 @@ mod macos;
 mod windows;
 
 #[cfg(any(test, windows))]
+pub(crate) mod assoc_stamp;
+#[cfg(any(test, windows))]
 pub(crate) mod windows_entries;
 
 /// Register SCR1B3 as a handler for `types` and, where the OS permits, set it as
@@ -101,6 +103,19 @@ fn startup_reregister_types(opted_in: bool, claimed: &[ClaimType]) -> bool {
 /// Windows-only in effect: on Linux the associations live in the package-managed
 /// `.desktop` file and on macOS in the app bundle's `Info.plist`, neither of which
 /// a per-launch call should churn, so this is a no-op there.
+///
+/// Two properties this deliberately has, both absent before:
+///
+/// - **It converges.** The work is skipped outright when nothing has changed,
+///   via the persisted stamp in [`assoc_stamp`]. Previously every launch rewrote
+///   all 182 byte-identical values; the surfaces added alongside this would have
+///   made that 351 writes plus the removal sweep, so converging is what keeps the
+///   more complete registration from being a much larger regression.
+/// - **It is OFF the main thread.** Each value is a synchronous `reg.exe` spawn,
+///   so running the set inline delayed the first frame by seconds — the same
+///   freeze the Settings path already moved to a worker to avoid. The thread is
+///   detached: nothing depends on its result, and a process that exits before it
+///   finishes simply leaves the stamp unwritten and retries next launch.
 pub fn reregister_on_startup(config: &scribe_core::config::IntegrationConfig) {
     let types = config.claimed_types();
     if !startup_reregister_types(config.register_file_types, &types) {
@@ -108,23 +123,46 @@ pub fn reregister_on_startup(config: &scribe_core::config::IntegrationConfig) {
     }
     #[cfg(windows)]
     {
-        let report = windows::register_silent(&types);
-        if report.failed.is_empty() {
-            tracing::debug!(
-                target: "scribe::integration",
-                count = report.registered.len(),
-                "refreshed file associations at startup"
-            );
-        } else {
-            // A failed silent re-register is not fatal — the user can re-run it
-            // from Settings. Record it so a persistent failure is diagnosable
-            // rather than silently swallowed.
+        use windows_entries::{APP_NAME, APP_ROOT, CLASS_ROOT};
+
+        let Some(exe) = std::env::current_exe()
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned())
+        else {
             tracing::warn!(
                 target: "scribe::integration",
-                failures = report.failed.len(),
-                "startup file-association refresh had failures"
+                "the running program path is unavailable; skipping the startup refresh"
             );
-        }
+            return;
+        };
+        let config_dir = scribe_core::Config::config_dir();
+        std::thread::spawn(move || {
+            // `register_under` is called with the SAME `exe` the stamp is
+            // computed from, so the stamp can never describe a registration
+            // performed against a different path.
+            let outcome = assoc_stamp::startup_refresh(config_dir.as_deref(), &exe, &types, |t| {
+                windows::register_under(t, &exe, CLASS_ROOT, APP_ROOT, APP_NAME)
+            });
+            match outcome {
+                assoc_stamp::StartupOutcome::AlreadyCurrent => tracing::debug!(
+                    target: "scribe::integration",
+                    "file associations already current; no registry work performed"
+                ),
+                assoc_stamp::StartupOutcome::Registered { count } => tracing::debug!(
+                    target: "scribe::integration",
+                    count,
+                    "refreshed file associations at startup"
+                ),
+                // A failed silent re-register is not fatal — the user can re-run
+                // it from Settings. Record it so a persistent failure is
+                // diagnosable rather than silently swallowed.
+                assoc_stamp::StartupOutcome::Failed { failures } => tracing::warn!(
+                    target: "scribe::integration",
+                    failures,
+                    "startup file-association refresh had failures"
+                ),
+            }
+        });
     }
     #[cfg(not(windows))]
     {
@@ -172,6 +210,77 @@ mod packaging_consistency_tests {
 
     const DESKTOP: &str = include_str!("../../../../packaging/linux/scr1b3.desktop");
     const INFO_PLIST: &str = include_str!("../../../../packaging/macos/Info.plist");
+    const WXS: &str = include_str!("../../wix/main.wxs");
+
+    /// The exe path the MSI writes: the install directory as a WiX property
+    /// token. `exe_file_name` understands the `]` terminator, so the generated
+    /// `Applications\scr1b3.exe` key matches the one the app writes at runtime.
+    const WIX_EXE: &str = "[APPLICATIONFOLDER]scr1b3.exe";
+
+    fn unescape_xml_attr(s: &str) -> String {
+        // `&amp;` LAST: doing it first would turn `&amp;quot;` into a quote.
+        s.replace("&quot;", "\"")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&amp;", "&")
+    }
+
+    /// Every `<RegistryValue>` in the .wxs as `(key, name, value)`, with `name`
+    /// empty for the key's default value (the attribute is omitted there, which
+    /// is exactly how [`super::windows_entries::RegEntry`] spells it too).
+    ///
+    /// A deliberately small hand parser rather than an XML dependency: the file
+    /// is generated in one shape, and the alternative was adding a dev-dependency
+    /// to read six attributes.
+    fn wxs_registry_rows() -> Vec<(String, String, String)> {
+        let mut out = Vec::new();
+        for chunk in WXS.split("<RegistryValue").skip(1) {
+            let el = &chunk[..chunk
+                .find("/>")
+                .expect("an unterminated RegistryValue element")];
+            let key = wxs_attr(el, "Key").expect("RegistryValue without a Key");
+            out.push((
+                key,
+                wxs_attr(el, "Name").unwrap_or_default(),
+                wxs_attr(el, "Value").expect("RegistryValue without a Value"),
+            ));
+        }
+        out
+    }
+
+    /// Read one attribute out of a `<RegistryValue …>` element body.
+    ///
+    /// The needle's LEADING SPACE anchors the match to an attribute boundary.
+    /// Note honestly what that does and does not buy, because the first version
+    /// of this comment claimed a bug it cannot actually have: it does NOT stop
+    /// `Key` matching inside `KeyPath`, since `Key="` requires `=` immediately
+    /// after `Key` and `KeyPath="` has `P` there — removing the space is an
+    /// EQUIVALENT mutation for this element grammar (verified by mutation:
+    /// dropping it leaves the whole suite green). Nor can `X="` occur inside an
+    /// attribute VALUE, because a raw `"` cannot appear in well-formed XML.
+    /// It is kept as cheap anchoring against a future attribute whose name ENDS
+    /// with another's (`Name` inside a hypothetical `FriendlyName`), which is the
+    /// one case that would genuinely mis-parse.
+    ///
+    /// The part that IS load-bearing is the unescape ORDER in
+    /// [`unescape_xml_attr`], pinned by `wxs_attr_reads_attributes_and_unescapes_
+    /// entities_in_the_right_order`.
+    fn wxs_attr(el: &str, name: &str) -> Option<String> {
+        let needle = format!(" {name}=\"");
+        let start = el.find(&needle)? + needle.len();
+        let end = start + el[start..].find('"')?;
+        Some(unescape_xml_attr(&el[start..end]))
+    }
+
+    /// Rows the association contract owns. The installer also writes an
+    /// unrelated `Software\ItashaCorp\SCR1B3\installed` marker as the Start-Menu
+    /// component's KeyPath, which is not an association and must not be dragged
+    /// into the comparison.
+    fn is_association_row(key: &str) -> bool {
+        key.starts_with("Software\\Classes")
+            || key.starts_with("Software\\SCR1B3")
+            || key == "Software\\RegisteredApplications"
+    }
 
     #[test]
     fn linux_desktop_declares_every_claimed_mime() {
@@ -200,6 +309,145 @@ mod packaging_consistency_tests {
                 );
             }
         }
+    }
+
+    /// The `.wxs` attribute reader must pick the right attribute and unescape
+    /// entities in the right ORDER.
+    ///
+    /// The drift test's whole value depends on this helper: if it silently
+    /// misreads, both directions of the comparison degrade into comparing
+    /// nonsense against nonsense and still pass. The `&amp;`-LAST ordering is the
+    /// real trap — unescaping `&amp;` first rewrites `&amp;quot;` into `&quot;`
+    /// and then into a quote, corrupting any value that legitimately contains the
+    /// TEXT `&quot;`. The value below carries exactly that sequence, so the
+    /// ordering is genuinely exercised rather than merely asserted.
+    #[test]
+    fn wxs_attr_reads_attributes_and_unescapes_entities_in_the_right_order() {
+        let el = concat!(
+            r#" Root="HKCU" KeyPath="yes" Key="Software\Classes\.txt" "#,
+            r#"Name="SCR1B3.txt" Value="&amp;quot; &amp; &quot;q&quot; &lt;x&gt;" Type="string" "#
+        );
+        assert_eq!(
+            wxs_attr(el, "Key").as_deref(),
+            Some("Software\\Classes\\.txt"),
+            "a `Key` needle must not read the `KeyPath` attribute"
+        );
+        assert_eq!(wxs_attr(el, "KeyPath").as_deref(), Some("yes"));
+        assert_eq!(wxs_attr(el, "Name").as_deref(), Some("SCR1B3.txt"));
+        assert_eq!(
+            wxs_attr(el, "Value").as_deref(),
+            Some("&quot; & \"q\" <x>"),
+            "`&amp;` must be unescaped LAST, or `&amp;quot;` collapses to a quote"
+        );
+        assert_eq!(wxs_attr(el, "Absent"), None);
+    }
+
+    /// The MSI must register EXACTLY what the app registers — no more, no less.
+    ///
+    /// Unlike `scr1b3.desktop` and `Info.plist`, which were already pinned here,
+    /// the `.wxs` was pinned by nothing: it wrote a single `installed=1` marker
+    /// and no associations at all, so a fresh MSI install left SCR1B3 absent from
+    /// Open-with and Default Apps until the user found the Settings button. The
+    /// fix is only half the work — without this test the installer table and the
+    /// runtime builder would drift apart silently the first time a surface is
+    /// added to one of them.
+    ///
+    /// Checked in BOTH directions on purpose. Forwards alone would pass while the
+    /// installer wrote extra keys the app never writes and therefore never
+    /// removes; backwards alone would pass with an installer that registers
+    /// nothing.
+    #[test]
+    fn wix_installer_registers_what_the_app_registers() {
+        let expected = super::windows_entries::registry_entries(
+            &ClaimType::ALL,
+            WIX_EXE,
+            super::windows_entries::CLASS_ROOT,
+            super::windows_entries::APP_ROOT,
+            super::windows_entries::APP_NAME,
+        );
+        let rows = wxs_registry_rows();
+        assert!(
+            rows.len() > 300,
+            "the parser found only {} RegistryValue rows — it is not reading the \
+             file (a silently-empty parse would make every assertion below vacuous)",
+            rows.len()
+        );
+
+        let actual: Vec<(String, String, String)> = rows
+            .into_iter()
+            .filter(|(k, _, _)| is_association_row(k))
+            .collect();
+
+        for e in &expected {
+            let want = (e.key.clone(), e.name.clone(), e.data.clone());
+            assert!(
+                actual.contains(&want),
+                "wix/main.wxs does not register what the app registers — missing \
+                 RegistryValue Key={:?} Name={:?} Value={:?}. Regenerate the \
+                 FileAssociations component from registry_entries.",
+                e.key,
+                e.name,
+                e.data
+            );
+        }
+        for row in &actual {
+            assert!(
+                expected
+                    .iter()
+                    .any(|e| e.key == row.0 && e.name == row.1 && e.data == row.2),
+                "wix/main.wxs registers something the app does not, so nothing \
+                 ever rewrites or removes it: Key={:?} Name={:?} Value={:?}",
+                row.0,
+                row.1,
+                row.2
+            );
+        }
+        assert_eq!(
+            actual.len(),
+            expected.len(),
+            "the installer and the app must write the same NUMBER of association \
+             values (duplicates in the .wxs would pass both directions above)"
+        );
+    }
+
+    /// The component carrying the association rows must actually be installed.
+    /// A `<Component>` that no `<Feature>` references is compiled into the MSI
+    /// and never installed — the table would exist and do nothing, which is the
+    /// same "registers nothing" outcome with a passing parity test.
+    #[test]
+    fn the_file_association_component_is_referenced_by_the_installed_feature() {
+        assert!(
+            WXS.contains("<Component Id=\"FileAssociations\""),
+            "the FileAssociations component is gone"
+        );
+        assert!(
+            WXS.contains("<ComponentRef Id=\"FileAssociations\" />"),
+            "the FileAssociations component is not referenced by any Feature, so \
+             the MSI would install none of its registry values"
+        );
+    }
+
+    /// The `.wxs` exe token must be the install-directory property, not a path
+    /// baked at authoring time. A literal path would install associations
+    /// pointing at whatever machine generated the file.
+    #[test]
+    fn the_installer_registers_the_install_directory_executable() {
+        let rows = wxs_registry_rows();
+        let cmd = rows
+            .iter()
+            .find(|(k, _, _)| k == "Software\\Classes\\SCR1B3.txt\\shell\\open\\command")
+            .expect("the .txt ProgID open command");
+        assert_eq!(
+            cmd.2,
+            format!("\"{WIX_EXE}\" \"%1\""),
+            "the installer's open command must use the [APPLICATIONFOLDER] token"
+        );
+        assert!(
+            rows.iter()
+                .any(|(k, _, _)| k == "Software\\Classes\\Applications\\scr1b3.exe"),
+            "the Applications key must resolve to the bare exe name, not the \
+             property token — exe_file_name's `]` rule is what guarantees that"
+        );
     }
 
     /// The CI mutation gate EXCLUDES `integration/windows.rs`, and this is the

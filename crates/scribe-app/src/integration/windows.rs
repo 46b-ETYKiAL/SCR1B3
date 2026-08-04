@@ -4,7 +4,10 @@
 //! `OpenWithProgids` + `Capabilities` + `RegisteredApplications` (making SCR1B3 a
 //! first-class choice) and deep-link the user to the Default Apps UI to confirm.
 
-use super::windows_entries::{registry_entries, summarize, FailedWrite, RegEntry};
+use super::windows_entries::{
+    append_cleanup_note, delete_error_is_benign, registry_entries, summarize, unregister_entries,
+    FailedWrite, RegDelete, RegEntry, APP_NAME, APP_ROOT, CLASS_ROOT,
+};
 use super::RegisterReport;
 use scribe_core::config::ClaimType;
 use std::os::windows::process::CommandExt;
@@ -45,6 +48,35 @@ pub(crate) fn apply_entry(e: &RegEntry) -> Result<(), String> {
     }
 }
 
+/// Apply one [`RegDelete`] via `reg.exe delete` under `HKCU`.
+///
+/// An ALREADY-ABSENT key or value is success: `reg.exe` exits non-zero for it,
+/// but "there was nothing to remove" is exactly the outcome an unregister wants,
+/// and treating it as an error would make every clean run report hundreds of
+/// bogus failures and stop the startup stamp ever being written.
+pub(crate) fn apply_delete(d: &RegDelete) -> Result<(), String> {
+    let full_key = format!("HKCU\\{}", d.key);
+    let mut cmd = Command::new("reg");
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    cmd.arg("delete").arg(&full_key);
+    if let Some(name) = &d.name {
+        cmd.args(["/v", name.as_str()]);
+    }
+    cmd.arg("/f");
+    let out = cmd
+        .output()
+        .map_err(|err| format!("reg.exe unavailable: {err}"))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    if delete_error_is_benign(&err) {
+        Ok(())
+    } else {
+        Err(err)
+    }
+}
+
 /// Apply every entry registering `types` under the given roots. Factored out so
 /// the `#[ignore]` integration test can target a throwaway subtree instead of
 /// real `Software\Classes`.
@@ -71,17 +103,35 @@ pub(crate) fn register_under(
             });
         }
     }
+
+    // Registration is a DESIRED-STATE sync, not an append. Removals run AFTER
+    // the writes so an interrupted run leaves SCR1B3 over-registered (harmless,
+    // and self-heals next launch) rather than half-unregistered.
+    let mut cleanup_failures: Vec<(String, String)> = Vec::new();
+    for d in unregister_entries(types, exe, class_root, app_root) {
+        if let Err(err) = apply_delete(&d) {
+            cleanup_failures.push((d.key.clone(), err));
+        }
+    }
+
     // The message + the registered set are DERIVED from what actually landed —
-    // never a hardcoded success string (see `summarize`).
+    // never a hardcoded success string (see `summarize`). Cleanup failures are
+    // deliberately NOT folded into `summarize`: a stale entry we could not
+    // remove does not mean the claim failed to register, and pretending it did
+    // would under-report a registration that actually landed. They are appended
+    // to the message and listed in `failed` so nothing is hidden.
     let outcome = summarize(types, &failures);
+    let message = append_cleanup_note(outcome.message, cleanup_failures.len());
+    let mut failed: Vec<(String, String)> = failures.into_iter().map(|f| (f.key, f.err)).collect();
+    failed.extend(cleanup_failures);
     RegisterReport {
         // Only ask the user to finish in the Default Apps UI if something
         // actually registered; sending them there after a total failure would
         // show them an app that isn't listed.
         needs_user_action: !outcome.registered.is_empty(),
         registered: outcome.registered,
-        failed: failures.into_iter().map(|f| (f.key, f.err)).collect(),
-        message: outcome.message,
+        failed,
+        message,
     }
 }
 
@@ -99,13 +149,7 @@ pub fn register_silent(types: &[ClaimType]) -> RegisterReport {
             ..Default::default()
         };
     };
-    register_under(
-        types,
-        &exe,
-        "Software\\Classes",
-        "Software\\SCR1B3",
-        "SCR1B3",
-    )
+    register_under(types, &exe, CLASS_ROOT, APP_ROOT, APP_NAME)
 }
 
 pub fn register(types: &[ClaimType]) -> RegisterReport {
