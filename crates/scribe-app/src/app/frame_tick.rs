@@ -71,7 +71,9 @@ pub(super) mod motion_test_hook {
 /// [`crate::app::commands::BuiltinCommand`] into, to be drained + dispatched a
 /// frame later where `self` is mutable (the menu closure runs while the
 /// highlighter borrows `self`).
-fn editor_ctx_cmd_id() -> egui::Id {
+/// `pub(super)` so the GRID pane's own right-click menu (`grid_methods`) stashes
+/// into the SAME slot the single-pane menu uses — one drain contract, not two.
+pub(super) fn editor_ctx_cmd_id() -> egui::Id {
     egui::Id::new("scr1b3_editor_ctx_menu_cmd")
 }
 
@@ -103,7 +105,9 @@ pub(super) enum EditorMode {
 impl EditorMode {
     /// Map the widget's own report of which buffer variant it walked. This is
     /// the first non-test consumer of `RopeEditorResponse::buffer_mode`.
-    fn from_buffer_mode(mode: &scribe_render::BufferModeSeen) -> Self {
+    /// `pub(super)` because the grid pane path renders the SAME widget and must
+    /// report the same distinction (`grid_methods`).
+    pub(super) fn from_buffer_mode(mode: &scribe_render::BufferModeSeen) -> Self {
         match mode {
             scribe_render::BufferModeSeen::Rope => Self::Rope,
             scribe_render::BufferModeSeen::Mmap => Self::RopeMmap,
@@ -123,24 +127,67 @@ impl EditorMode {
 
     /// The explanation shown on hover — names the trade-off, so the badge is
     /// self-describing rather than an unexplained acronym.
+    ///
+    /// The rope wording used to name FOUR unavailable features (breadcrumbs,
+    /// sticky scroll, spellcheck overlay, completion popup). That was a
+    /// substantial under-report: the rope branch `return`s before the whole
+    /// remainder of the `TextEdit` body, so roughly a dozen MORE conveniences
+    /// die with it — every galley-driven overlay, every caret op that needs the
+    /// `TextEditState`, multi-cursor, and the app-drawn gutter decorations. A
+    /// badge whose explanation lists a quarter of the damage is barely better
+    /// than no badge, so the list below is the real one.
     pub(super) fn hover(self) -> &'static str {
         match self {
             Self::Standard => "Standard editor — all editing features available",
             Self::Rope => {
                 "Large-file editor: this buffer is past the rope-editor size threshold, so it \
-                 renders through the in-house viewport-culled editor. Editing, undo and find \
-                 work; TextEdit-only conveniences (breadcrumbs, sticky scroll, spellcheck \
-                 overlay, completion popup) are unavailable."
+                 renders through the in-house viewport-culled editor. Still working: typing, \
+                 undo/redo, find, line numbers, whitespace markers, snippets. Unavailable \
+                 here: breadcrumbs, sticky scroll, spellcheck underlines, the completion \
+                 popup, the find highlight-all wash, the right-click menu, multi-cursor \
+                 (Ctrl+D / Ctrl+click / Alt+drag column select), the markdown caret chords and \
+                 palette caret ops (bold, italic, inline code, strikethrough, task toggle, \
+                 format table, change case, insert date/time, duplicate selection, jump to \
+                 matching bracket), auto-indent on Enter, auto-pair, list Tab/Shift+Tab, smart \
+                 paste (URL to link), clickable URLs, indent guides, column rulers, the \
+                 trailing-whitespace tint, the current-line highlight, bracket-match boxes, \
+                 selection-occurrence boxes, the Block/Underline caret style, the status-bar \
+                 Ln/Col and selection counters, and the gutter's bookmark dots and change bars."
             }
             Self::RopeMmap => {
                 "Large-file editor on a memory-mapped buffer — read-only until the file is \
-                 loaded into a rope."
+                 loaded into a rope. Everything the ROPE badge lists as unavailable is \
+                 unavailable here too, and editing is disabled on top of that."
             }
             Self::ReadOnlyLarge => {
                 "Read-only browse: this file is past the hard size cap, so it opens read-only \
-                 for O(viewport) navigation. Editing is disabled."
+                 for O(viewport) navigation. Editing is disabled, and so is every \
+                 TextEdit-only convenience the ROPE badge lists (overlays, caret ops, \
+                 multi-cursor, the right-click menu, completion and spellcheck)."
             }
             Self::Fold => "Folded preview — read-only projection. Exit folds to edit.",
+        }
+    }
+
+    /// The one-shot toast raised when the editor SWAPS into this surface, or
+    /// `None` for a surface the user asked for explicitly.
+    ///
+    /// The rope swap past `rope_editor_auto_threshold_bytes` is the only
+    /// transition the user never requested and cannot predict: they type past
+    /// 16 MiB and a dozen features stop responding. The badge alone is a passive,
+    /// four-letter signal that has to be HOVERED to explain itself, so a user who
+    /// does not already know it exists gets no explanation at all. `Fold` and
+    /// `ReadOnlyLarge` are deliberately silent — folding is an explicit user
+    /// action, and the read-only browse already prints its own
+    /// "[ large file: read-only ]" segment next to the badge.
+    pub(super) fn entry_notice(self) -> Option<&'static str> {
+        match self {
+            Self::Rope | Self::RopeMmap => Some(
+                "This file crossed the large-file threshold, so SCR1B3 switched to the \
+                 viewport-culled editor to stay responsive. Editing, undo and find still \
+                 work — hover the mode badge in the status bar for what is unavailable.",
+            ),
+            Self::Standard | Self::ReadOnlyLarge | Self::Fold => None,
         }
     }
 }
@@ -152,9 +199,37 @@ fn editor_mode_id() -> egui::Id {
     egui::Id::new("scr1b3_active_editor_mode")
 }
 
-/// Publish the surface that just rendered. Every editor path calls this, so the
-/// badge can never go stale on a tab switch or a mode change.
-fn publish_editor_mode(ctx: &egui::Context, mode: EditorMode) {
+/// ctx-data slot holding the one-shot notice queued by [`publish_editor_mode`]
+/// on a real transition INTO a degraded surface, drained by
+/// [`ScribeApp::drain_editor_mode_notice`] where `self` is mutable again.
+fn editor_mode_notice_id() -> egui::Id {
+    egui::Id::new("scr1b3_editor_mode_notice")
+}
+
+/// Publish the surface that just rendered.
+///
+/// Every editor path MUST call this: the status bar reads the published value
+/// and would otherwise keep rendering the PREVIOUS surface's badge forever. The
+/// doc comment here used to assert that every path already did — it did not.
+/// `render_grid_central_panel` (the split / multi-note grid) published nothing,
+/// so switching into grid view left whatever the last single-pane frame had
+/// published frozen on screen: open a 20 MiB file, flip on the grid, and the
+/// status bar still claimed ROPE while a full-feature `TextEdit` was rendering
+/// — the exact "silent and misleading" state the badge exists to prevent. The
+/// grid path now publishes too, and `grid_publishes_the_active_panes_mode` /
+/// `grid_badge_clears_when_the_active_pane_is_a_small_buffer` pin it so the
+/// claim in this comment stays true.
+///
+/// On a real transition into an unrequested degraded surface it also queues
+/// [`EditorMode::entry_notice`], so the swap is announced once instead of only
+/// being discoverable by hovering a four-letter badge.
+pub(super) fn publish_editor_mode(ctx: &egui::Context, mode: EditorMode) {
+    let prev: Option<EditorMode> = ctx.data(|d| d.get_temp(editor_mode_id()));
+    if prev != Some(mode) {
+        if let Some(notice) = mode.entry_notice() {
+            ctx.data_mut(|d| d.insert_temp(editor_mode_notice_id(), notice.to_string()));
+        }
+    }
     ctx.data_mut(|d| d.insert_temp(editor_mode_id(), mode));
 }
 
@@ -301,6 +376,22 @@ impl ScribeApp {
     /// cannot self-invalidate on a family change; this explicit drop is the only
     /// signal. (Bug: changing the app UI font silently rebuilt the atlas and the
     /// note text rendered from the stale galley.)
+    /// Move a queued editor-mode entry notice (see [`publish_editor_mode`]) onto
+    /// the toast line. Called once per frame AFTER the central panel, which is
+    /// the first point at which `self` is mutable again — the publish sites all
+    /// sit inside closures that hold a borrow of `self.hl` or `self.tabs`.
+    pub(super) fn drain_editor_mode_notice(&mut self, ctx: &egui::Context) {
+        let queued = ctx.data_mut(|d| {
+            let id = editor_mode_notice_id();
+            let v = d.get_temp::<String>(id);
+            d.remove::<String>(id);
+            v
+        });
+        if let Some(msg) = queued {
+            self.toast = Some(msg);
+        }
+    }
+
     pub(super) fn invalidate_galley_caches(&self) {
         *self.hl_cache.borrow_mut() = None;
         *self.hl_galley_cache.borrow_mut() = None;
@@ -2602,19 +2693,16 @@ impl ScribeApp {
                 // so they run here — after the editor stored its state this
                 // frame — and `store` takes effect next frame.
                 if !read_only {
-                    if act.jump_bracket || std::mem::take(&mut self.pending_jump_bracket) {
-                        self.jump_matching_bracket(ctx, editor_id, active);
-                    }
-                    if std::mem::take(&mut self.pending_insert_datetime) {
-                        self.insert_datetime_at_caret(ctx, editor_id, active);
-                    }
-                    if std::mem::take(&mut self.pending_dup_selection) {
-                        self.duplicate_selection(ctx, editor_id, active);
+                    // The keyboard chord and the `pending_*` latch are the same
+                    // request; fold the chord into the latch so ONE drain applies
+                    // every caret op.
+                    if act.jump_bracket {
+                        self.pending_jump_bracket = true;
                     }
                     // A right-click context-menu command stashed in ctx-data on a
                     // previous frame (it couldn't run inside the editor closure
                     // while the highlighter borrowed `self`) — dispatch it now so
-                    // its pending_* flag is applied by the drains just below.
+                    // its pending_* flag is applied by the drain just below.
                     if let Some(cmd) = ctx.data_mut(|d| {
                         let id = editor_ctx_cmd_id();
                         let v = d.get_temp::<crate::app::commands::BuiltinCommand>(id);
@@ -2624,19 +2712,11 @@ impl ScribeApp {
                         self.execute_builtin(cmd);
                     }
                     // Note-usability caret ops (palette + chord) — P0-1 / P0-4 /
-                    // P1-4 / P2-1.
-                    if std::mem::take(&mut self.pending_toggle_task) {
-                        self.toggle_task_checkbox_active(ctx, editor_id, active);
-                    }
-                    if let Some(marker) = self.pending_wrap_marker.take() {
-                        self.wrap_selection_active(ctx, editor_id, active, marker);
-                    }
-                    if let Some(op) = self.pending_case.take() {
-                        self.case_selection_active(ctx, editor_id, active, op);
-                    }
-                    if std::mem::take(&mut self.pending_format_table) {
-                        self.format_table_active(ctx, editor_id, active);
-                    }
+                    // P1-4 / P2-1. Shared with the grid pane path so the two
+                    // surfaces can never drift into two different drain sets (the
+                    // grid drained NONE of them, so every one of these latched
+                    // forever in split view).
+                    self.apply_pending_caret_ops(ctx, editor_id, active);
                 }
 
                 // #78 — misspellings for the active buffer, computed (memoized)
@@ -3655,6 +3735,12 @@ impl ScribeApp {
                 }
             });
         }
+
+        // An unrequested swap into a degraded editor queues a one-shot notice
+        // (see `publish_editor_mode`). Drain it HERE — the first point after the
+        // central panel where `self` is mutable again — so the swap is announced
+        // rather than only being discoverable by hovering the status-bar badge.
+        self.drain_editor_mode_notice(ctx);
 
         // Window color-tint overlay (subtle wash; portable across modes/OSes).
         if self.config.window.tint_strength > 0.0 {

@@ -2360,6 +2360,9 @@ mod find_in_files_tests;
 mod grid_pane_tests;
 
 #[cfg(test)]
+mod grid_parity_tests;
+
+#[cfg(test)]
 mod filetree_tests;
 
 #[cfg(test)]
