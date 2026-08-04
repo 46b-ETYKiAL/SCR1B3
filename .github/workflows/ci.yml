@@ -653,3 +653,261 @@ jobs:
               raise SystemExit("::error::shipped binary is missing mitigations: " + "; ".join(missing))
           print("binary hardening OK:", "; ".join(required.values()))
           PY
+
+  msi-build:
+    # Compile the Windows installer source. Before this job NOTHING in the repo
+    # ever ran WiX: `crates/scribe-app/wix/main.wxs` had never been compiled by
+    # CI or locally (there is no WiX toolchain on the dev host, and the shipped
+    # Windows artifact is the F0RG3-W1R3 native CRT .exe built by release.yml,
+    # not this MSI). A 351-row HKCU registry table was added to it validated
+    # only for XML well-formedness -- so a schema-valid-but-WiX-invalid edit, a
+    # duplicate Component Id, a dangling ComponentRef, or an illegal registry
+    # Root value would all have shipped green.
+    #
+    # This job also makes the in-tree drift test
+    # (integration::packaging_consistency_tests::
+    #  wix_installer_registers_what_the_app_registers, which asserts main.wxs's
+    # table equals the app's `registry_entries`) verified end-to-end rather than
+    # assumed: that test parses the .wxs as TEXT. Here the same table is
+    # compiled into a real MSI and read back out of the built package, so "the
+    # source text matches" is upgraded to "the installer that would actually
+    # ship carries those rows".
+    name: Windows installer (.msi) compile
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    env:
+      # WiX 3.x is required (main.wxs uses the wix/2006/wi namespace, which WiX
+      # 4/5 do not accept). Pinned to a release asset + SHA-256 rather than
+      # relying on whatever the runner image happens to preinstall, so a runner
+      # image change cannot silently swap the compiler under the gate.
+      WIX_URL: "https://github.com/wixtoolset/wix3/releases/download/wix3141rtm/wix314-binaries.zip"
+      WIX_SHA256: "6ac824e1642d6f7277d0ed7ea09411a508f6116ba6fae0aa5f2c7daa2ff43d31"
+      # Non-vacuity floor for the compiled registry table. Mirrors the
+      # `rows.len() > 300` floor the Rust drift test uses, for the same reason:
+      # a silently-empty compile would make every other assertion here
+      # trivially true.
+      REGISTRY_ROW_FLOOR: "300"
+    steps:
+      - name: Harden the runner (egress audit)
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          # Pinned for reproducible CI; bump in lockstep with rust-toolchain.toml.
+          toolchain: "1.95.0"
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Build the release binary the installer packages
+        shell: bash
+        # main.wxs embeds $(var.CargoTargetBinDir)\scr1b3.exe, so the exe must
+        # exist before `light` can build the cab. Building it for real (rather
+        # than stubbing a placeholder file) keeps the compiled MSI the same
+        # artifact a release would produce.
+        run: cargo build --locked --release --package scribe-app
+      - name: Install WiX 3.14 (pinned + checksum-verified)
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -sSLf -o wix314-binaries.zip "$WIX_URL"
+          # Verify BEFORE extracting: an unverified archive is never unpacked.
+          echo "${WIX_SHA256}  wix314-binaries.zip" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/wix"
+          # Git-Bash on the Windows image does not reliably ship `unzip`, and
+          # 7z's presence is an image detail, so try each and fail loudly rather
+          # than let a missing extractor look like a missing WiX.
+          if command -v unzip >/dev/null 2>&1; then
+            unzip -q -o wix314-binaries.zip -d "$RUNNER_TEMP/wix"
+          elif command -v 7z >/dev/null 2>&1; then
+            7z x -y -o"$RUNNER_TEMP/wix" wix314-binaries.zip > /dev/null
+          else
+            echo "::error::no archive extractor available (tried unzip, 7z)"
+            exit 1
+          fi
+          for t in candle.exe light.exe dark.exe; do
+            [ -f "$RUNNER_TEMP/wix/$t" ] || { echo "::error::WiX archive did not contain $t"; exit 1; }
+          done
+          "$RUNNER_TEMP/wix/candle.exe" -? | head -2
+      - name: Compile the installer source (candle)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # `cargo pkgid` rather than `cargo metadata | jq`: jq's presence on the
+          # runner image is an incidental detail, and pkgid needs no parser.
+          # It prints `...#0.4.62` (or `...#scribe-app@0.4.62`); the version is
+          # whatever follows the last `#` or `@` in either form.
+          VER="$(cargo pkgid --offline -p scribe-app | sed -E 's/.*[#@]//')"
+          # WiX requires x.x.x.x with each field <= 65534, so a non-numeric or
+          # empty version must stop here rather than reach candle as garbage.
+          echo "$VER" | grep -qE '^[0-9]+(\.[0-9]+){1,3}$' \
+            || { echo "::error::could not resolve a numeric scribe-app version (got '$VER')"; exit 1; }
+          echo "installer version = $VER"
+          # Windows-style dir for the $(var.CargoTargetBinDir)\scr1b3.exe join.
+          BIN_DIR="$(pwd -W)/target/release"
+          [ -f "target/release/scr1b3.exe" ] || { echo "::error::target/release/scr1b3.exe missing"; exit 1; }
+          "$RUNNER_TEMP/wix/candle.exe" -nologo -arch x64 \
+            -dVersion="$VER" -dCargoTargetBinDir="$BIN_DIR" \
+            -out main.wixobj crates/scribe-app/wix/main.wxs
+          [ -s main.wixobj ] || { echo "::error::candle reported success but produced no .wixobj"; exit 1; }
+      - name: Link the installer (light, with ICE validation)
+        shell: bash
+        # ICE validation stays ON. Exactly three ICEs are suppressed, and only
+        # these three -- each is a known false positive for a per-user
+        # (InstallScope="perUser") MSI, which is what this installer is by
+        # design (no admin / no UAC, so the in-app updater can swap the binary
+        # in place; see the header comment in main.wxs):
+        #   ICE38 -- "component installs to user profile, KeyPath must be an
+        #            HKCU registry value, not a file". Written for per-machine
+        #            packages; a per-user package legitimately uses a file
+        #            KeyPath under LOCALAPPDATA.
+        #   ICE64 -- "directory in the user profile is not in the RemoveFile
+        #            table". Aimed at directories a package CREATES in a roaming
+        #            profile; MSI already removes its own installed files and
+        #            directories on uninstall.
+        #   ICE91 -- per-user directory "doesn't vary based on ALLUSERS", which
+        #            is the explicit intent of a perUser install.
+        # Every other ICE -- including the ones that catch duplicate keys, bad
+        # foreign keys, malformed tables and invalid sequencing -- still fails
+        # the build. Do NOT widen this list to make an edit pass: an ICE outside
+        # these three is a real defect in the .wxs.
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/wix/light.exe" -nologo \
+            -ext WixUIExtension -ext WixUtilExtension \
+            -sice:ICE38 -sice:ICE64 -sice:ICE91 \
+            -out scr1b3-installer.msi main.wixobj
+          [ -f scr1b3-installer.msi ] || { echo "::error::light reported success but produced no .msi"; exit 1; }
+          # light writes the .msi BEFORE ICE validation runs, so "the file
+          # exists" is not by itself proof the link succeeded -- `set -e` on
+          # light's exit status is what enforces that. This size floor is the
+          # separate check that the package is not a degenerate stub.
+          sz=$(wc -c < scr1b3-installer.msi)
+          echo "MSI size = $sz bytes"
+          [ "$sz" -gt 100000 ] || { echo "::error::MSI is implausibly small ($sz bytes)"; exit 1; }
+      - name: Assert the compiled MSI carries the registry table the app expects
+        shell: bash
+        # Reads the table back out of the BUILT package (via WiX's own
+        # decompiler) instead of trusting the source text. This is what turns
+        # the Rust drift test's premise from assumed into verified: that test
+        # proves main.wxs's text matches `registry_entries`; this proves the
+        # package that would ship actually contains that same set of rows.
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/wix/dark.exe" -nologo scr1b3-installer.msi -out decompiled.wxs
+          [ -s decompiled.wxs ] || { echo "::error::dark produced no output"; exit 1; }
+          built=$(grep -c '<RegistryValue' decompiled.wxs || true)
+          src=$(grep -c '<RegistryValue' crates/scribe-app/wix/main.wxs || true)
+          echo "RegistryValue rows: source=$src compiled=$built"
+          if [ "$built" -lt "$REGISTRY_ROW_FLOOR" ]; then
+            echo "::error::the compiled MSI carries only $built RegistryValue rows (floor $REGISTRY_ROW_FLOOR) -- the registry table did not make it into the package."
+            exit 1
+          fi
+          if [ "$built" -ne "$src" ]; then
+            echo "::error::registry rows differ between source ($src) and compiled MSI ($built) -- rows were dropped or merged during the build."
+            exit 1
+          fi
+      - name: Upload the compiled MSI
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: scr1b3-msi-ci
+          path: scr1b3-installer.msi
+          if-no-files-found: error
+
+  gate:
+    # THE aggregating check. Every blocking job above is a `needs:` of this one,
+    # so a single required-status-check entry ("CI gate") covers the whole set
+    # -- and a job can no longer be authoritative while being unable to block a
+    # merge. `msrv` is the case in point: it was recently made authoritative
+    # (job-level RUSTUP_TOOLCHAIN, so it really tests the declared floor instead
+    # of silently re-testing 1.95.0 under the rust-toolchain.toml directory
+    # override) while being a `needs:` of NOTHING, which left the repaired gate
+    # still unable to fail a merge.
+    #
+    # `if: always()` is required: without it, a failed or skipped dependency
+    # would SKIP this job, and GitHub treats a skipped required check as
+    # satisfied -- the exact "skipped equals success" footgun this job closes.
+    name: CI gate
+    needs:
+      - test
+      - deny
+      - content-safety
+      - forge-wire-manifest
+      - bench-smoke
+      - gpu-ignored
+      - fuzz-build
+      - miri
+      - mutation-in-diff
+      - unused-deps
+      - msrv
+      - supply-chain-audit
+      - binary-hardening
+      - msi-build
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Verify every required job succeeded
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          R_TEST: ${{ needs.test.result }}
+          R_DENY: ${{ needs.deny.result }}
+          R_CONTENT_SAFETY: ${{ needs.content-safety.result }}
+          R_FORGE_WIRE_MANIFEST: ${{ needs.forge-wire-manifest.result }}
+          R_BENCH_SMOKE: ${{ needs.bench-smoke.result }}
+          R_GPU_IGNORED: ${{ needs.gpu-ignored.result }}
+          R_FUZZ_BUILD: ${{ needs.fuzz-build.result }}
+          R_MIRI: ${{ needs.miri.result }}
+          R_MUTATION_IN_DIFF: ${{ needs.mutation-in-diff.result }}
+          R_UNUSED_DEPS: ${{ needs.unused-deps.result }}
+          R_MSRV: ${{ needs.msrv.result }}
+          R_SUPPLY_CHAIN_AUDIT: ${{ needs.supply-chain-audit.result }}
+          R_BINARY_HARDENING: ${{ needs.binary-hardening.result }}
+          R_MSI_BUILD: ${{ needs.msi-build.result }}
+        run: |
+          set -uo pipefail
+          failed=0
+          # $1 = job name, $2 = result, $3 = "skippable" when the job is
+          # deliberately gated off for this trigger.
+          check() {
+            printf '%-24s %s\n' "$1" "$2"
+            if [ "$2" = "success" ]; then return; fi
+            if [ "${3:-}" = "skippable" ] && [ "$2" = "skipped" ]; then
+              echo "                         (skipped by design for event '${EVENT}')"
+              return
+            fi
+            echo "::error::required job '$1' did not succeed (result: $2)"
+            failed=1
+          }
+          check test                 "$R_TEST"
+          check deny                 "$R_DENY"
+          check content-safety       "$R_CONTENT_SAFETY"
+          check forge-wire-manifest  "$R_FORGE_WIRE_MANIFEST"
+          check bench-smoke          "$R_BENCH_SMOKE"
+          check gpu-ignored          "$R_GPU_IGNORED"
+          check fuzz-build           "$R_FUZZ_BUILD"
+          check miri                 "$R_MIRI"
+          check unused-deps          "$R_UNUSED_DEPS"
+          check msrv                 "$R_MSRV"
+          check supply-chain-audit   "$R_SUPPLY_CHAIN_AUDIT"
+          check binary-hardening     "$R_BINARY_HARDENING"
+          check msi-build            "$R_MSI_BUILD"
+          # mutation-in-diff is `if: github.event_name == 'pull_request'`, so it
+          # is legitimately skipped on push and schedule runs. On a pull_request
+          # -- the case a merge gate actually guards -- it must succeed like
+          # everything else.
+          if [ "$EVENT" = "pull_request" ]; then
+            check mutation-in-diff "$R_MUTATION_IN_DIFF"
+          else
+            check mutation-in-diff "$R_MUTATION_IN_DIFF" skippable
+          fi
+          if [ "$failed" -ne 0 ]; then
+            echo "::error::CI gate failed -- one or more required jobs did not succeed."
+            exit 1
+          fi
+          echo "CI gate passed: all required jobs succeeded."
