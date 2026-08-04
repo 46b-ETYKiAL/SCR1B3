@@ -3831,3 +3831,279 @@ fn replace_in_active_empty_pattern_early_returns_without_touching_status() {
         "empty-pattern replace must EARLY-RETURN, never run the body (kills || -> &&)"
     );
 }
+
+// ---- palette / context-menu clipboard actions reach the ACTIVE editor ----
+//
+// `execute_builtin(Copy|Cut|Paste|Undo|Redo)` records a pending action that
+// `drain_pending_editor_action` delivers at the top of the next frame. There
+// are two central-editor render paths with DIFFERENT widget ids, and delivery
+// has to pick the right one:
+//
+//   * the egui `TextEdit`, keyed `Id::new("scr1b3-central-editor").with(doc_id)`
+//   * the in-house rope editor, keyed `ui.id().with("scr1b3-rope-editable")`,
+//     which auto-engages past `rope_editor_auto_threshold_bytes`
+//
+// The drain used to focus a THIRD, un-salted id (`Id::new("scr1b3-central-editor")`)
+// that belongs to no widget at all - so the action was delivered nowhere on
+// either path, while still yanking focus off the editor the user was in. These
+// tests assert the OBSERVABLE OUTCOME (the buffer actually changes / focus is
+// actually kept), not that a pending flag was set: a "pending action is Some"
+// assertion is exactly what let the defect ship.
+
+/// A primary click at `pos` (press + release), as a raw event pair.
+fn click_events(pos: egui::Pos2) -> Vec<egui::Event> {
+    vec![
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        },
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        },
+    ]
+}
+
+/// An app whose active tab renders through the rope editor, with the rope
+/// built and the caret state live (two frames: build, then settle).
+fn rope_app(text: &str) -> (Driver, ScribeApp) {
+    let mut cfg = Config::default();
+    cfg.editor.first_run_completed = true;
+    cfg.editor.experimental_rope_editor = true;
+    let mut app = ScribeApp::new_test(cfg);
+    app.tabs[0].text = text.to_string();
+    let d = Driver::new();
+    d.idle(&mut app);
+    d.idle(&mut app);
+    assert!(
+        app.tabs[0].rope_state.is_some(),
+        "precondition: the rope path is the one rendering this tab"
+    );
+    assert!(
+        app.active_editor_is_rope(),
+        "precondition: delivery must classify this tab as the rope path"
+    );
+    (d, app)
+}
+
+/// Select `[a, b)` in the rope editor's own caret state.
+fn rope_select(app: &mut ScribeApp, a: usize, b: usize) {
+    let st = app.tabs[0]
+        .rope_state
+        .as_mut()
+        .expect("rope state built by rope_app");
+    st.edit.anchor = a;
+    st.edit.cursor = b;
+    st.edit.goal_col = None;
+}
+
+/// ROPE PATH - a palette `Cut` must actually remove the selected text.
+#[test]
+fn palette_cut_on_rope_path_removes_the_selected_text() {
+    let (d, mut app) = rope_app("hello world");
+    rope_select(&mut app, 0, 6);
+    app.execute_builtin(BuiltinCommand::Cut);
+    d.idle(&mut app); // drain -> inject -> show_editable applies -> text syncs
+    assert_eq!(
+        app.tabs[0].text, "world",
+        "palette Cut on the rope path must delete the selection from the buffer"
+    );
+}
+
+/// ROPE PATH - a palette `Undo` / `Redo` must actually move the buffer.
+#[test]
+fn palette_undo_redo_on_rope_path_moves_the_buffer() {
+    let (d, mut app) = rope_app("");
+    // Click into the editor, then type through it, so there is a genuine
+    // undo entry recorded by the rope editor's own history.
+    d.frame(
+        &mut app,
+        egui::Modifiers::NONE,
+        click_events(egui::pos2(300.0, 300.0)),
+    );
+    d.frame(
+        &mut app,
+        egui::Modifiers::NONE,
+        vec![egui::Event::Text("abc".to_string())],
+    );
+    assert_eq!(app.tabs[0].text, "abc", "precondition: the typing landed");
+    app.execute_builtin(BuiltinCommand::Undo);
+    d.idle(&mut app);
+    assert_eq!(
+        app.tabs[0].text, "",
+        "palette Undo on the rope path must revert the typing run"
+    );
+    app.execute_builtin(BuiltinCommand::Redo);
+    d.idle(&mut app);
+    assert_eq!(
+        app.tabs[0].text, "abc",
+        "palette Redo on the rope path must re-apply it"
+    );
+}
+
+/// ROPE PATH - delivering an action must NOT steal keyboard focus. The old
+/// drain called `request_focus` on an id no widget owns, which blurred the
+/// editor the user was working in for no benefit.
+#[test]
+fn palette_action_on_rope_path_keeps_editor_focus() {
+    let (d, mut app) = rope_app("hello world");
+    d.frame(
+        &mut app,
+        egui::Modifiers::NONE,
+        click_events(egui::pos2(300.0, 300.0)),
+    );
+    let focused_before = d.ctx.memory(egui::Memory::focused);
+    assert!(
+        focused_before.is_some(),
+        "precondition: something in the editor holds focus"
+    );
+    rope_select(&mut app, 0, 5);
+    app.execute_builtin(BuiltinCommand::Copy);
+    d.idle(&mut app);
+    assert_eq!(
+        d.ctx.memory(egui::Memory::focused),
+        focused_before,
+        "delivering a palette action must not move keyboard focus"
+    );
+}
+
+/// Number of actions parked on the active tab's rope queue. An action parked
+/// there while some OTHER surface is rendering is delivered to nobody: the
+/// queue is drained only by `show_editable`, so it would sit there forever -
+/// the same silent-no-op the mode-aware drain exists to prevent.
+fn parked_on_rope_queue(app: &ScribeApp) -> usize {
+    app.tabs[app.active]
+        .rope_state
+        .as_ref()
+        .map_or(0, scribe_render::RopeEditorState::injected_len)
+}
+
+/// GRID PATH - the tiling grid renders its panes as `TextEdit`s and never calls
+/// `show_editable`, so an action must NOT be parked on the tab's rope queue even
+/// though `experimental_rope_editor` is on. Without the grid guard in
+/// `active_editor_is_rope` the action is queued on a state nothing drains and
+/// the command is a silent no-op again.
+#[test]
+fn palette_action_in_grid_mode_is_never_parked_on_the_rope_queue() {
+    let mut cfg = Config::default();
+    cfg.editor.first_run_completed = true;
+    cfg.editor.grid_enabled = true;
+    cfg.editor.experimental_rope_editor = true;
+    let mut app = ScribeApp::new_test(cfg);
+    app.tabs[0].text = "hello world".to_string();
+    let d = Driver::new();
+    d.idle(&mut app);
+    d.idle(&mut app);
+    assert!(
+        app.grid_tree.is_some(),
+        "precondition: the grid owns the central surface"
+    );
+    app.execute_builtin(BuiltinCommand::Cut);
+    d.idle(&mut app);
+    assert_eq!(
+        parked_on_rope_queue(&app),
+        0,
+        "the grid renders TextEdit panes - an action parked on the rope queue \
+         is delivered to nobody"
+    );
+}
+
+/// FOLD PATH - the folded preview is its own (non-rope) read-only surface, so an
+/// action must not be parked on the rope queue there either.
+#[test]
+fn palette_action_in_fold_view_is_never_parked_on_the_rope_queue() {
+    let mut cfg = Config::default();
+    cfg.editor.first_run_completed = true;
+    cfg.editor.experimental_rope_editor = true;
+    let mut app = ScribeApp::new_test(cfg);
+    app.tabs[0].text = "# h\n\nbody\n".to_string();
+    let d = Driver::new();
+    d.idle(&mut app);
+    app.fold_view = true;
+    d.idle(&mut app);
+    app.execute_builtin(BuiltinCommand::Copy);
+    d.idle(&mut app);
+    assert!(app.fold_view, "precondition: the fold preview is rendering");
+    assert_eq!(
+        parked_on_rope_queue(&app),
+        0,
+        "the fold preview never calls show_editable - an action parked on the \
+         rope queue is delivered to nobody"
+    );
+}
+
+/// TEXTEDIT PATH - a palette `Cut` must actually remove the selected text.
+/// The drain has to focus the editor id SALTED with the active tab's `doc_id`
+/// (what `frame_tick` builds the widget with); the un-salted id names no widget,
+/// so the event went nowhere.
+#[test]
+fn palette_cut_on_textedit_path_removes_the_selected_text() {
+    let mut cfg = Config::default();
+    cfg.editor.first_run_completed = true;
+    cfg.editor.experimental_rope_editor = false;
+    let mut app = ScribeApp::new_test(cfg);
+    app.tabs[0].text = "hello world".to_string();
+    let d = Driver::new();
+    d.idle(&mut app);
+    d.idle(&mut app); // editor auto-focuses
+    assert!(
+        !app.active_editor_is_rope(),
+        "precondition: this tab renders through the egui TextEdit"
+    );
+    let id = central_editor_id(&app);
+    set_selection(&d.ctx, id, 0, 6);
+    app.execute_builtin(BuiltinCommand::Cut);
+    d.idle(&mut app);
+    assert_eq!(
+        app.tabs[0].text, "world",
+        "palette Cut on the TextEdit path must delete the selection"
+    );
+}
+
+/// The rope editor's right-click menu offers the clipboard/history actions and
+/// a pick reaches the buffer. The rope path had NO context menu at all - the
+/// TextEdit path's menu lives in a branch the rope path returns before.
+#[test]
+fn rope_context_menu_cut_removes_the_selected_text() {
+    let mut cfg = Config::default();
+    cfg.appearance.frameless = false;
+    cfg.editor.first_run_completed = true;
+    cfg.editor.experimental_rope_editor = true;
+    let mut app = ScribeApp::new_test(cfg);
+    app.tabs[0].text = "hello world".to_string();
+    let mut h = egui_kittest::Harness::builder()
+        .with_size(egui::Vec2::new(900.0, 600.0))
+        .build_state(|ctx, app: &mut ScribeApp| app.frame_tick(ctx), app);
+    h.run();
+    h.run();
+    {
+        let st = h.state_mut().tabs[0]
+            .rope_state
+            .as_mut()
+            .expect("rope path is rendering");
+        st.edit.anchor = 0;
+        st.edit.cursor = 6;
+    }
+    // Right-click inside the editor body to open the context menu.
+    for pressed in [true, false] {
+        h.input_mut().events.push(egui::Event::PointerButton {
+            pos: egui::pos2(400.0, 300.0),
+            button: egui::PointerButton::Secondary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        });
+    }
+    h.run();
+    h.get_by_label("Cut").click();
+    h.run(); // the pick is published to ctx-data
+    h.run(); // drained by the app and applied by the editor
+    assert_eq!(
+        h.state().tabs[0].text,
+        "world",
+        "the rope editor's right-click Cut must delete the selection"
+    );
+}

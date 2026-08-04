@@ -233,7 +233,8 @@ impl<'a> RopeEditor<'a> {
     }
 
     /// Editable variant: consume keyboard/clipboard input via [`apply_event`]
-    /// (only while focused), then render text + caret + selection. Returns the
+    /// (keyboard input only while focused; [injected](RopeEditorState::inject_event)
+    /// events always), then render text + caret + selection. Returns the
     /// response plus any text the host should write to the OS clipboard (from
     /// Copy/Cut). The editor takes keyboard focus on click. Caret geometry
     /// assumes the monospace editor font (one advance per char).
@@ -249,11 +250,21 @@ impl<'a> RopeEditor<'a> {
         let mut content_changed = false;
 
         // ---- input phase (mutates the rope) ----
-        if focused {
-            let events = ui.input(|i| i.events.clone());
+        // Host-injected events (a command-palette / menu Copy-Cut-Paste-Undo-Redo)
+        // apply whether or not this editor holds egui focus: an explicit command
+        // must neither require the user to have clicked into the editor first nor
+        // steal focus from wherever they are to be delivered. Keyboard events are
+        // still focus-gated — only the focused editor consumes typing.
+        let injected = state.take_injected();
+        if focused || !injected.is_empty() {
+            let events = if focused {
+                ui.input(|i| i.events.clone())
+            } else {
+                Vec::new()
+            };
             let snippets = self.snippets;
             if let Some(rope) = self.buffer.as_rope_mut() {
-                for ev in &events {
+                for ev in injected.iter().chain(events.iter()) {
                     // Snippet Tab-trigger: a plain Tab right after a known prefix
                     // expands the snippet instead of indenting. Checked before
                     // apply_event so the normal Tab-indent path is skipped on a hit.
@@ -592,6 +603,29 @@ impl<'a> RopeEditor<'a> {
         // shift-click to extend (TextEdit parity). Clicking also focuses the
         // editor so keyboard input flows.
         let area = ui.interact(scroll.inner_rect, editor_id, egui::Sense::click_and_drag());
+        // Right-click clipboard / history menu — parity with the `TextEdit`
+        // path's context menu. This crate deliberately carries no OS-clipboard
+        // dependency (Paste needs one, and Copy/Cut hand their text back to the
+        // host to write), so a pick is PUBLISHED as a [`RopeEditorAction`]
+        // request in ctx-data and the host drains it via
+        // [`take_rope_action_request`]. Without this the rope path had no
+        // right-click clipboard menu at all.
+        area.context_menu(|ui| {
+            ui.set_min_width(160.0);
+            let pick = |ui: &mut Ui, label: &str, action: RopeEditorAction| {
+                if ui.button(label).clicked() {
+                    ui.ctx()
+                        .data_mut(|d| d.insert_temp(rope_action_request_id(), action));
+                    ui.close();
+                }
+            };
+            pick(ui, "Cut", RopeEditorAction::Cut);
+            pick(ui, "Copy", RopeEditorAction::Copy);
+            pick(ui, "Paste", RopeEditorAction::Paste);
+            ui.separator();
+            pick(ui, "Undo", RopeEditorAction::Undo);
+            pick(ui, "Redo", RopeEditorAction::Redo);
+        });
         if area.clicked() || area.drag_started() {
             ui.memory_mut(|m| m.request_focus(editor_id));
         }
@@ -1013,11 +1047,51 @@ pub struct RopeEditorState {
     /// it tracks window resizes / zoom); [`DEFAULT_PAGE_ROWS`] until the first
     /// paint, and for headless callers that drive `apply_event` directly.
     page_rows: usize,
+    /// Host-injected input events awaiting the next `show_editable` pass — the
+    /// delivery channel for a command-palette / menu Copy-Cut-Paste-Undo-Redo.
+    /// Applied REGARDLESS of egui focus (see [`RopeEditorState::inject_event`]).
+    injected: Vec<egui::Event>,
 }
 
 /// PageUp/PageDown step used before the first paint has reported a real
 /// viewport height (and by headless `apply_event` callers).
 pub const DEFAULT_PAGE_ROWS: usize = 20;
+
+/// A clipboard / history action picked from the rope editor's right-click
+/// context menu.
+///
+/// The menu cannot execute these itself: Paste needs to READ the OS clipboard
+/// and Copy/Cut need their text WRITTEN to it, and this crate owns no clipboard
+/// dependency. So a pick is published as a request and the host — which already
+/// owns the `arboard` round-trip for the palette route — drains and executes it
+/// via [`take_rope_action_request`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RopeEditorAction {
+    Copy,
+    Cut,
+    Paste,
+    Undo,
+    Redo,
+}
+
+/// ctx-data key a context-menu pick is published under.
+fn rope_action_request_id() -> egui::Id {
+    egui::Id::new("scr1b3-rope-action-request")
+}
+
+/// Take (and clear) a context-menu action request published by the rope
+/// editor's right-click menu, if one is pending. `None` when nothing was
+/// picked. The host calls this once per frame.
+pub fn take_rope_action_request(ctx: &egui::Context) -> Option<RopeEditorAction> {
+    ctx.data_mut(|d| {
+        let id = rope_action_request_id();
+        let v = d.get_temp::<RopeEditorAction>(id);
+        if v.is_some() {
+            d.remove::<RopeEditorAction>(id);
+        }
+        v
+    })
+}
 
 impl Default for RopeEditorState {
     fn default() -> Self {
@@ -1029,6 +1103,7 @@ impl Default for RopeEditorState {
             edit_gen: 0,
             hl_cache: HighlightCache::default(),
             page_rows: DEFAULT_PAGE_ROWS,
+            injected: Vec::new(),
         }
     }
 }
@@ -1036,6 +1111,31 @@ impl Default for RopeEditorState {
 impl RopeEditorState {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Queue an input event for the next [`RopeEditor::show_editable`] pass.
+    ///
+    /// Injected events are applied whether or not the editor holds egui
+    /// keyboard focus. That is what makes a command-palette / context-menu
+    /// Copy-Cut-Paste-Undo-Redo actually land on the rope path: the host cannot
+    /// deliver those by pushing an `egui::Event` and calling `request_focus`,
+    /// because the rope editor's focus id is derived from the `Ui` it is shown
+    /// in (`ui.id().with("scr1b3-rope-editable")`) and is not reproducible from
+    /// outside the render closure — and stealing focus to deliver a command is
+    /// itself a defect (it yanks the caret out of whatever the user is in).
+    pub fn inject_event(&mut self, ev: egui::Event) {
+        self.injected.push(ev);
+    }
+
+    /// Number of injected events not yet applied by a `show_editable` pass.
+    #[must_use]
+    pub fn injected_len(&self) -> usize {
+        self.injected.len()
+    }
+
+    /// Take the queued injected events, leaving the queue empty.
+    fn take_injected(&mut self) -> Vec<egui::Event> {
+        std::mem::take(&mut self.injected)
     }
 
     /// Clamp the caret/anchor into the current rope (after an external content
@@ -2787,5 +2887,188 @@ mod tests {
                 assert_eq!(resp.buffer_mode, BufferModeSeen::Rope);
             });
         });
+    }
+
+    // ---- injected (palette / context-menu) editor actions ----
+    //
+    // These drive the REAL `show_editable` render pass — the same call
+    // `frame_tick` makes — with the editor UNFOCUSED, and assert the OBSERVABLE
+    // outcome (rope contents, returned clipboard payload). An assertion that a
+    // request was merely *recorded* would not have caught the defect these
+    // guard: the host used to deliver clipboard actions by focusing a widget id
+    // that belongs to no widget, so nothing was ever applied.
+
+    /// Drive one `show_editable` pass over `buf`/`state` with a headless Ui.
+    /// The editor is NEVER focused here — that is the point: an injected action
+    /// must land regardless of focus.
+    fn run_editable(
+        buf: &mut Buffer,
+        state: &mut RopeEditorState,
+        raw: egui::RawInput,
+    ) -> Option<String> {
+        let ctx = egui::Context::default();
+        let mut clipboard = None;
+        let _ = ctx.run(raw, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let (_resp, cb) =
+                    RopeEditor::new(buf, FontId::monospace(14.0), 18.0).show_editable(ui, state);
+                clipboard = cb;
+            });
+        });
+        clipboard
+    }
+
+    /// Select `[a, b)` and queue `ev` for the next `show_editable` pass.
+    fn select_and_inject(state: &mut RopeEditorState, a: usize, b: usize, ev: egui::Event) {
+        state.edit.anchor = a;
+        state.edit.cursor = b;
+        state.edit.goal_col = None;
+        state.inject_event(ev);
+    }
+
+    #[test]
+    fn injected_copy_returns_the_selection_without_focus() {
+        let mut buf = Buffer::Rope(Rope::from_str("hello world"));
+        let mut st = RopeEditorState::new();
+        select_and_inject(&mut st, 0, 5, egui::Event::Copy);
+        let cb = run_editable(&mut buf, &mut st, egui::RawInput::default());
+        assert_eq!(
+            cb.as_deref(),
+            Some("hello"),
+            "an injected Copy must hand the selected text back for the host to \
+             write to the OS clipboard, even though the editor is not focused"
+        );
+        assert_eq!(
+            buf.as_rope().map(ropey::Rope::to_string).as_deref(),
+            Some("hello world"),
+            "copy must not mutate"
+        );
+        assert_eq!(st.injected_len(), 0, "the queue is drained by the pass");
+    }
+
+    #[test]
+    fn injected_cut_removes_the_selection_without_focus() {
+        let mut buf = Buffer::Rope(Rope::from_str("hello world"));
+        let mut st = RopeEditorState::new();
+        select_and_inject(&mut st, 0, 6, egui::Event::Cut);
+        let cb = run_editable(&mut buf, &mut st, egui::RawInput::default());
+        assert_eq!(cb.as_deref(), Some("hello "));
+        assert_eq!(
+            buf.as_rope().map(ropey::Rope::to_string).as_deref(),
+            Some("world"),
+            "an injected Cut must actually delete the selection from the rope"
+        );
+    }
+
+    #[test]
+    fn injected_paste_inserts_without_focus() {
+        let mut buf = Buffer::Rope(Rope::from_str("ac"));
+        let mut st = RopeEditorState::new();
+        select_and_inject(&mut st, 1, 1, egui::Event::Paste("b".to_string()));
+        run_editable(&mut buf, &mut st, egui::RawInput::default());
+        assert_eq!(
+            buf.as_rope().map(ropey::Rope::to_string).as_deref(),
+            Some("abc"),
+            "an injected Paste must insert at the caret"
+        );
+    }
+
+    #[test]
+    fn injected_undo_then_redo_round_trip_without_focus() {
+        let mut buf = Buffer::Rope(Rope::from_str(""));
+        let mut st = RopeEditorState::new();
+        // A real edit to undo: type through the same engine the editor uses.
+        if let Some(rope) = buf.as_rope_mut() {
+            for ch in ["a", "b", "c"] {
+                apply_event(rope, &mut st, &text_event(ch));
+            }
+        }
+        assert_eq!(
+            buf.as_rope().map(ropey::Rope::to_string).as_deref(),
+            Some("abc")
+        );
+        st.inject_event(key_ev(egui::Key::Z, false, true));
+        run_editable(&mut buf, &mut st, egui::RawInput::default());
+        assert_eq!(
+            buf.as_rope().map(ropey::Rope::to_string).as_deref(),
+            Some(""),
+            "an injected Ctrl+Z must undo the typing run"
+        );
+        st.inject_event(key_ev(egui::Key::Z, true, true));
+        run_editable(&mut buf, &mut st, egui::RawInput::default());
+        assert_eq!(
+            buf.as_rope().map(ropey::Rope::to_string).as_deref(),
+            Some("abc"),
+            "an injected Ctrl+Shift+Z must redo it"
+        );
+    }
+
+    /// The injected channel must NOT un-gate ordinary keyboard input: typing
+    /// still only reaches the FOCUSED editor. Without this, every rope editor
+    /// on screen would consume the same keystroke.
+    #[test]
+    fn ordinary_key_events_stay_focus_gated() {
+        let mut buf = Buffer::Rope(Rope::from_str("x"));
+        let mut st = RopeEditorState::new();
+        let raw = egui::RawInput {
+            events: vec![text_event("Z")],
+            ..Default::default()
+        };
+        run_editable(&mut buf, &mut st, raw);
+        assert_eq!(
+            buf.as_rope().map(ropey::Rope::to_string).as_deref(),
+            Some("x"),
+            "an UNFOCUSED rope editor must ignore typed input"
+        );
+    }
+
+    /// The narrow case `ordinary_key_events_stay_focus_gated` cannot reach: an
+    /// injected action OPENS the input phase for an unfocused editor, so the
+    /// focus-gate on `ui.input().events` has to hold INSIDE that branch too.
+    /// Without the inner gate, whatever the user is typing elsewhere is applied
+    /// to this editor as a side effect of a palette pick — every unfocused rope
+    /// editor would swallow the same keystroke.
+    #[test]
+    fn an_injected_action_does_not_admit_unfocused_typing() {
+        let mut buf = Buffer::Rope(Rope::from_str("hello world"));
+        let mut st = RopeEditorState::new();
+        select_and_inject(&mut st, 0, 5, egui::Event::Copy);
+        let raw = egui::RawInput {
+            events: vec![text_event("Z")],
+            ..Default::default()
+        };
+        let cb = run_editable(&mut buf, &mut st, raw);
+        assert_eq!(
+            cb.as_deref(),
+            Some("hello"),
+            "precondition: the injected Copy still lands while unfocused"
+        );
+        assert_eq!(
+            buf.as_rope().map(ropey::Rope::to_string).as_deref(),
+            Some("hello world"),
+            "an injected action must not admit the unfocused editor to the \
+             ordinary keyboard queue — the typed 'Z' must NOT replace the selection"
+        );
+    }
+
+    #[test]
+    fn take_rope_action_request_round_trips_then_clears() {
+        let ctx = egui::Context::default();
+        assert_eq!(
+            take_rope_action_request(&ctx),
+            None,
+            "nothing pending on a fresh context"
+        );
+        ctx.data_mut(|d| d.insert_temp(rope_action_request_id(), RopeEditorAction::Paste));
+        assert_eq!(
+            take_rope_action_request(&ctx),
+            Some(RopeEditorAction::Paste),
+            "a published pick is handed to the host"
+        );
+        assert_eq!(
+            take_rope_action_request(&ctx),
+            None,
+            "taking it clears it — a pick must never be executed twice"
+        );
     }
 }

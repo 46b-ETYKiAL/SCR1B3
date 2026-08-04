@@ -264,19 +264,72 @@ impl ScribeApp {
         }
     }
 
-    /// Drain a palette-requested clipboard/history action by injecting the
-    /// corresponding egui event into the input queue and focusing the central
-    /// editor, so egui's `TextEdit` performs it natively this frame. Called at
-    /// the top of `frame_tick`, before any panel renders, so the editor (shown
-    /// later in the same frame) sees the event. `Paste` reads the OS clipboard
-    /// via `arboard`; a read failure surfaces a toast rather than panicking.
+    /// Whether the active tab currently renders through the in-house rope
+    /// editor rather than egui's `TextEdit`.
+    ///
+    /// Mirrors the branch order `frame_tick` takes for the central surface: the
+    /// tiling grid and the folded preview each own their own (TextEdit-backed)
+    /// surface, a read-only huge file browses through the NON-editable rope
+    /// path, and only then does `use_rope_editor` decide. Kept in lockstep with
+    /// that branch so a delivered editor action lands where the caret actually
+    /// is — the rope path auto-engages past `rope_editor_auto_threshold_bytes`
+    /// (16 MiB by default), so this is not an opt-in-only corner.
+    pub(super) fn active_editor_is_rope(&self) -> bool {
+        if self.grid_tree.is_some() || self.fold_view {
+            return false;
+        }
+        let Some(tab) = self.tabs.get(self.active) else {
+            return false;
+        };
+        if tab.doc.is_read_only_large() {
+            return false;
+        }
+        use_rope_editor(
+            self.config.editor.experimental_rope_editor,
+            tab.text.len(),
+            self.config.editor.rope_editor_auto_threshold_bytes,
+        )
+    }
+
+    /// Drain a palette / menu-requested clipboard-history action into the editor
+    /// that is ACTUALLY rendering the active tab. Called at the top of
+    /// `frame_tick`, before any panel renders, so the editor (shown later in the
+    /// same frame) sees the action. `Paste` reads the OS clipboard via
+    /// `arboard`; a read failure surfaces a toast rather than panicking.
+    ///
+    /// Delivery is mode-aware because the two central-editor paths claim
+    /// different widget ids and consume input differently:
+    ///
+    /// * **rope path** — the action is queued on the tab's `RopeEditorState`
+    ///   and applied by `show_editable` regardless of focus. The rope editor's
+    ///   id is `ui.id().with("scr1b3-rope-editable")`, derived from the `Ui` it
+    ///   is shown in and therefore not reproducible here; and focusing it would
+    ///   be wrong anyway — an explicit command must not yank the caret around.
+    /// * **`TextEdit` path** — the event is pushed onto egui's input queue and
+    ///   the central editor is focused so `TextEdit` performs it natively. The
+    ///   id MUST carry the active tab's `doc_id` salt, because that is the id
+    ///   `frame_tick` builds the widget with (per-note `TextEditState`).
+    /// * **grid path** — the panes are `TextEdit`s with egui-auto-generated ids
+    ///   that cannot be named from here, so the event is pushed WITHOUT
+    ///   touching focus: whichever pane the user is in handles it.
     pub(super) fn drain_pending_editor_action(&mut self, ctx: &egui::Context) {
+        // A right-click pick on the ROPE editor's context menu arrives as a
+        // ctx-data request (scribe-render owns no clipboard dependency). Fold it
+        // into the same pending slot the palette uses so both routes share one
+        // drain — and so an already-pending palette pick is never dropped.
+        if let Some(req) = scribe_render::take_rope_action_request(ctx) {
+            let action = match req {
+                scribe_render::RopeEditorAction::Copy => EditorAction::Copy,
+                scribe_render::RopeEditorAction::Cut => EditorAction::Cut,
+                scribe_render::RopeEditorAction::Paste => EditorAction::Paste,
+                scribe_render::RopeEditorAction::Undo => EditorAction::Undo,
+                scribe_render::RopeEditorAction::Redo => EditorAction::Redo,
+            };
+            self.pending_editor_action.get_or_insert(action);
+        }
         let Some(action) = self.pending_editor_action.take() else {
             return;
         };
-        let editor_id = egui::Id::new("scr1b3-central-editor");
-        // Focus the editor so the injected event is delivered to it.
-        ctx.memory_mut(|m| m.request_focus(editor_id));
         let event = match action {
             EditorAction::Copy => egui::Event::Copy,
             EditorAction::Cut => egui::Event::Cut,
@@ -296,6 +349,26 @@ impl ScribeApp {
                 egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
             ),
         };
+        if self.active_editor_is_rope() {
+            let tab = &mut self.tabs[self.active];
+            tab.rope_state
+                .get_or_insert_with(scribe_render::RopeEditorState::new)
+                .inject_event(event);
+            // The queue is drained by the editor's next paint; make sure one
+            // happens even if nothing else requested it.
+            ctx.request_repaint();
+            return;
+        }
         ctx.input_mut(|i| i.events.push(event));
+        if self.grid_tree.is_none() {
+            // Focus the editor so the pushed event is delivered to it. The
+            // `doc_id` salt is what `frame_tick` keys the widget on; an
+            // un-salted id belongs to NO widget, so focusing it both failed to
+            // deliver the action and stole focus from the real editor.
+            if let Some(tab) = self.tabs.get(self.active) {
+                let editor_id = egui::Id::new("scr1b3-central-editor").with(tab.doc_id);
+                ctx.memory_mut(|m| m.request_focus(editor_id));
+            }
+        }
     }
 }

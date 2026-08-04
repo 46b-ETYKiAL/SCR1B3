@@ -11,7 +11,8 @@
 pub mod rope_editor;
 
 pub use rope_editor::{
-    apply_event, BufferModeSeen, EventOutcome, RopeEditor, RopeEditorResponse, RopeEditorState,
+    apply_event, take_rope_action_request, BufferModeSeen, EventOutcome, RopeEditor,
+    RopeEditorAction, RopeEditorResponse, RopeEditorState,
 };
 
 use egui::{Color32, Stroke, Visuals};
