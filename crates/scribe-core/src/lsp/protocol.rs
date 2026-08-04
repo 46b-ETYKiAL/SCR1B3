@@ -90,11 +90,18 @@ pub fn notification(method: &str, params: Value) -> Value {
 }
 
 /// A diagnostic surfaced by the server (subset of the LSP `Diagnostic`).
+///
+/// `line`/`character` are the range START and `end_line`/`end_character` the
+/// range END, both in UTF-16 code units (the LSP default position encoding).
+/// The END is what lets the editor underline the offending span instead of just
+/// counting the diagnostic — without it a squiggle has no width.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Diagnostic {
     pub uri: String,
     pub line: u32,
     pub character: u32,
+    pub end_line: u32,
+    pub end_character: u32,
     pub severity: u8, // 1=error 2=warning 3=info 4=hint
     pub message: String,
 }
@@ -111,16 +118,39 @@ pub fn parse_publish_diagnostics(msg: &Value) -> Vec<Diagnostic> {
     if let Some(arr) = params["diagnostics"].as_array() {
         for d in arr {
             let start = &d["range"]["start"];
+            let end = &d["range"]["end"];
+            let line = start["line"].as_u64().unwrap_or(0) as u32;
+            let character = start["character"].as_u64().unwrap_or(0) as u32;
             out.push(Diagnostic {
                 uri: uri.clone(),
-                line: start["line"].as_u64().unwrap_or(0) as u32,
-                character: start["character"].as_u64().unwrap_or(0) as u32,
+                line,
+                character,
+                // A server that omits `end` (or sends a malformed one) leaves us
+                // with a zero-width span at the start — degrade to the start
+                // rather than to (0,0), which would underline the top of the
+                // file for a diagnostic on line 400.
+                end_line: end["line"].as_u64().map_or(line, |v| v as u32),
+                end_character: end["character"].as_u64().map_or(character, |v| v as u32),
                 severity: d["severity"].as_u64().unwrap_or(1) as u8,
                 message: d["message"].as_str().unwrap_or_default().to_string(),
             });
         }
     }
     out
+}
+
+/// `textDocument/didChange` params.
+///
+/// `version` must strictly increase per document; the server uses it to reject
+/// changes it has already applied and to correlate the diagnostics it publishes
+/// back. `changes` is built by [`super::sync::content_changes`] for the kind the
+/// server declared.
+pub fn did_change_params(uri: &str, version: i64, changes: &[super::sync::ContentChange]) -> Value {
+    json!({
+        "textDocument": { "uri": uri, "version": version },
+        "contentChanges": changes.iter().map(super::sync::ContentChange::to_json)
+            .collect::<Vec<_>>(),
+    })
 }
 
 /// Pull the id out of a JSON-RPC response (for correlating requests).
@@ -177,6 +207,83 @@ mod tests {
         assert_eq!(diags[0].line, 3);
         assert_eq!(diags[0].severity, 1);
         assert_eq!(diags[0].message, "mismatched types");
+    }
+
+    #[test]
+    fn parse_diagnostics_keeps_the_range_end_so_a_squiggle_has_width() {
+        // Without the END the editor can only count diagnostics — it cannot
+        // underline the offending span. Assert the end is the SERVER's end, not
+        // a copy of the start (a zero-width squiggle paints nothing).
+        let msg = notification(
+            "textDocument/publishDiagnostics",
+            json!({
+                "uri": "file:///x.rs",
+                "diagnostics": [
+                    {"range": {"start": {"line": 3, "character": 5}, "end": {"line": 3, "character": 9}},
+                     "severity": 2, "message": "unused variable"}
+                ]
+            }),
+        );
+        let d = &parse_publish_diagnostics(&msg)[0];
+        assert_eq!((d.line, d.character), (3, 5));
+        assert_eq!(
+            (d.end_line, d.end_character),
+            (3, 9),
+            "the end must be the server's end, not the start"
+        );
+        assert!(
+            d.end_character > d.character,
+            "a real diagnostic span has non-zero width"
+        );
+    }
+
+    #[test]
+    fn a_diagnostic_with_no_end_degrades_to_its_own_start_not_the_file_top() {
+        // A malformed/absent `end` must not silently become (0,0) — that would
+        // underline line 1 for an error on line 400.
+        let msg = notification(
+            "textDocument/publishDiagnostics",
+            json!({
+                "uri": "file:///x.rs",
+                "diagnostics": [
+                    {"range": {"start": {"line": 400, "character": 7}}, "message": "boom"}
+                ]
+            }),
+        );
+        let d = &parse_publish_diagnostics(&msg)[0];
+        assert_eq!(
+            (d.end_line, d.end_character),
+            (400, 7),
+            "an absent end collapses onto the START, never onto (0,0)"
+        );
+    }
+
+    #[test]
+    fn did_change_params_carry_the_version_and_the_changes() {
+        use super::super::sync::{content_changes, TextDocumentSyncKind};
+        let changes = content_changes("ab\n", "aXb\n", TextDocumentSyncKind::Incremental);
+        let p = did_change_params("file:///x.rs", 4, &changes);
+        assert_eq!(p["textDocument"]["uri"], "file:///x.rs");
+        assert_eq!(
+            p["textDocument"]["version"], 4,
+            "the server rejects a change whose version did not advance"
+        );
+        assert_eq!(p["contentChanges"].as_array().unwrap().len(), 1);
+        assert_eq!(p["contentChanges"][0]["text"], "X");
+        assert_eq!(p["contentChanges"][0]["range"]["start"]["character"], 1);
+    }
+
+    #[test]
+    fn did_change_params_with_full_sync_omit_the_range() {
+        use super::super::sync::{content_changes, TextDocumentSyncKind};
+        let changes = content_changes("a\n", "b\n", TextDocumentSyncKind::Full);
+        let p = did_change_params("file:///x.rs", 2, &changes);
+        assert_eq!(p["contentChanges"][0]["text"], "b\n");
+        assert!(
+            p["contentChanges"][0].get("range").is_none(),
+            "a full-sync change must have NO range — a range would mean \
+             'replace only this span'"
+        );
     }
 
     #[test]

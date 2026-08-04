@@ -302,6 +302,139 @@ fn a_failed_in_place_swap_never_asks_the_window_to_go_away() {
     }
 }
 
+// ───────────── unsaved work holds the apply, not merely the close ─────────────
+//
+// `request_restart_close` already routes the close through the app's guard —
+// but it runs AFTER the apply. By the time the unsaved-changes prompt is on
+// screen the running exe has been swapped and its replacement spawned, or the
+// elevated installer is running `-Wait` and is about to replace the files under
+// the modal. So Cancel could not mean what it says. Both sites are reachable
+// with NO user present (`poll` auto-chains into them every frame), so the gate
+// has to sit above the irreversible half.
+
+/// A staged in-place apply with unsaved work must do NOTHING to the window.
+///
+/// The discriminating half is the STATE: pointing `staged` at a nonexistent
+/// path also emits no viewport command (the swap simply fails), so "no command"
+/// alone cannot tell a hold from a failure. A hold leaves `ReadyToApply`
+/// untouched — the user saves and clicks again — where a failure would have
+/// replaced it with `Failed`.
+#[test]
+fn unsaved_work_holds_the_in_place_apply_and_leaves_it_retriable() {
+    let mut u = Updater {
+        state: UpdateState::ReadyToApply {
+            staged: std::path::PathBuf::from("/nonexistent/scr1b3-staged-binary"),
+            version: "9.9.9".to_string(), // newer, so anti-rollback would pass
+        },
+        unsaved_work: true,
+        ..Default::default()
+    };
+    let cmds = viewport_cmds(|ctx| u.apply_and_restart(ctx));
+    assert!(
+        cmds.is_empty(),
+        "a held apply must emit no viewport command at all, got: {cmds:?}"
+    );
+    assert!(
+        matches!(u.state, UpdateState::ReadyToApply { .. }),
+        "the hold must leave the update RETRIABLE, not Failed — got {:?}",
+        u.state
+    );
+    assert!(
+        u.unsaved_hold_notice.is_some(),
+        "a silent hold is indistinguishable from a broken button; the user \
+         must be told why nothing happened"
+    );
+}
+
+/// Same gate on the installer route — the worse of the two, because the
+/// elevated `setup.exe` can replace or kill the app while a modal is still up.
+#[test]
+fn unsaved_work_holds_the_installer_and_leaves_it_retriable() {
+    let mut u = Updater {
+        state: UpdateState::ReadyToRunInstaller {
+            installer: std::path::PathBuf::from("/nonexistent/scr1b3-setup.exe"),
+            version: "9.9.9".to_string(),
+        },
+        unsaved_work: true,
+        ..Default::default()
+    };
+    let cmds = viewport_cmds(|ctx| u.run_installer(ctx));
+    assert!(cmds.is_empty(), "got: {cmds:?}");
+    assert!(
+        matches!(u.state, UpdateState::ReadyToRunInstaller { .. }),
+        "got {:?}",
+        u.state
+    );
+    assert!(u.unsaved_hold_notice.is_some());
+}
+
+/// The auto-chained path, which is the one that fires with nobody watching:
+/// a verified download completes inside `poll` and chains straight into the
+/// in-place swap. With unsaved work that chain must stop before the swap.
+///
+/// Without the gate this reaches `replace_running_executable` and lands in
+/// `Failed(install failed)` (the staged path does not exist) — so the state
+/// assertion here is what distinguishes "held" from "tried and failed".
+#[test]
+fn an_auto_chained_apply_is_held_by_unsaved_work_before_it_touches_the_exe() {
+    let mut u = Updater {
+        unsaved_work: true,
+        ..Default::default()
+    };
+    let cmds = viewport_cmds(|ctx| {
+        u.handle_update_msg(
+            UpdateMsg::Downloaded(Ok((
+                std::path::PathBuf::from("/nonexistent/scr1b3-staged-binary"),
+                "9.9.9".to_string(),
+            ))),
+            ctx,
+        );
+    });
+    assert!(cmds.is_empty(), "got: {cmds:?}");
+    assert!(
+        matches!(u.state, UpdateState::ReadyToApply { .. }),
+        "the auto-chain must STOP at ReadyToApply while work is unsaved — \
+         Failed(install failed) would mean the swap was attempted, got {:?}",
+        u.state
+    );
+}
+
+/// The gate must not become a permanent block: with nothing unsaved, the apply
+/// proceeds exactly as before (here: to the swap, which fails on the fixture
+/// path — proving the gate was passed and the irreversible half was reached).
+#[test]
+fn with_nothing_unsaved_the_apply_proceeds_as_before() {
+    let mut u = Updater {
+        unsaved_work: false,
+        ..Default::default()
+    };
+    let _ = viewport_cmds(|ctx| {
+        u.handle_update_msg(
+            UpdateMsg::Downloaded(Ok((
+                std::path::PathBuf::from("/nonexistent/scr1b3-staged-binary"),
+                "9.9.9".to_string(),
+            ))),
+            ctx,
+        );
+    });
+    match &u.state {
+        UpdateState::Failed(e) => assert!(
+            e.contains("install failed"),
+            "the swap must have been ATTEMPTED, got: {e}"
+        ),
+        other => panic!("expected the apply to proceed to the swap, got {other:?}"),
+    }
+    assert!(
+        u.unsaved_hold_notice.is_none(),
+        "nothing was held, so nothing should be announced"
+    );
+}
+
+// The flag is only a gate while the host actually PUBLISHES it every frame.
+// That half is pinned in `app::lsp_and_preview_wiring_tests`
+// (`frame_tick_publishes_the_unsaved_verdict_to_the_updater_every_frame`),
+// which is inside the `app` module and can therefore read `ScribeApp::updater`.
+
 /// The chokepoint is only a chokepoint while it is the ONLY way out.
 ///
 /// A structural pin, in the idiom of the crate's other wiring guards: the

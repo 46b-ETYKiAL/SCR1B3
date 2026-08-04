@@ -2308,6 +2308,9 @@ mod build_plugins;
 mod builtins;
 mod chrome;
 mod deferred_actions;
+/// Pure placement rules for the inline LSP-diagnostic overlay (squiggle spans,
+/// gutter marks, hover text). The painting itself lives in `frame_tick`.
+mod diagnostics_overlay;
 /// The single seam to the OS file dialogs — headless under `cfg(test)`.
 pub(crate) mod dialogs;
 mod drag_scroll;
@@ -2323,6 +2326,8 @@ mod keyboard_input;
 mod keymap;
 mod modals;
 mod multi_cursor_glue;
+/// One-entry, content-keyed cache for the preview header's note metrics.
+mod note_metrics;
 mod notes_ui;
 mod render_support;
 // Re-export the rendering & text-geometry leaf helpers so existing bare-name
@@ -2555,3 +2560,6 @@ mod tabbar_layout_tests;
 
 #[cfg(test)]
 mod close_guard_tests;
+
+#[cfg(test)]
+mod lsp_and_preview_wiring_tests;

@@ -3153,6 +3153,8 @@ fn status_bar_encoding_language_and_diagnostics_labels_present() {
         uri: "inmemory://scratch".into(),
         line: 0,
         character: 0,
+        end_line: 0,
+        end_character: 2,
         severity: 1,
         message: "boom".into(),
     });

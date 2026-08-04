@@ -302,6 +302,27 @@ pub struct Updater {
     /// `ReleaseInfo` carried no index (a hand-built fixture; the production
     /// resolver always sets it).
     pending_release_index: Option<u64>,
+    /// Does the app hold unsaved edits right now? Republished by the host every
+    /// frame (`frame_tick`, immediately before [`poll`](Self::poll)).
+    ///
+    /// This is the gate on the IRREVERSIBLE half of an apply. `request_restart_close`
+    /// is already a close REQUEST the unsaved-changes guard adjudicates — but by
+    /// the time it is sent, the apply has ALREADY happened: the running exe has
+    /// been swapped and its replacement spawned, or the elevated installer has
+    /// been launched `-Wait` and is about to replace the files under us. Cancel
+    /// on the resulting prompt therefore could not mean what it says, and on the
+    /// installer path setup.exe could replace or kill the app while the modal was
+    /// still on screen. Both apply sites are reachable with NO user present —
+    /// `handle_update_msg` auto-chains `Downloaded(Ok)` / `InstallerReady(Ok)`
+    /// straight into them from `poll`, which the host drains every frame — so the
+    /// user may be mid-sentence.
+    ///
+    /// So the apply itself, not just the close, has to be behind the flag.
+    pub unsaved_work: bool,
+    /// Set when an apply was HELD because [`unsaved_work`](Self::unsaved_work)
+    /// was set. The host drains it into its own toast on the next frame — a hold
+    /// the user is never told about is indistinguishable from a broken button.
+    pub unsaved_hold_notice: Option<String>,
 }
 
 impl Updater {
@@ -316,6 +337,31 @@ impl Updater {
         if let Some(idx) = self.pending_release_index.take() {
             update::update_state::record_applied_index_for_current_exe(idx);
         }
+    }
+
+    /// Should this apply be HELD because the user has unsaved work?
+    ///
+    /// Sits at the top of BOTH apply routes, above every irreversible step: the
+    /// exe swap + replacement spawn, and the elevated `-Wait` installer launch.
+    /// It has to be there rather than at the close, because
+    /// `request_restart_close` runs AFTER the apply has already happened — at
+    /// which point "Cancel" on the unsaved-changes prompt cannot undo a swapped
+    /// binary, and a running setup.exe can replace or kill the app while the
+    /// prompt is still on screen.
+    ///
+    /// The held state is left EXACTLY as it was (`ReadyToApply` /
+    /// `ReadyToRunInstaller`), never `Failed`: nothing failed, and the user must
+    /// be able to save and click again. The only side effect is the notice the
+    /// host turns into a toast.
+    fn hold_for_unsaved_work(&mut self, route: &'static str) -> bool {
+        if !self.unsaved_work {
+            return false;
+        }
+        tracing::info!("update apply held ({route}): the app holds unsaved work");
+        self.unsaved_hold_notice = Some(
+            "Save your open files first — installing the update restarts SCR1B3.".to_string(),
+        );
+        true
     }
 
     /// Ask the APP to close so a staged update can finish applying.
@@ -500,6 +546,13 @@ impl Updater {
             self.state = UpdateState::Failed(e);
             return;
         }
+        // Everything above is reversible: a refusal only sets `Failed`. Below
+        // this line the apply becomes IRREVERSIBLE — an elevated setup.exe runs
+        // `-Wait` and replaces the files under us, and it can do that while an
+        // unsaved-changes prompt is still on screen. Hold here, above it.
+        if self.hold_for_unsaved_work("installer") {
+            return;
+        }
         // Launch with a UAC elevation prompt — the setup.exe is
         // requireAdministrator, so a plain CreateProcess fails with os error 740.
         // The staging dir is NOT cleaned here: the installer is running FROM it;
@@ -550,6 +603,14 @@ impl Updater {
                 current_version()
             );
             self.state = UpdateState::Failed(e);
+            return;
+        }
+        // Everything above is reversible: a refusal only sets `Failed`. Below
+        // this line the apply becomes IRREVERSIBLE — the running exe is swapped
+        // and its replacement spawned BEFORE any close is adjudicated, so a
+        // later "Cancel" on the unsaved-changes prompt could not undo it. Hold
+        // here, above it.
+        if self.hold_for_unsaved_work("in-place swap") {
             return;
         }
         // ReadyToApply is only ever reached on a WRITABLE install (start_download

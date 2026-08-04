@@ -427,6 +427,67 @@ impl ScribeApp {
         self.tabs.iter().any(EditorTab::is_dirty)
     }
 
+    /// Feed the active buffer to the language server, debounced.
+    ///
+    /// Called once per frame. Before this existed the client sent `didOpen` and
+    /// then nothing: the server's copy of the document was frozen at the moment
+    /// the file was opened, so every diagnostic the editor displayed described
+    /// text the user had already changed. `note_change` only records; the actual
+    /// `textDocument/didChange` goes out from `flush_pending_change` once the
+    /// buffer has been quiet for `lsp::sync::DEBOUNCE`.
+    ///
+    /// Guarded on URI identity: the client tracks ONE document, and a tab switch
+    /// must not send the newly-active buffer's text against the previously
+    /// opened file's URI. When the active tab is not the opened one we send
+    /// nothing and leave the server on its last known-good state (the user can
+    /// re-run "Start LSP" to move it) rather than corrupting it.
+    pub(super) fn sync_lsp_document(&mut self) {
+        let Some(client) = self.lsp.as_mut() else {
+            return;
+        };
+        let Some(open_uri) = client.open_uri().map(str::to_owned) else {
+            return;
+        };
+        let active = self.active.min(self.tabs.len().saturating_sub(1));
+        let matching_text = self.tabs.get(active).and_then(|t| {
+            let path = t.doc.path()?;
+            (path_to_uri(path) == open_uri).then(|| t.text.clone())
+        });
+        if let Some(text) = matching_text {
+            client.note_change(&text, std::time::Instant::now());
+        }
+        // Flush unconditionally: a pending change must still go out on the frame
+        // AFTER the user tabbed away, and a flush with nothing pending is a
+        // cheap `Option` check.
+        if let Err(e) = client.flush_pending_change(std::time::Instant::now()) {
+            // The writer thread is gone (server died). Diagnostics will stop
+            // updating; drop the client so a later "Start LSP" can spawn a
+            // fresh one instead of talking to a corpse.
+            tracing::warn!(
+                target: "scribe::lsp",
+                error_kind = ?e.kind(),
+                "language server stopped accepting changes; dropping the client"
+            );
+            self.lsp = None;
+            self.lsp_lang = None;
+        }
+    }
+
+    /// The active buffer's diagnostics resolved onto byte spans, ready to paint.
+    /// Empty (and free) when there are no diagnostics, which is the common case.
+    pub(super) fn diagnostic_spans_for_active(
+        &self,
+        active: usize,
+    ) -> Vec<super::diagnostics_overlay::DiagSpan> {
+        if self.diagnostics.is_empty() {
+            return Vec::new();
+        }
+        let Some(tab) = self.tabs.get(active) else {
+            return Vec::new();
+        };
+        super::diagnostics_overlay::diagnostic_spans(&tab.text, &self.diagnostics)
+    }
+
     /// Titles of the tabs holding unsaved edits, for the close prompt. Listing
     /// them is what makes the prompt actionable — "some file is unsaved" leaves
     /// the user unable to judge whether Discard is safe.
@@ -625,12 +686,29 @@ impl ScribeApp {
         }
         // Once per launch: kick off an automatic update check if opted in.
         self.maybe_remind_update(ctx);
+        // Republish the unsaved-work verdict BEFORE the drain, so the apply
+        // sites inside `poll` see this frame's answer. `poll` auto-chains
+        // `Downloaded(Ok)` / `InstallerReady(Ok)` straight into
+        // `apply_and_restart` / `run_installer` with no user present, and both
+        // of those do their IRREVERSIBLE work (exe swap + replacement spawn; the
+        // elevated `-Wait` installer launch) BEFORE any close is adjudicated —
+        // so by the time the unsaved-changes prompt appears, Cancel could no
+        // longer mean what it says. The apply itself has to be gated, not just
+        // the close. `has_unsaved_tabs` is the same predicate the close guard
+        // rules on, so the two can never disagree.
+        self.updater.unsaved_work = self.has_unsaved_tabs();
         // Drain the updater worker each frame. A `notify`-mode launch check that
         // found a release raises a prominent top banner (Update / Dismiss) instead
         // of the easily-missed passive toast — see the "update-notice" panel below.
         self.updater.poll(ctx);
         if let Some(v) = self.updater.toast_pending.take() {
             self.update_notice = Some(v);
+        }
+        // An apply that was HELD for unsaved work must say so — a silent hold is
+        // indistinguishable from a broken "Restart now" button. The updater's
+        // state is left retriable, so saving and clicking again just works.
+        if let Some(msg) = self.updater.unsaved_hold_notice.take() {
+            self.toast = Some(msg);
         }
         // `auto`-mode found-an-update yes/no modal.
         self.render_update_prompt(ctx);
@@ -806,6 +884,16 @@ impl ScribeApp {
         // back this frame so the results pane fills in progressively. Cheap
         // (one `try_recv` loop) and a no-op when no search is in flight.
         self.drain_find_in_files();
+
+        // Keep the language server's copy of the buffer in step with the
+        // editor's, then drain whatever it published back.
+        //
+        // Sync FIRST: the server only ever knew the text as it stood at
+        // `didOpen`, so without this every diagnostic on screen described a file
+        // the user had already edited past. `note_change` is a cheap per-frame
+        // record; nothing goes on the wire until the buffer has been quiet for
+        // `lsp::sync::DEBOUNCE`, so a keystroke cannot spam the server.
+        self.sync_lsp_document();
 
         // Drain LSP diagnostics published by the server thread.
         let mut new_diags: Option<Vec<Diagnostic>> = None;
@@ -2123,30 +2211,48 @@ impl ScribeApp {
                 .unwrap_or(false);
             if is_md {
                 let md = self.tabs[active].text.clone();
-                // The live preview re-parses the whole document and rebuilds the
-                // widget tree every frame it is open. Bound that cost: above this
-                // size the metric scans + full markdown parse are skipped and a
-                // notice is shown, so a multi-MiB note can't peg a core at single-
-                // digit FPS. (Mirrors the highlighter's own large-buffer cap.)
+                // Bound on the size of note the live preview will render.
+                //
+                // This cap used to be justified by "the preview re-parses the
+                // whole document and rebuilds the widget tree every frame". Half
+                // of that is no longer true: the parse is cached on the source
+                // text (`md_preview::cache`) and so are the three header metric
+                // scans below (`note_metrics`). The cap survives on the OTHER
+                // half — the widget rebuild, which is not cached and cannot
+                // easily be: `md_preview::show` reconstructs every egui widget
+                // for the whole document on every frame.
+                //
+                // Re-derived by measurement rather than inherited. Release
+                // profile, synthetic markdown, this machine:
+                //
+                //   size     parse (cold)   metrics (cold / cached)   full frame
+                //   256 KiB     10.5 ms        1.4 ms / 0.017 ms        26.8 ms
+                //   512 KiB      9.8 ms        2.3 ms / 0.035 ms        50.8 ms
+                //   1 MiB       23.8 ms        4.5 ms / 0.134 ms       117.3 ms
+                //   2 MiB       42.6 ms        9.7 ms / 0.214 ms       292.1 ms
+                //
+                // "full frame" is a complete egui pass through `md_preview::show`
+                // with the parse ALREADY cached. At 1 MiB that is ~117 ms — about
+                // 8 fps, seven times over a 60 fps budget — and the caching this
+                // change added removed only ~28 ms of it (parse + metrics). So
+                // the cap stays at 1 MiB: raising it would hand the user a
+                // preview that pins a core for a quarter-second per frame, and
+                // the two things that got cheaper were never what made it
+                // expensive.
                 const PREVIEW_MAX_BYTES: usize = 1 << 20; // 1 MiB
                 let preview_too_large = md.len() > PREVIEW_MAX_BYTES;
                 // P0-1 / P1-3: task progress + reading-time + heading count, shown
-                // in the preview header (computed via pure scribe-core fns). Skipped
-                // for an oversized note (each is a full-document scan).
-                let (done, total) = if preview_too_large {
-                    (0, 0)
+                // in the preview header. Three full-document scans, cached on the
+                // source text so they run once per EDIT rather than once per
+                // frame. Still skipped entirely for an oversized note, whose
+                // preview is not drawn at all.
+                let metrics = if preview_too_large {
+                    super::note_metrics::NoteMetrics::default()
                 } else {
-                    scribe_core::md_ops::tasks_progress(&md)
+                    super::note_metrics::metrics_for(&md)
                 };
-                let (mins, headings) = if preview_too_large {
-                    (0, 0)
-                } else {
-                    let words = md.split_whitespace().count();
-                    (
-                        scribe_core::md_ops::reading_time_minutes(words),
-                        scribe_core::md_ops::heading_outline(&md).len(),
-                    )
-                };
+                let (done, total) = (metrics.done, metrics.total);
+                let (mins, headings) = (metrics.minutes, metrics.headings);
                 // Source lines whose checkbox was clicked this frame (applied
                 // after the panel closes so the borrow on `md` is released).
                 let mut toggled: Vec<usize> = Vec::new();
@@ -2304,6 +2410,13 @@ impl ScribeApp {
                 "change_bar_saved",
                 Rgba::new(0x6f, 0xb8, 0x9a, 255),
             );
+            // Diagnostic gutter marks: worst severity per source line, sorted.
+            // The squiggle tells you a line is wrong once you are looking at it;
+            // the gutter mark is what tells you WHICH line to look at while you
+            // are somewhere else in the file.
+            let diag_marks = super::diagnostics_overlay::gutter_marks(&self.diagnostics);
+            let diag_err = ui_color(&self.theme, "error", Rgba::new(0xe5, 0x3e, 0x3e, 255));
+            let diag_warn = ui_color(&self.theme, "warning", Rgba::new(0xf2, 0xb3, 0x3d, 255));
             egui::SidePanel::left("line-gutter")
                 .exact_width(gutter_w)
                 .resizable(false)
@@ -2360,6 +2473,27 @@ impl ScribeApp {
                                 egui::pos2(lx, y + gutter_row_h * 0.5),
                                 3.0,
                                 accent,
+                            );
+                        }
+                        // Diagnostic marker: a short severity-coloured bar on the
+                        // gutter's LEFT edge (the bookmark dot's own lane is a
+                        // circle at `lx`; a bar is a distinguishable shape at the
+                        // same glance, and the two can legitimately coexist on
+                        // one line). Errors win over warnings on a shared line.
+                        if let Ok(m) = diag_marks.binary_search_by_key(&(i as u32), |(l, _)| *l) {
+                            let sev = diag_marks[m].1;
+                            let col = match sev {
+                                super::diagnostics_overlay::SEVERITY_ERROR => diag_err,
+                                super::diagnostics_overlay::SEVERITY_WARNING => diag_warn,
+                                _ => muted,
+                            };
+                            painter.rect_filled(
+                                egui::Rect::from_min_max(
+                                    egui::pos2(lx - 3.0, y + gutter_row_h * 0.2),
+                                    egui::pos2(lx - 0.5, y + gutter_row_h * 0.8),
+                                ),
+                                1.0,
+                                col,
                             );
                         }
                         painter.text(
@@ -2723,6 +2857,11 @@ impl ScribeApp {
                 // BEFORE the partial borrows below so the owned Vec can move into
                 // the editor closure and drive the red underline painter.
                 let misspellings = self.misspellings_for_active();
+                // LSP diagnostics resolved onto byte spans, owned so they can
+                // move into the editor closure alongside `misspellings` and
+                // drive the squiggle + hover overlay. Empty (and free) when the
+                // language server has published nothing.
+                let diag_spans = self.diagnostic_spans_for_active(active);
                 // Wave-5: compute all find matches once (needs &self) so the
                 // highlight-all overlay can paint every match, not just the
                 // navigated one. Empty when the find bar is closed.
@@ -3109,6 +3248,99 @@ impl ScribeApp {
                                 let x0 = out.galley_pos.x + r0.min.x;
                                 let x1 = out.galley_pos.x + r1.min.x;
                                 paint_squiggle(painter, x0, x1, y, red);
+                            }
+                        }
+                        // ---- Inline LSP diagnostics ----
+                        //
+                        // The client has drained `publishDiagnostics` since it
+                        // was written, but the ONLY thing rendered from them was
+                        // a pair of integers in the status bar ("3e / 7") — no
+                        // squiggle, no gutter mark, no message. Two integers do
+                        // not tell you which line is wrong or why. Paint a
+                        // severity-coloured squiggle under each diagnostic's
+                        // range, and describe it on hover.
+                        //
+                        // Painted per galley ROW rather than per span, so a
+                        // multi-line diagnostic (an unclosed delimiter, a type
+                        // error spanning a match arm) underlines every line it
+                        // covers instead of being dropped for spanning rows —
+                        // and so it follows soft wrapping.
+                        if !diag_spans.is_empty() {
+                            let text_ref = &self.tabs[active].text;
+                            let painter = ui.painter();
+                            let err_c = ui_color(
+                                &self.theme,
+                                "error",
+                                Rgba::new(0xe5, 0x3e, 0x3e, 255),
+                            );
+                            let warn_c = ui_color(
+                                &self.theme,
+                                "warning",
+                                Rgba::new(0xf2, 0xb3, 0x3d, 255),
+                            );
+                            let info_c = accent;
+                            let origin = out.galley_pos.to_vec2();
+                            // Rects actually painted, so the hover test is
+                            // "is the pointer over a squiggle", not "is it
+                            // somewhere on a line that has one".
+                            let mut painted: Vec<egui::Rect> = Vec::new();
+                            for span in &diag_spans {
+                                let color = match span.severity {
+                                    crate::app::diagnostics_overlay::SEVERITY_ERROR => err_c,
+                                    crate::app::diagnostics_overlay::SEVERITY_WARNING => warn_c,
+                                    crate::app::diagnostics_overlay::SEVERITY_INFO => info_c,
+                                    _ => muted,
+                                };
+                                let c0 = byte_to_char_index(text_ref, span.start);
+                                let c1 = byte_to_char_index(text_ref, span.end);
+                                let mut row_start = 0usize;
+                                for prow in &out.galley.rows {
+                                    let row_end =
+                                        row_start + prow.char_count_including_newline();
+                                    let s = c0.max(row_start);
+                                    let e = c1.min(row_end);
+                                    if s < e {
+                                        let rx = origin.x + prow.pos.x;
+                                        let x0 = rx + prow.row.x_offset(s - row_start);
+                                        let x1 = rx + prow.row.x_offset(e - row_start);
+                                        let top = origin.y + prow.pos.y;
+                                        let bot = top + prow.row.size.y;
+                                        paint_squiggle(painter, x0, x1, bot, color);
+                                        painted.push(egui::Rect::from_min_max(
+                                            egui::pos2(x0, top),
+                                            egui::pos2(x1, bot),
+                                        ));
+                                    }
+                                    row_start = row_end;
+                                    if row_start >= c1 {
+                                        break;
+                                    }
+                                }
+                            }
+                            // Hover: name the problem. Resolved through the
+                            // galley so the message belongs to the character
+                            // under the pointer, not merely to the same line.
+                            if let Some(p) = ui.ctx().pointer_hover_pos() {
+                                if painted.iter().any(|r| r.contains(p)) {
+                                    let cursor =
+                                        out.galley.cursor_from_pos(p - out.galley_pos);
+                                    let byte = char_to_byte(text_ref, cursor.index);
+                                    if let Some(text) =
+                                        crate::app::diagnostics_overlay::hover_text(
+                                            &diag_spans,
+                                            byte,
+                                        )
+                                    {
+                                        egui::show_tooltip_at_pointer(
+                                            ui.ctx(),
+                                            out.response.layer_id,
+                                            egui::Id::new("scr1b3-diagnostic-tooltip"),
+                                            |ui| {
+                                                ui.label(text);
+                                            },
+                                        );
+                                    }
+                                }
                             }
                         }
                         // Wave-5: incremental highlight-all — paint a translucent
