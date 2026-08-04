@@ -41,6 +41,25 @@ toml.workspace = true
 # (no `unsafe`), so the app keeps `#![forbid(unsafe_code)]`.
 raw-window-handle = "0.6"
 
+# Windows-only: the system-tray icon + its right-click menu (single left-click
+# minimize/restore). Scoped to `cfg(windows)` DELIBERATELY — on Linux `tray-icon`
+# needs GTK3 + libxdo (a large new native surface for a feature the Linux desktop
+# increasingly serves via a different protocol), and on macOS the dock already
+# provides minimize/restore. The tray is a Windows-shell affordance, so the
+# dependency is a Windows-shell dependency.
+#
+# `default-features = false` drops the `libxdo` feature (Linux-only anyway) and
+# the optional PNG decoding — we hand it a raw RGBA buffer decoded by the same
+# `eframe::icon_data::from_png_bytes` the window icon already uses, so no second
+# image decoder enters the graph.
+#
+# Pinned EXACT (`=`) per the production-dependency pinning policy: this crate
+# owns a process-wide event handler and a shell icon, so an unattended patch bump
+# is a behaviour change in the OS integration layer, not a transparent fix.
+# License MIT OR Apache-2.0 (deny.toml allow-list). No network, no telemetry.
+[target.'cfg(windows)'.dependencies]
+tray-icon = { version = "=0.24.2", default-features = false }
+
 [dev-dependencies]
 tempfile = "3"
 # Glyph-coverage assertion for the bundled Noto Sans JP kanji subset. Same

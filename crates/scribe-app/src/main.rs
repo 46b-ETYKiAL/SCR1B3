@@ -32,8 +32,10 @@ mod plugin_manager;
 mod reporting;
 mod session_path_guard;
 mod settings;
+mod single_instance;
 mod theme_editor;
 mod to_markdown;
+mod tray;
 mod updater;
 
 use std::process::ExitCode;
@@ -55,6 +57,19 @@ fn main() -> ExitCode {
     // the binary behaves like a normal CLI for the "scr1b3 --help" / "scr1b3
     // --version" surfaces every shell user expects.
     let cli_action = cli::parse(std::env::args().skip(1));
+    // The launch arguments, captured from the SAME parse the dispatch below uses
+    // (the prior code re-parsed further down purely to recover them). They feed
+    // both the single-instance hand-off and `ScribeApp::new`.
+    let (cli_paths, cli_jump): (Vec<String>, Option<(usize, Option<usize>)>) = match &cli_action {
+        cli::Action::Launch { paths, jump } => (
+            paths
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect(),
+            *jump,
+        ),
+        _ => (Vec::new(), None),
+    };
     match cli_action {
         cli::Action::Help => {
             println!("{}", cli::help_text());
@@ -80,6 +95,51 @@ fn main() -> ExitCode {
         )
         .with_writer(std::io::stderr)
         .try_init();
+
+    // Single-instance guard. SCR1B3 registers file associations, so Explorer
+    // spawns one `scr1b3.exe <path>` per selected file — without this, opening
+    // five files starts five processes that each own a window, a GPU device and
+    // a copy of the session writer. A secondary hands its arguments to the
+    // running primary (which opens them and raises itself) and exits.
+    //
+    // Every failure mode here falls THROUGH to a normal launch: an unwritable
+    // config dir or a failed hand-off must never swallow the file the user
+    // asked for. `_instance_lock` must outlive `run_native` — dropping it early
+    // would hand ownership away while this window is still up.
+    let instance_root = scribe_core::Config::config_dir()
+        .map(|dir| single_instance::instance_root(&dir))
+        .filter(|_| {
+            !single_instance::wants_new_instance(
+                std::env::var(single_instance::NEW_INSTANCE_ENV)
+                    .ok()
+                    .as_deref(),
+            )
+        });
+    let instance_lock = match instance_root.as_deref() {
+        Some(root) => match single_instance::acquire(root) {
+            Ok(single_instance::Startup::Primary(lock)) => Some(lock),
+            Ok(single_instance::Startup::Secondary) => {
+                let request = single_instance::Request {
+                    paths: cli_paths.clone(),
+                    jump: cli_jump,
+                };
+                match single_instance::forward(root, &request) {
+                    Ok(()) => return ExitCode::SUCCESS,
+                    Err(e) => {
+                        // The primary is alive but unreachable. Opening a second
+                        // window is strictly better than dropping the user's file.
+                        tracing::warn!("single-instance hand-off failed: {e}; launching anyway");
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("single-instance lock unavailable: {e}; launching unguarded");
+                None
+            }
+        },
+        None => None,
+    };
 
     // Load config BEFORE installing the panic hook so the hook knows the
     // opt-in crash-report posture (default OFF). Load is pure + idempotent.
@@ -202,29 +262,26 @@ fn main() -> ExitCode {
         ..Default::default()
     };
 
-    // Re-parse here so we can hand the paths AND the `PATH:LINE:COLUMN` jump
-    // target to ScribeApp::new. (Parsing is pure and idempotent — same args,
-    // same Action.) The prior code discarded `jump` with `..`, so `scr1b3
-    // file:42:10` always opened at line 1 — the editor never received the
-    // position. Capture it here and thread it through `new`.
-    let (cli_paths, cli_jump): (Vec<String>, Option<(usize, Option<usize>)>) =
-        match cli::parse(std::env::args().skip(1)) {
-            cli::Action::Launch { paths, jump } => (
-                paths
-                    .iter()
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .collect(),
-                jump,
-            ),
-            _ => (Vec::new(), None),
-        };
-
+    // `cli_paths` / `cli_jump` were captured from the single `cli::parse` above
+    // (they also fed the single-instance hand-off), so the `PATH:LINE:COLUMN`
+    // jump target reaches `ScribeApp::new` intact.
+    //
+    // `handoff_root` is `Some` only for the process that OWNS the instance lock:
+    // a fall-through launch (unwritable config dir, failed hand-off) must not
+    // also start draining the queue, or two windows would race to open the same
+    // forwarded file.
+    let handoff_root = instance_lock.as_ref().and(instance_root);
     let result = eframe::run_native(
         scribe_core::PRODUCT_NAME,
         native_options,
         Box::new(move |cc| {
             Ok(Box::new(app::ScribeApp::new(
-                cc, config, config_err, cli_paths, cli_jump,
+                cc,
+                config,
+                config_err,
+                cli_paths,
+                cli_jump,
+                handoff_root,
             )))
         }),
     );

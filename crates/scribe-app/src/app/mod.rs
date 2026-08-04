@@ -1007,6 +1007,15 @@ pub struct ScribeApp {
     /// Selection length in characters, if the cursor range is non-empty.
     /// Drives the status-bar segment "(N chars selected)". Closes F-024.
     last_selection_chars: usize,
+    /// Root of the single-instance hand-off queue, for the process that OWNS
+    /// the instance lock. `None` for `new_test` and for a launch that could not
+    /// take the lock (an unguarded fall-through must not also drain, or two
+    /// windows would race to open the same forwarded file).
+    handoff_root: Option<PathBuf>,
+    /// Frame number at which the hand-off queue was last drained, throttled the
+    /// same way as the external-disk poll — a `read_dir` on every frame of an
+    /// idle editor is pure waste.
+    last_handoff_poll_frame: u64,
 }
 
 /// State for the open completion popup.
@@ -1026,8 +1035,19 @@ impl ScribeApp {
         config_err: Option<String>,
         cli_paths: Vec<String>,
         cli_jump: Option<(usize, Option<usize>)>,
+        handoff_root: Option<PathBuf>,
     ) -> Self {
         let mut app = Self::build(config, config_err, cli_paths, true);
+        // Single-instance hand-off: this process owns the lock, so later launches
+        // will drop their arguments into `handoff_root` instead of starting their
+        // own window. `ui` drains the queue; the watcher below is what makes that
+        // work while the window is minimized and egui has stopped repainting.
+        app.handoff_root = handoff_root;
+        app.spawn_handoff_watcher(&cc.egui_ctx);
+        // Windows system-tray icon (single-click minimize/restore, right-click
+        // menu). Best-effort: a shell without a notification area logs and
+        // leaves no tray. No-op off Windows.
+        crate::tray::init(&cc.egui_ctx);
         // Apply a `PATH:LINE[:COLUMN]` jump target (from `scr1b3 file:42:10`) to
         // the first opened tab, so the editor opens scrolled to the requested
         // line rather than at line 1. Runs after `build` (which opened the CLI
@@ -1443,6 +1463,11 @@ impl ScribeApp {
             grid_close_queue: Vec::new(),
             last_cursor_line_col: None,
             last_selection_chars: 0,
+            // Set by `new` for the production launch that owns the instance
+            // lock; `new_test` leaves it `None` so a headless test never
+            // touches (or drains) the real user's hand-off queue.
+            handoff_root: None,
+            last_handoff_poll_frame: u64::MAX,
         };
 
         app
@@ -2051,6 +2076,117 @@ pub(crate) const NOTE_THEMES: &[&str] = &[
     "Catppuccin Latte",
 ];
 
+/// How many frames must elapse between hand-off queue polls. At ~60 fps this is
+/// ~4 Hz — a forwarded file appears effectively instantly, and an idle editor
+/// does not pay a `read_dir` on every frame. Mirrors [`DISK_POLL_INTERVAL_FRAMES`].
+const HANDOFF_POLL_INTERVAL_FRAMES: u64 = 15;
+
+impl ScribeApp {
+    /// Wake this (primary) process when a secondary launch queues a request.
+    ///
+    /// Necessary because the queue is drained from the frame loop, and a
+    /// minimized or fully-idle window is not repainting: without a wake, opening
+    /// a file from Explorer while SCR1B3 sits minimized would do nothing until
+    /// the user happened to touch the window. The thread only ever asks for a
+    /// repaint — all state changes stay on the frame thread.
+    fn spawn_handoff_watcher(&self, ctx: &egui::Context) {
+        let Some(root) = self.handoff_root.clone() else {
+            return;
+        };
+        let ctx = ctx.clone();
+        let spawned = std::thread::Builder::new()
+            .name("scr1b3-handoff".to_string())
+            .spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                if crate::single_instance::pending(&root) {
+                    ctx.request_repaint();
+                }
+            });
+        if let Err(e) = spawned {
+            // Not fatal: the queue is still drained on every painted frame, so a
+            // forwarded file arrives as soon as the window is touched. Log it —
+            // silently losing the wake would look like "the tray/Explorer open
+            // is flaky" with no trace.
+            tracing::warn!("hand-off watcher thread could not start: {e}");
+        }
+    }
+
+    /// Drain any launches forwarded by a secondary process, open what they
+    /// asked for, and raise this window.
+    ///
+    /// A raise happens for EVERY request, including one with no paths: a bare
+    /// second launch (double-clicking the icon or the taskbar tile) is the user
+    /// asking for the existing window, and answering it with nothing visible
+    /// would read as a dead application.
+    pub(super) fn poll_handoff_queue(&mut self, ctx: &egui::Context) {
+        let Some(root) = self.handoff_root.clone() else {
+            return;
+        };
+        let frame = ctx.cumulative_pass_nr();
+        if !should_poll_disk(
+            frame,
+            self.last_handoff_poll_frame,
+            HANDOFF_POLL_INTERVAL_FRAMES,
+        ) {
+            return;
+        }
+        self.last_handoff_poll_frame = frame;
+        let requests = crate::single_instance::drain(&root);
+        if requests.is_empty() {
+            return;
+        }
+        for request in requests {
+            self.apply_handoff_request(&request);
+        }
+        // Un-minimize BEFORE focusing — see `tray::restore_commands`.
+        for cmd in crate::tray::restore_commands() {
+            ctx.send_viewport_cmd(cmd);
+        }
+    }
+
+    /// Open one forwarded launch's files. An already-open path activates its
+    /// existing tab instead of opening a duplicate; the FIRST path becomes the
+    /// active tab, matching how a cold launch treats its command line.
+    pub(super) fn apply_handoff_request(&mut self, request: &crate::single_instance::Request) {
+        let mut first_opened: Option<usize> = None;
+        for raw in &request.paths {
+            let path = PathBuf::from(raw);
+            if let Some(idx) = self
+                .tabs
+                .iter()
+                .position(|t| t.doc.path() == Some(path.as_path()))
+            {
+                first_opened.get_or_insert(idx);
+                continue;
+            }
+            match EditorTab::from_path(path) {
+                Ok(tab) => {
+                    self.tabs.push(tab);
+                    first_opened.get_or_insert(self.tabs.len() - 1);
+                }
+                Err(e) => {
+                    self.toast = Some(format!("could not open {raw}: {e}"));
+                }
+            }
+        }
+        if let Some(idx) = first_opened {
+            self.active = idx;
+            self.status = format!("opened {} file(s) from a new launch", request.paths.len());
+            // `apply_cli_jump` is not reusable here: it forces `active = 0`,
+            // which is correct for a cold launch (the CLI files ARE tabs 0..n)
+            // and wrong for a hand-off landing after a session restore.
+            if let Some((line, col)) = request.jump {
+                if line > 0 {
+                    self.goto_line(line);
+                    if let Some(c) = col {
+                        self.status = format!("go to line {line}:{c}");
+                    }
+                }
+            }
+        }
+    }
+}
+
 impl eframe::App for ScribeApp {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         // Transparent for frameless rounded corners.
@@ -2104,6 +2240,10 @@ impl eframe::App for ScribeApp {
                 }
             }
         }
+        // Single-instance hand-off: pick up anything a later launch forwarded
+        // (and raise this window) BEFORE the frame is built, so the files it
+        // asked for are painted in the very frame the window comes forward.
+        self.poll_handoff_queue(&ctx);
         self.frame_tick(&ctx);
     }
 }
@@ -2319,6 +2459,9 @@ mod tab_reorder_tests;
 
 #[cfg(test)]
 mod sidetab_drop_indicator_tests;
+
+#[cfg(test)]
+mod handoff_tests;
 
 #[cfg(test)]
 mod multi_file_open_tests;
