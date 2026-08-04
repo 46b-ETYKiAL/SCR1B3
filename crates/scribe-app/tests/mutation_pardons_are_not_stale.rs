@@ -167,7 +167,11 @@ fn resolve(repo_root: &Path, partial: &str) -> Option<PathBuf> {
         }
     }
     // An ambiguous partial would make this test assert about the wrong file.
-    if hits.len() == 1 { hits.pop() } else { None }
+    if hits.len() == 1 {
+        hits.pop()
+    } else {
+        None
+    }
 }
 
 fn read_config() -> String {
