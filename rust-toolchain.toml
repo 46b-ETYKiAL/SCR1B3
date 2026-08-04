@@ -1,3 +1,11 @@
+# Pinned build toolchain for local dev + CI. This is NOT the MSRV — the
+# workspace floor is Cargo.toml `rust-version` (1.92), which is lower.
+#
+# MSRV implication: this file is a rustup DIRECTORY OVERRIDE, so it outranks
+# rustup's default toolchain in every process whose cwd is this repo. That is
+# why the `msrv` job in .github/workflows/ci.yml must set RUSTUP_TOOLCHAIN (env
+# outranks this file) rather than just `rustup default` the MSRV — otherwise the
+# MSRV check silently runs on 1.95.0 and can never fail.
 [toolchain]
 channel = "1.95.0"
 components = ["rustfmt", "clippy"]
