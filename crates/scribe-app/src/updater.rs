@@ -318,6 +318,35 @@ impl Updater {
         }
     }
 
+    /// Ask the APP to close so a staged update can finish applying.
+    ///
+    /// This is the ONE place in the updater that may take the window away.
+    /// Every path that refuses or fails an apply — a call from the wrong state,
+    /// the anti-rollback downgrade refusal, a failed installer launch, a failed
+    /// in-place swap — sits ABOVE it and is therefore provably close-free
+    /// (`a_refused_*` / `a_failed_*` in `updater_restart_close_tests.rs` assert
+    /// that on the emitted `ViewportCommand`s, and
+    /// `the_updater_has_exactly_one_place_that_can_take_the_window_away` pins
+    /// the chokepoint itself).
+    ///
+    /// It is deliberately a close REQUEST, never a bare "destroy this window".
+    /// The host round-trips `ViewportCommand::Close` back in as the NEXT frame's
+    /// `close_requested()` — `egui_winit::process_viewport_commands` turns the
+    /// command into a `ViewportEvent::Close` on the viewport's `ViewportInfo`,
+    /// and eframe rebuilds `raw_input.viewports` from that info — so the app
+    /// receives exactly the signal an OS ✕ / Alt+F4 delivers. That is what puts
+    /// an update restart behind `frame_tick`'s unsaved-changes guard: with dirty
+    /// buffers the guard raises the Save / Discard / Cancel prompt instead of
+    /// destroying the window, and any close that does proceed still HIDES one
+    /// frame before it destroys (the T19.1 DWM-ghost fix).
+    ///
+    /// The corollary the updater must respect: "I asked to close" is NOT "we
+    /// closed". The app can refuse, and with unsaved work it does — so nothing
+    /// here may assume the process is about to end.
+    fn request_restart_close(ctx: &egui::Context) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
+
     /// True while a network/apply operation is in flight (used to disable the
     /// "Check for updates" button so a second click can't spawn a second job).
     pub fn is_busy(&self) -> bool {
@@ -442,7 +471,10 @@ impl Updater {
     }
 
     /// Launch the staged, verified self-elevating installer in SILENT mode and
-    /// close the app so it can replace the files in place. The helper (see
+    /// ask the app to close (via
+    /// [`request_restart_close`](Self::request_restart_close) — a REQUEST the
+    /// unsaved-changes close guard adjudicates) so it can replace the files in
+    /// place. The helper (see
     /// [`launch_installer_elevated`]) shows ONE UAC prompt, runs the installer
     /// with no window and no click-through, waits for it, then relaunches
     /// SCR1B3 — so from the user's view a machine-wide update is as seamless as
@@ -481,7 +513,7 @@ impl Updater {
                 // its manifest release_index as the new anti-rollback floor.
                 self.commit_applied_index();
                 self.state = UpdateState::Applied { version };
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                Self::request_restart_close(ctx);
             }
             Err(e) => {
                 tracing::error!(
@@ -497,7 +529,9 @@ impl Updater {
     }
 
     /// Swap the running executable for the staged, verified binary and best-
-    /// effort relaunch. On success the caller should close the window.
+    /// effort relaunch, then ask the app to close via
+    /// [`request_restart_close`](Self::request_restart_close) — a REQUEST the
+    /// unsaved-changes close guard adjudicates, not a bare destroy.
     pub fn apply_and_restart(&mut self, ctx: &egui::Context) {
         let UpdateState::ReadyToApply { staged, version } = &self.state else {
             return;
@@ -547,7 +581,7 @@ impl Updater {
                         tracing::info!("update applied: v{version} swapped in and relaunching");
                         self.commit_applied_index();
                         self.state = UpdateState::Applied { version };
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        Self::request_restart_close(ctx);
                     }
                     Err(e) => {
                         // The verified update was installed but wouldn't start.
@@ -695,6 +729,13 @@ impl Updater {
         }
     }
 }
+
+/// The update-restart close contract: which paths may take the window away, and
+/// what the app does with the request when they do. Kept in its own file because
+/// it drives the REAL `ScribeApp::frame_tick`, not just this module's state.
+#[cfg(test)]
+#[path = "updater_restart_close_tests.rs"]
+mod restart_close_tests;
 
 #[cfg(test)]
 mod tests {
