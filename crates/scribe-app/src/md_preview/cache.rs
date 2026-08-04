@@ -156,17 +156,29 @@ mod tests {
     }
 
     #[test]
-    fn the_live_entry_point_uses_the_real_parser_options() {
-        // `blocks()` must key on PARSER_OPTIONS — not on 0 or a stale constant —
-        // so a table (a PARSER_OPTIONS-gated extension) actually parses.
+    fn the_live_entry_point_keys_on_the_real_parser_options() {
+        // `blocks()` must store PARSER_OPTIONS as the key's option half — not 0
+        // or a stale constant. Asserting only that a table parses would NOT show
+        // this: `parse` applies PARSER_OPTIONS internally whatever bits the key
+        // carries, so the table would appear either way. The discriminating
+        // probe is to re-ask with the real bits explicitly and require a HIT —
+        // if `blocks()` had stored anything else, that is a miss and re-parses.
+        let src = "| a | b |\n|---|---|\n| 1 | 2 |\n";
         let mut c = PreviewCache::new();
-        let blocks = c.blocks("| a | b |\n|---|---|\n| 1 | 2 |\n").to_vec();
+        c.blocks(src);
+        assert_eq!(c.parses(), 1);
+        c.blocks_for(src, super::super::PARSER_OPTIONS.bits());
+        assert_eq!(
+            c.parses(),
+            1,
+            "blocks() must have keyed the entry on PARSER_OPTIONS.bits()"
+        );
+        // Sanity: the entry really is the extension-parsed one.
+        let blocks = c.blocks(src).to_vec();
         assert!(
             blocks.iter().any(|b| matches!(b, MdBlock::Table { .. })),
-            "blocks() must parse with PARSER_OPTIONS, got {blocks:?}"
+            "the cached blocks are the PARSER_OPTIONS parse, got {blocks:?}"
         );
         assert_eq!(c.parses(), 1);
-        c.blocks("| a | b |\n|---|---|\n| 1 | 2 |\n");
-        assert_eq!(c.parses(), 1, "and it must still hit the cache");
     }
 }
