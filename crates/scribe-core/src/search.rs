@@ -81,6 +81,26 @@ pub fn find_all(text: &str, q: &Query) -> Result<Vec<Match>> {
 ///
 /// Zero-width matches are skipped per the module-level empty-match policy, so
 /// the replacement is never injected between characters.
+///
+/// # STATUS: no production caller — this is the library half of the API pair
+///
+/// The editor never calls this. Its one replace call site
+/// (`scribe-app/src/app/find_replace.rs`) passes a dynamic `Option<usize>` limit
+/// — `Some(1)` for "Replace next", `None` for "Replace all" — so it always calls
+/// [`replace_n`] directly. This wrapper's callers are the crate's criterion
+/// bench (`benches/search.rs`) and the proptest / miri / correctness integration
+/// suites.
+///
+/// It is kept, rather than deleted, because it is the unbounded half of the
+/// `replace_all` / `replace_n` pair that mirrors the `regex` crate's own
+/// `replace_all` / `replacen` shape — the spelling a reader of this module
+/// expects to find. It carries no external risk: `scribe-core` is a
+/// workspace-internal crate (not published), and the Rhai plugin surface exposes
+/// no search API, so nothing outside this repository can depend on it.
+///
+/// The "no production caller" claim is ENFORCED, not asserted: see
+/// `scribe-app/tests/public_api_dormancy.rs`. Wire this into the app and that
+/// guard fails, demanding this note be corrected.
 pub fn replace_all(text: &str, q: &Query, replacement: &str) -> Result<String> {
     replace_n(text, q, replacement, None)
 }

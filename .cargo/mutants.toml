@@ -247,8 +247,11 @@ exclude_re = [
   'find_in_files\.rs:108:',         # walk_project batch>remaining -> >=: truncate-to-equal is a no-op
   'find_in_files\.rs:77:44:',       # walk_project outer ||: inner line-84 cap backstops identical output
   'issue_intake\.rs:187:',          # title_tail_from >80 -> >=: both branches equal at count==80
-  'md_preview\.rs:279:',            # parse Heading-Start runs.clear(): runs always empty at a block Start (defensive)
-  'md_preview\.rs:289:',            # parse Paragraph-Start runs.clear(): same
+  # Re-anchored on the mutant DESCRIPTION after both line anchors rotated during
+  # the markdown work (:279 slid onto `None => MdBlock::ListItem {`, :289 onto a
+  # doc comment). A description anchor cannot rotate.
+  'delete match arm Event::Start\(Tag::Heading\{\.\.\}\) in parse',   # runs always empty at a block Start (defensive)
+  'delete match arm Event::Start\(Tag::Paragraph\) in parse',        # same
   'md_preview\.rs:628:',            # is_safe_link path-sep break: the un-broken char is not a valid scheme char anyway
   'multi_cursor\.rs:232:',          # apply_edit Delete head<total -> <=: EOF caret sorts last; shift never propagates
   'multi_cursor\.rs:419:',          # reconcile_carets !is_primary tiebreak: retain-primary swap compensates

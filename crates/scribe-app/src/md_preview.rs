@@ -1,25 +1,46 @@
 //! Markdown preview: `pulldown-cmark` events → a flat, document-order list of
 //! styled [`MdBlock`]s that the egui side panel renders as native widgets.
 //!
-//! **No HTML, no webview, no JavaScript.** Only the common CommonMark subset is
-//! rendered (headings, paragraphs, emphasis/strong, inline + fenced code, bullet
-//! and ordered lists, blockquotes, links, horizontal rules); anything else
-//! degrades to plain text. This keeps the crate `#![forbid(unsafe_code)]` and
-//! adds zero attack surface beyond the pure-Rust parser.
+//! **No HTML, no webview, no JavaScript.** The CommonMark core plus four GFM
+//! extensions are rendered (headings, paragraphs, emphasis/strong, inline +
+//! fenced code, bullet and ordered lists, task lists, blockquotes/callouts,
+//! links, horizontal rules, **tables**, **footnotes** and **math**); anything
+//! else degrades to plain text. This keeps the crate `#![forbid(unsafe_code)]`
+//! and adds zero attack surface beyond the pure-Rust parser.
 //!
-//! The design splits cleanly into two halves:
+//! The design splits cleanly into three parts:
 //!   1. [`parse`] — pure `&str -> Vec<MdBlock>`, no egui dependency, fully unit
 //!      tested below. This is the load-bearing logic.
 //!   2. [`show`] — walks the parsed blocks and emits egui widgets. It contains
 //!      no parsing logic, so it cannot be the source of a markdown bug.
+//!   3. [`cache`] — a one-entry, content-keyed cache in front of [`parse`], so
+//!      an open preview pane does not re-parse the whole document on every
+//!      frame. [`show`] goes through it; [`parse`] itself stays pure.
 //!
 //! Built against `pulldown-cmark` 0.13 (the 0.11 → 0.13 split moved every block
 //! end-tag onto the [`pulldown_cmark::TagEnd`] enum; `Tag::Heading` carries a
 //! `level` field; `Tag::List(Option<u64>)` carries the ordered-list start index;
 //! `Tag::Link { dest_url, .. }`; `Tag::CodeBlock(CodeBlockKind)`).
 
+mod cache;
+mod math;
+
 use egui::{Color32, RichText};
-use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use std::cell::RefCell;
+use std::collections::HashMap;
+
+/// The markdown extensions this module understands, in ONE place so the block
+/// parser, the HTML export and the preview cache key can never disagree.
+///
+/// Kept deliberately narrow: an extension is enabled only once there is code
+/// that RENDERS it. Enabling a flag without a renderer is worse than leaving it
+/// off — `pulldown-cmark` would consume the source markers (e.g. `~~`) and the
+/// unhandled event would then drop the content silently.
+const PARSER_OPTIONS: Options = Options::ENABLE_TASKLISTS
+    .union(Options::ENABLE_TABLES)
+    .union(Options::ENABLE_FOOTNOTES)
+    .union(Options::ENABLE_MATH);
 
 /// Render markdown source to a standalone, self-contained HTML document (for the
 /// "Export as HTML" command). Uses pulldown-cmark's own HTML writer — pure Rust,
@@ -64,6 +85,11 @@ pub fn to_html(md: &str) -> String {
          pre code{{background:none;padding:0}}\n\
          blockquote{{border-left:3px solid #ccc;margin:0;padding-left:1rem;color:#555}}\n\
          table{{border-collapse:collapse}}td,th{{border:1px solid #ccc;padding:.3rem .6rem}}\n\
+         th{{background:#f4f4f4}}\n\
+         .math{{font-family:ui-serif,Georgia,serif;font-style:italic}}\n\
+         .math-display{{display:block;text-align:center;margin:1rem 0}}\n\
+         .footnote-definition{{font-size:.9em;color:#555}}\n\
+         .footnote-definition p{{display:inline;margin:0}}\n\
          </style>\n</head>\n<body>\n{body}</body>\n</html>\n"
     )
 }
@@ -72,7 +98,13 @@ pub fn to_html(md: &str) -> String {
 /// dangerous link/image schemes neutralised (see [`to_html`] for the threat
 /// model). Pure `&str -> String`, no IO — unit-tested below.
 fn render_safe_html(md: &str) -> String {
-    let safe_events = Parser::new(md).filter_map(|ev| match ev {
+    // Same extension set as the in-app preview ([`PARSER_OPTIONS`]) so an export
+    // is never a lossier document than what the user was just looking at. The
+    // event filter below is unchanged and still covers the new element types:
+    // raw HTML inside a table cell or a footnote body arrives as
+    // `Event::InlineHtml`/`Event::Html` and is dropped, and a link inside a
+    // table cell is an ordinary `Tag::Link` whose destination is neutralised.
+    let safe_events = Parser::new_ext(md, PARSER_OPTIONS).filter_map(|ev| match ev {
         // Drop author-supplied raw HTML entirely. This is the `<script>` /
         // `<img onerror=…>` / `<iframe>` vector — markdown that embeds raw HTML
         // must NOT have it survive into a browser-opened export.
@@ -151,16 +183,71 @@ pub enum MdBlock {
     Quote(Vec<MdRun>),
     /// A horizontal rule (`---`).
     Rule,
+    /// A GFM pipe table. `aligns` has one entry per column (from the delimiter
+    /// row); `header` is one cell per column; `rows` is the body.
+    ///
+    /// Per the GFM spec the parser itself reconciles a ragged source row against
+    /// the header width — a short row is padded with an EMPTY cell, a long one
+    /// is truncated — so every row from [`parse`] has `header.len()` cells. The
+    /// renderer still pads defensively, because [`MdBlock`] is public and a
+    /// caller may hand it a table this module did not parse.
+    Table {
+        aligns: Vec<MdAlign>,
+        header: Vec<Vec<MdRun>>,
+        rows: Vec<Vec<Vec<MdRun>>>,
+    },
+    /// Display math (`$$…$$`). `tex` is the source between the delimiters,
+    /// VERBATIM — transliteration to Unicode happens at render time so the
+    /// original is never lost (see [`math`]).
+    MathBlock { tex: String },
+    /// A footnote definition (`[^label]: …`). Collected during the parse and
+    /// emitted at the END of the block list, ordered by `number`, after a
+    /// [`MdBlock::Rule`] separator — matching how GitHub renders a footnote
+    /// section. `body` holds the definition's own blocks.
+    FootnoteDef {
+        number: usize,
+        label: String,
+        body: Vec<MdBlock>,
+    },
+}
+
+/// Column alignment for a [`MdBlock::Table`]. Mirrors
+/// [`pulldown_cmark::Alignment`] so the public block model never leaks a parser
+/// type (the same reason `HeadingLevel` is mapped to a `u8`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MdAlign {
+    /// No explicit alignment in the delimiter row.
+    #[default]
+    None,
+    Left,
+    Center,
+    Right,
+}
+
+/// What an inline run *is*, beyond its styling. Most runs are plain
+/// [`MdRunKind::Text`]; the other variants carry content the renderer must
+/// treat specially rather than print literally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MdRunKind {
+    /// Ordinary prose.
+    #[default]
+    Text,
+    /// Inline math (`$…$`). [`MdRun::text`] is the VERBATIM TeX source.
+    InlineMath,
+    /// A footnote reference (`[^label]`). [`MdRun::text`] is the footnote's
+    /// 1-based number as a string, matching its [`MdBlock::FootnoteDef`].
+    FootnoteRef,
 }
 
 /// A styled inline run. `link` set means the whole run is a hyperlink.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct MdRun {
     pub text: String,
     pub bold: bool,
     pub italic: bool,
     pub code: bool,
     pub link: Option<String>,
+    pub kind: MdRunKind,
 }
 
 /// Tracks one open ordered/unordered list level and, for ordered lists, the
@@ -197,6 +284,59 @@ impl PendingItem {
                 runs,
             },
         }
+    }
+}
+
+/// A GFM table being accumulated across its `Table`/`TableHead`/`TableRow`/
+/// `TableCell` events.
+#[derive(Default)]
+struct TableBuilder {
+    aligns: Vec<MdAlign>,
+    header: Vec<Vec<MdRun>>,
+    rows: Vec<Vec<Vec<MdRun>>>,
+    /// Cells of the row currently being read (header or body).
+    row: Vec<Vec<MdRun>>,
+}
+
+/// An open footnote definition. Its own blocks accumulate in `body` so they are
+/// never interleaved into the main document flow.
+struct PendingFootnote {
+    label: String,
+    number: usize,
+    body: Vec<MdBlock>,
+}
+
+/// Route a finished block to the open footnote definition when there is one, or
+/// to the document otherwise. Every block push in [`parse`] goes through this —
+/// without it, a list or table inside a footnote would surface at the position
+/// the footnote's *definition* happens to sit, not inside the note.
+fn push_block(blocks: &mut Vec<MdBlock>, footnote: &mut Option<PendingFootnote>, block: MdBlock) {
+    match footnote {
+        Some(f) => f.body.push(block),
+        None => blocks.push(block),
+    }
+}
+
+/// The 1-based number for a footnote label, assigning the next free one on
+/// first sight. Numbering follows order of first appearance, so a reference
+/// and its definition always agree.
+fn footnote_number(numbers: &mut HashMap<String, usize>, next: &mut usize, label: &str) -> usize {
+    if let Some(n) = numbers.get(label) {
+        return *n;
+    }
+    let n = *next;
+    *next += 1;
+    numbers.insert(label.to_owned(), n);
+    n
+}
+
+/// Map the parser's column alignment onto the public [`MdAlign`].
+fn map_align(a: &Alignment) -> MdAlign {
+    match a {
+        Alignment::None => MdAlign::None,
+        Alignment::Left => MdAlign::Left,
+        Alignment::Center => MdAlign::Center,
+        Alignment::Right => MdAlign::Right,
     }
 }
 
@@ -253,7 +393,17 @@ pub fn parse(src: &str) -> Vec<MdBlock> {
     let mut in_code_block = false;
     let mut code_buf = String::new();
 
-    // Flush the current inline `runs` into a run-bearing block, clearing it.
+    // GFM table under construction (tables never nest, so one slot suffices).
+    let mut table: Option<TableBuilder> = None;
+
+    // Footnotes: the definition currently open, the completed ones (emitted at
+    // the end of the document), and the label -> number assignment.
+    let mut footnote: Option<PendingFootnote> = None;
+    let mut footnotes: Vec<MdBlock> = Vec::new();
+    let mut footnote_numbers: HashMap<String, usize> = HashMap::new();
+    let mut next_footnote: usize = 1;
+
+    // Append a styled inline run, dropping empty text.
     fn push_run(
         runs: &mut Vec<MdRun>,
         text: &str,
@@ -261,6 +411,7 @@ pub fn parse(src: &str) -> Vec<MdBlock> {
         italic: bool,
         code: bool,
         link: &Option<String>,
+        kind: MdRunKind,
     ) {
         if !text.is_empty() {
             runs.push(MdRun {
@@ -269,31 +420,37 @@ pub fn parse(src: &str) -> Vec<MdBlock> {
                 italic,
                 code,
                 link: link.clone(),
+                kind,
             });
         }
     }
 
-    for (ev, range) in Parser::new_ext(src, Options::ENABLE_TASKLISTS).into_offset_iter() {
+    for (ev, range) in Parser::new_ext(src, PARSER_OPTIONS).into_offset_iter() {
         match ev {
             // ---- Headings ---------------------------------------------------
             Event::Start(Tag::Heading { .. }) => runs.clear(),
             Event::End(TagEnd::Heading(level)) => {
                 let text: String = runs.drain(..).map(|r| r.text).collect();
-                blocks.push(MdBlock::Heading {
-                    level: heading_to_u8(level),
-                    text,
-                });
+                push_block(
+                    &mut blocks,
+                    &mut footnote,
+                    MdBlock::Heading {
+                        level: heading_to_u8(level),
+                        text,
+                    },
+                );
             }
 
             // ---- Paragraphs -------------------------------------------------
             Event::Start(Tag::Paragraph) => runs.clear(),
             Event::End(TagEnd::Paragraph) if !runs.is_empty() => {
                 let taken = std::mem::take(&mut runs);
-                if quote_depth > 0 {
-                    blocks.push(MdBlock::Quote(taken));
+                let block = if quote_depth > 0 {
+                    MdBlock::Quote(taken)
                 } else {
-                    blocks.push(MdBlock::Paragraph(taken));
-                }
+                    MdBlock::Paragraph(taken)
+                };
+                push_block(&mut blocks, &mut footnote, block);
             }
 
             // ---- Code blocks ------------------------------------------------
@@ -320,21 +477,30 @@ pub fn parse(src: &str) -> Vec<MdBlock> {
                 if code.ends_with('\n') {
                     code.pop();
                 }
-                blocks.push(MdBlock::CodeBlock {
-                    lang: code_lang.take(),
-                    code,
-                });
+                push_block(
+                    &mut blocks,
+                    &mut footnote,
+                    MdBlock::CodeBlock {
+                        lang: code_lang.take(),
+                        code,
+                    },
+                );
             }
 
             // ---- Lists ------------------------------------------------------
             Event::Start(Tag::List(start)) => {
                 // A nested list begins inside the current item: flush that item's
                 // own text first so the parent is emitted before its children.
-                if let Some(item) = pending.last_mut() {
+                let flushed = pending.last_mut().and_then(|item| {
                     if !item.flushed && !runs.is_empty() {
-                        blocks.push(item.to_block(std::mem::take(&mut runs)));
                         item.flushed = true;
+                        Some(item.to_block(std::mem::take(&mut runs)))
+                    } else {
+                        None
                     }
+                });
+                if let Some(block) = flushed {
+                    push_block(&mut blocks, &mut footnote, block);
                 }
                 lists.push(ListLevel { ordinal: start });
             }
@@ -375,7 +541,8 @@ pub fn parse(src: &str) -> Vec<MdBlock> {
             Event::End(TagEnd::Item) => {
                 if let Some(item) = pending.pop() {
                     if !item.flushed {
-                        blocks.push(item.to_block(std::mem::take(&mut runs)));
+                        let block = item.to_block(std::mem::take(&mut runs));
+                        push_block(&mut blocks, &mut footnote, block);
                     } else {
                         // Trailing text after a nested list (uncommon) is dropped
                         // rather than leaking into the next sibling item.
@@ -392,6 +559,140 @@ pub fn parse(src: &str) -> Vec<MdBlock> {
                 quote_depth = quote_depth.saturating_sub(1);
             }
 
+            // ---- Tables -----------------------------------------------------
+            Event::Start(Tag::Table(aligns)) => {
+                table = Some(TableBuilder {
+                    aligns: aligns.iter().map(map_align).collect(),
+                    ..TableBuilder::default()
+                });
+                runs.clear();
+            }
+            Event::Start(Tag::TableHead) | Event::Start(Tag::TableRow) => {
+                if let Some(t) = table.as_mut() {
+                    t.row.clear();
+                }
+                runs.clear();
+            }
+            Event::End(TagEnd::TableHead) => {
+                if let Some(t) = table.as_mut() {
+                    let head = std::mem::take(&mut t.row);
+                    t.header = head;
+                }
+            }
+            Event::End(TagEnd::TableRow) => {
+                if let Some(t) = table.as_mut() {
+                    let row = std::mem::take(&mut t.row);
+                    t.rows.push(row);
+                }
+            }
+            Event::Start(Tag::TableCell) => runs.clear(),
+            Event::End(TagEnd::TableCell) => {
+                if let Some(t) = table.as_mut() {
+                    t.row.push(std::mem::take(&mut runs));
+                }
+            }
+            Event::End(TagEnd::Table) => {
+                if let Some(t) = table.take() {
+                    push_block(
+                        &mut blocks,
+                        &mut footnote,
+                        MdBlock::Table {
+                            aligns: t.aligns,
+                            header: t.header,
+                            rows: t.rows,
+                        },
+                    );
+                }
+            }
+
+            // ---- Footnotes --------------------------------------------------
+            Event::FootnoteReference(label) => {
+                let n = footnote_number(&mut footnote_numbers, &mut next_footnote, &label);
+                push_run(
+                    &mut runs,
+                    &n.to_string(),
+                    bold,
+                    italic,
+                    code,
+                    &link,
+                    MdRunKind::FootnoteRef,
+                );
+            }
+            Event::Start(Tag::FootnoteDefinition(label)) => {
+                // `pulldown-cmark` never nests definitions, but closing any
+                // still-open one keeps the state machine total rather than
+                // silently discarding its accumulated body.
+                if let Some(prev) = footnote.take() {
+                    footnotes.push(MdBlock::FootnoteDef {
+                        number: prev.number,
+                        label: prev.label,
+                        body: prev.body,
+                    });
+                }
+                let number = footnote_number(&mut footnote_numbers, &mut next_footnote, &label);
+                runs.clear();
+                footnote = Some(PendingFootnote {
+                    label: label.to_string(),
+                    number,
+                    body: Vec::new(),
+                });
+            }
+            Event::End(TagEnd::FootnoteDefinition) => {
+                if let Some(f) = footnote.take() {
+                    footnotes.push(MdBlock::FootnoteDef {
+                        number: f.number,
+                        label: f.label,
+                        body: f.body,
+                    });
+                }
+            }
+
+            // ---- Math -------------------------------------------------------
+            Event::InlineMath(tex) => push_run(
+                &mut runs,
+                &tex,
+                bold,
+                italic,
+                code,
+                &link,
+                MdRunKind::InlineMath,
+            ),
+            Event::DisplayMath(tex) => {
+                // `$$…$$` can appear mid-paragraph, so flush any inline runs
+                // already collected BEFORE emitting the block — otherwise the
+                // text before the formula would be re-ordered after it.
+                // Inside a table cell or a list item there is no place for a
+                // standalone block, so it stays inline instead.
+                if table.is_some() || !pending.is_empty() {
+                    push_run(
+                        &mut runs,
+                        &tex,
+                        bold,
+                        italic,
+                        code,
+                        &link,
+                        MdRunKind::InlineMath,
+                    );
+                } else {
+                    if !runs.is_empty() {
+                        let taken = std::mem::take(&mut runs);
+                        let block = if quote_depth > 0 {
+                            MdBlock::Quote(taken)
+                        } else {
+                            MdBlock::Paragraph(taken)
+                        };
+                        push_block(&mut blocks, &mut footnote, block);
+                    }
+                    push_block(
+                        &mut blocks,
+                        &mut footnote,
+                        MdBlock::MathBlock {
+                            tex: tex.to_string(),
+                        },
+                    );
+                }
+            }
+
             // ---- Inline styling --------------------------------------------
             Event::Start(Tag::Strong) => bold = true,
             Event::End(TagEnd::Strong) => bold = false,
@@ -401,32 +702,54 @@ pub fn parse(src: &str) -> Vec<MdBlock> {
             Event::End(TagEnd::Link) => link = None,
 
             // ---- Leaf content ----------------------------------------------
-            Event::Code(s) => push_run(&mut runs, &s, bold, italic, true, &link),
+            Event::Code(s) => push_run(&mut runs, &s, bold, italic, true, &link, MdRunKind::Text),
             Event::Text(s) => {
                 if in_code_block {
                     code_buf.push_str(&s);
                 } else {
-                    push_run(&mut runs, &s, bold, italic, code, &link);
+                    push_run(&mut runs, &s, bold, italic, code, &link, MdRunKind::Text);
                 }
             }
             Event::SoftBreak | Event::HardBreak => {
                 if in_code_block {
                     code_buf.push('\n');
                 } else {
-                    push_run(&mut runs, " ", bold, italic, code, &link);
+                    push_run(&mut runs, " ", bold, italic, code, &link, MdRunKind::Text);
                 }
             }
-            Event::Rule => blocks.push(MdBlock::Rule),
+            Event::Rule => push_block(&mut blocks, &mut footnote, MdBlock::Rule),
 
-            // Everything else (tables, footnotes, HTML, tasks, images) degrades
-            // to its text content via the Text events already handled above.
+            // Everything else (raw HTML, images, definition lists) degrades to
+            // its text content via the Text events already handled above.
             _ => {}
         }
     }
 
-    // Flush any dangling runs from truncated input (e.g. an unclosed paragraph).
+    // Flush any dangling runs from truncated input (e.g. an unclosed paragraph),
+    // routing them into an unterminated footnote rather than the document.
     if !runs.is_empty() {
-        blocks.push(MdBlock::Paragraph(runs));
+        let block = MdBlock::Paragraph(std::mem::take(&mut runs));
+        push_block(&mut blocks, &mut footnote, block);
+    }
+    // Close a footnote definition left open by truncated input.
+    if let Some(f) = footnote.take() {
+        footnotes.push(MdBlock::FootnoteDef {
+            number: f.number,
+            label: f.label,
+            body: f.body,
+        });
+    }
+
+    // Footnote definitions render as a section at the END of the document,
+    // ordered by number and separated by a rule — GitHub's layout, and the only
+    // one that makes sense when a definition may sit anywhere in the source.
+    if !footnotes.is_empty() {
+        footnotes.sort_by_key(|b| match b {
+            MdBlock::FootnoteDef { number, .. } => *number,
+            _ => 0,
+        });
+        blocks.push(MdBlock::Rule);
+        blocks.extend(footnotes);
     }
 
     blocks
@@ -444,12 +767,38 @@ fn heading_to_u8(level: HeadingLevel) -> u8 {
     }
 }
 
-/// Render parsed markdown into an egui [`Ui`] as native widgets.
+thread_local! {
+    /// The preview pane's parse cache. Thread-local because egui is driven from
+    /// one UI thread, and per-thread so parallel test threads never share state.
+    static PREVIEW_CACHE: RefCell<cache::PreviewCache> =
+        const { RefCell::new(cache::PreviewCache::new()) };
+}
+
+/// Deepest block nesting [`render_blocks`] will descend. Insurance only: the
+/// only nesting [`parse`] can produce is a footnote body, and a footnote body
+/// can never contain another footnote definition (those are routed to the top
+/// level), so the tree is two levels deep by construction. The cap means a
+/// future parse change can never turn into a stack overflow on a hostile file.
+const MAX_BLOCK_DEPTH: u8 = 6;
+
+/// Shared state threaded through the block renderer.
+struct RenderCtx {
+    accent: Color32,
+    muted: Color32,
+    /// Source lines of task checkboxes clicked this frame.
+    clicked: Vec<usize>,
+    /// Monotonic counter giving each table a unique `egui::Grid` id.
+    table_seq: usize,
+}
+
+/// Render markdown into an egui [`Ui`] as native widgets.
 ///
 /// `accent` colours headings and links; `muted` colours code. Pass the active
-/// theme's colours from the call site. This function parses on every call — for
-/// a preview pane that is fine; cache the [`parse`] result if the source is
-/// large and unchanged between frames.
+/// theme's colours from the call site.
+///
+/// The parse result is cached (see [`cache`]) on the source text plus the active
+/// parser options, so an open preview pane re-parses only when the document
+/// actually changes — not on every frame it is redrawn.
 ///
 /// Returns the source line(s) of any task checkbox the user CLICKED this frame
 /// (empty when none). The caller toggles those source lines via
@@ -457,58 +806,80 @@ fn heading_to_u8(level: HeadingLevel) -> u8 {
 /// markdown source (GitHub/GitLab "click edits source" behaviour), never a
 /// hidden state.
 pub fn show(ui: &mut egui::Ui, md: &str, accent: Color32, muted: Color32) -> Vec<usize> {
-    let mut clicked_lines: Vec<usize> = Vec::new();
-    for block in parse(md) {
+    let mut ctx = RenderCtx {
+        accent,
+        muted,
+        clicked: Vec::new(),
+        table_seq: 0,
+    };
+    // The cache borrow is held across rendering (rather than cloning the block
+    // list every frame). That is sound because nothing reachable from the egui
+    // closures below re-enters `show`.
+    PREVIEW_CACHE.with(|cell| {
+        let mut cache = cell.borrow_mut();
+        render_blocks(ui, cache.blocks(md), &mut ctx, 0);
+    });
+    ctx.clicked
+}
+
+/// Emit one block list. Recurses only for a footnote definition's body.
+fn render_blocks(ui: &mut egui::Ui, blocks: &[MdBlock], ctx: &mut RenderCtx, depth: u8) {
+    for block in blocks {
         match block {
             MdBlock::TaskItem {
-                depth,
+                depth: indent,
                 checked,
                 source_line,
                 runs,
             } => {
                 ui.horizontal_wrapped(|ui| {
-                    ui.add_space(depth as f32 * 16.0);
+                    ui.add_space(*indent as f32 * 16.0);
                     // A clickable checkbox; the boolean is local (the source is
                     // the single point of truth) — a click is reported up so the
                     // caller flips the source line.
-                    let mut state = checked;
+                    let mut state = *checked;
                     if ui.checkbox(&mut state, "").changed() {
-                        clicked_lines.push(source_line);
+                        ctx.clicked.push(*source_line);
                     }
-                    render_runs(ui, &runs, accent, muted);
+                    render_runs(ui, runs, ctx.accent, ctx.muted);
                 });
             }
             MdBlock::Heading { level, text } => {
-                let size = match level {
+                let size = match *level {
                     1 => 26.0,
                     2 => 22.0,
                     3 => 18.0,
                     _ => 15.0,
                 };
                 ui.add(egui::Label::new(
-                    RichText::new(text).size(size).strong().color(accent),
+                    RichText::new(text.as_str())
+                        .size(size)
+                        .strong()
+                        .color(ctx.accent),
                 ));
                 ui.add_space(2.0);
             }
             MdBlock::Paragraph(runs) => {
-                ui.horizontal_wrapped(|ui| render_runs(ui, &runs, accent, muted));
+                ui.horizontal_wrapped(|ui| render_runs(ui, runs, ctx.accent, ctx.muted));
                 ui.add_space(4.0);
             }
             MdBlock::Quote(runs) => {
                 // GFM/Obsidian callout: a blockquote whose first run begins with
                 // `[!type]` renders with an accent title + indented body (no tag
                 // DB — purely presentational).
-                if let Some((title, body)) = callout_split(&runs) {
+                if let Some((title, body)) = callout_split(runs) {
                     egui::Frame::group(ui.style()).show(ui, |ui| {
-                        ui.label(RichText::new(title).color(accent).strong().small());
+                        ui.label(RichText::new(title).color(ctx.accent).strong().small());
                         if !body.is_empty() {
-                            ui.horizontal_wrapped(|ui| render_runs(ui, &body, accent, muted));
+                            ui.horizontal_wrapped(|ui| {
+                                render_runs(ui, &body, ctx.accent, ctx.muted)
+                            });
                         }
                     });
                 } else {
                     ui.indent("md_quote", |ui| {
                         ui.horizontal_wrapped(|ui| {
-                            render_runs(ui, &runs, accent, muted);
+                            render_runs(ui, runs, ctx.accent, ctx.muted);
                         });
                     });
                 }
@@ -517,28 +888,144 @@ pub fn show(ui: &mut egui::Ui, md: &str, accent: Color32, muted: Color32) -> Vec
             MdBlock::CodeBlock { code, .. } => {
                 egui::Frame::group(ui.style()).show(ui, |ui| {
                     ui.add(egui::Label::new(
-                        RichText::new(code).monospace().color(muted),
+                        RichText::new(code.as_str()).monospace().color(ctx.muted),
                     ));
                 });
                 ui.add_space(4.0);
             }
             MdBlock::ListItem {
-                depth,
+                depth: indent,
                 marker,
                 runs,
             } => {
                 ui.horizontal_wrapped(|ui| {
-                    ui.add_space(depth as f32 * 16.0);
-                    ui.label(RichText::new(marker).color(muted));
-                    render_runs(ui, &runs, accent, muted);
+                    ui.add_space(*indent as f32 * 16.0);
+                    ui.label(RichText::new(marker.as_str()).color(ctx.muted));
+                    render_runs(ui, runs, ctx.accent, ctx.muted);
                 });
             }
             MdBlock::Rule => {
                 ui.separator();
             }
+            MdBlock::Table {
+                aligns,
+                header,
+                rows,
+            } => render_table(ui, aligns, header, rows, ctx),
+            MdBlock::MathBlock { tex } => {
+                // No typesetter is available (see the `math` module for why), so
+                // display math gets a centred, emphasised Unicode rendering with
+                // the original TeX one hover away.
+                let pretty = math::math_to_unicode(tex);
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.add(egui::Label::new(
+                            RichText::new(pretty.as_str()).italics().size(17.0),
+                        ))
+                        .on_hover_text(format!("$${tex}$$"));
+                    });
+                });
+                ui.add_space(4.0);
+            }
+            MdBlock::FootnoteDef {
+                number,
+                label,
+                body,
+            } => {
+                let marker = RichText::new(format!("[{number}]"))
+                    .small()
+                    .strong()
+                    .color(ctx.accent);
+                match body.as_slice() {
+                    // The overwhelmingly common shape — keep the marker and the
+                    // note on one line instead of burning a row on the marker.
+                    [MdBlock::Paragraph(runs)] => {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(marker).on_hover_text(label.as_str());
+                            render_runs(ui, runs, ctx.accent, ctx.muted);
+                        });
+                    }
+                    rest => {
+                        ui.label(marker).on_hover_text(label.as_str());
+                        if depth < MAX_BLOCK_DEPTH {
+                            ui.indent(("md_footnote", *number), |ui| {
+                                render_blocks(ui, rest, ctx, depth + 1);
+                            });
+                        }
+                    }
+                }
+                ui.add_space(2.0);
+            }
         }
     }
-    clicked_lines
+}
+
+/// Alignment declared for column `col`, or [`MdAlign::None`] when the source's
+/// delimiter row had fewer columns than a body row.
+fn align_at(aligns: &[MdAlign], col: usize) -> MdAlign {
+    aligns.get(col).copied().unwrap_or_default()
+}
+
+/// Render a GFM table as an `egui::Grid`. Ragged rows are padded with blank
+/// cells so the column grid stays aligned — the parser never invents content.
+fn render_table(
+    ui: &mut egui::Ui,
+    aligns: &[MdAlign],
+    header: &[Vec<MdRun>],
+    rows: &[Vec<Vec<MdRun>>],
+    ctx: &mut RenderCtx,
+) {
+    let cols = header
+        .len()
+        .max(aligns.len())
+        .max(rows.iter().map(Vec::len).max().unwrap_or(0));
+    if cols == 0 {
+        return;
+    }
+    ctx.table_seq += 1;
+    let grid_id = ("md_preview_table", ctx.table_seq);
+    egui::Grid::new(grid_id)
+        .striped(true)
+        .num_columns(cols)
+        .show(ui, |ui| {
+            if !header.is_empty() {
+                for col in 0..cols {
+                    render_cell(ui, align_at(aligns, col), header.get(col), ctx, true);
+                }
+                ui.end_row();
+            }
+            for row in rows {
+                for col in 0..cols {
+                    render_cell(ui, align_at(aligns, col), row.get(col), ctx, false);
+                }
+                ui.end_row();
+            }
+        });
+    ui.add_space(4.0);
+}
+
+/// One table cell. `None` is a padding cell for a ragged row.
+fn render_cell(
+    ui: &mut egui::Ui,
+    align: MdAlign,
+    runs: Option<&Vec<MdRun>>,
+    ctx: &mut RenderCtx,
+    header: bool,
+) {
+    let Some(runs) = runs else {
+        ui.label("");
+        return;
+    };
+    let layout = match align {
+        MdAlign::Right => egui::Layout::top_down(egui::Align::Max),
+        MdAlign::Center => egui::Layout::top_down(egui::Align::Center),
+        MdAlign::None | MdAlign::Left => egui::Layout::top_down(egui::Align::Min),
+    };
+    ui.with_layout(layout, |ui| {
+        ui.horizontal(|ui| {
+            render_runs_inner(ui, runs, ctx.accent, ctx.muted, header);
+        });
+    });
 }
 
 /// If a blockquote's flattened runs begin with a callout marker `[!type]`,
@@ -659,7 +1146,39 @@ pub(crate) fn is_safe_link_scheme(url: &str) -> bool {
 /// Emit a sequence of styled inline runs into the current (typically
 /// `horizontal_wrapped`) layout.
 fn render_runs(ui: &mut egui::Ui, runs: &[MdRun], accent: Color32, muted: Color32) {
+    render_runs_inner(ui, runs, accent, muted, false);
+}
+
+/// [`render_runs`] with an extra `force_bold`, used for table header cells so a
+/// header can be emphasised without cloning and mutating every run.
+fn render_runs_inner(
+    ui: &mut egui::Ui,
+    runs: &[MdRun],
+    accent: Color32,
+    muted: Color32,
+    force_bold: bool,
+) {
     for r in runs {
+        // Non-prose runs carry content that must NOT be printed literally, so
+        // they are dispatched before any of the plain-text handling below (in
+        // particular before URL detection, which would otherwise chew on TeX).
+        match r.kind {
+            MdRunKind::FootnoteRef => {
+                // No superscript in egui — a small accent `[n]` is the readable
+                // equivalent, and matches the `[n]` marker on the definition.
+                ui.label(RichText::new(format!("[{}]", r.text)).small().color(accent))
+                    .on_hover_text(format!("footnote {}", r.text));
+                continue;
+            }
+            MdRunKind::InlineMath => {
+                let pretty = math::math_to_unicode(&r.text);
+                ui.label(RichText::new(pretty).italics())
+                    .on_hover_text(format!("${}$", r.text));
+                continue;
+            }
+            MdRunKind::Text => {}
+        }
+        let bold = r.bold || force_bold;
         if let Some(url) = &r.link {
             if is_safe_link_scheme(url) {
                 // egui handles its own link styling/underline; only colour it.
@@ -686,7 +1205,7 @@ fn render_runs(ui: &mut egui::Ui, runs: &[MdRun], accent: Color32, muted: Color3
                 // Emphasis carries onto the non-URL sub-segments.
                 let styled = |s: &str| {
                     let mut rt = RichText::new(s);
-                    if r.bold {
+                    if bold {
                         rt = rt.strong();
                     }
                     if r.italic {
@@ -719,12 +1238,12 @@ fn render_runs(ui: &mut egui::Ui, runs: &[MdRun], accent: Color32, muted: Color3
         // contains a `#tag` token is split so each tag renders in the accent
         // colour while the surrounding prose keeps the default style. URLs took
         // the branch above, so a run reaching here has no clickable link.
-        if !r.code && !r.bold && !r.italic && contains_tag(&r.text) {
+        if !r.code && !bold && !r.italic && contains_tag(&r.text) {
             render_text_with_tags(ui, &r.text, accent);
             continue;
         }
         let mut rt = RichText::new(&r.text);
-        if r.bold {
+        if bold {
             rt = rt.strong();
         }
         if r.italic {
@@ -793,6 +1312,14 @@ fn render_text_with_tags(ui: &mut egui::Ui, text: &str, accent: Color32) {
     }
 }
 
+/// Total number of real parses the preview cache has performed on this thread.
+/// Test-only: lets the wiring test prove [`show`] goes THROUGH the cache rather
+/// than calling [`parse`] directly.
+#[cfg(test)]
+fn cache_parses() -> u64 {
+    PREVIEW_CACHE.with(|c| c.borrow().parses())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -800,6 +1327,604 @@ mod tests {
     /// Collect a run-bearing block's text into one string for assertions.
     fn runs_text(runs: &[MdRun]) -> String {
         runs.iter().map(|r| r.text.as_str()).collect()
+    }
+
+    /// Borrowed view of one parsed table: alignments, header cells, body rows.
+    /// Named rather than returned as a bare 3-tuple of nested `Vec`s, which
+    /// clippy rightly calls out as unreadable at the call site.
+    type TableView<'a> = (&'a [MdAlign], &'a [Vec<MdRun>], &'a [Vec<Vec<MdRun>>]);
+
+    /// The first [`MdBlock::Table`] in `blocks`.
+    fn first_table(blocks: &[MdBlock]) -> TableView<'_> {
+        blocks
+            .iter()
+            .find_map(|b| match b {
+                MdBlock::Table {
+                    aligns,
+                    header,
+                    rows,
+                } => Some((aligns.as_slice(), header.as_slice(), rows.as_slice())),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("expected a table, got {blocks:?}"))
+    }
+
+    /// Every [`MdBlock::FootnoteDef`] in document order.
+    fn footnote_defs(blocks: &[MdBlock]) -> Vec<(usize, &str, &Vec<MdBlock>)> {
+        blocks
+            .iter()
+            .filter_map(|b| match b {
+                MdBlock::FootnoteDef {
+                    number,
+                    label,
+                    body,
+                } => Some((*number, label.as_str(), body)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn harness_showing(md: &'static str) -> egui_kittest::Harness<'static> {
+        let mut h = egui_kittest::Harness::builder()
+            .with_size(egui::Vec2::new(700.0, 900.0))
+            .build_ui(move |ui| {
+                show(
+                    ui,
+                    md,
+                    Color32::from_rgb(0, 0xd0, 0xa0),
+                    Color32::from_rgb(0x80, 0x80, 0x80),
+                );
+            });
+        h.run();
+        h
+    }
+
+    // ---- Footnotes -------------------------------------------------------
+
+    #[test]
+    fn footnote_reference_and_definition_are_structured_not_literal_text() {
+        // Before ENABLE_FOOTNOTES the parser emitted `[`, `^1`, `]` as three
+        // literal Text runs and the definition as an ordinary paragraph reading
+        // "[^1]: The footnote body." — i.e. the markup leaked to the reader.
+        let b = parse("Text with a note[^1].\n\n[^1]: The footnote body.\n");
+
+        // The reference is a FootnoteRef run carrying the assigned number, and
+        // the raw `[^1]` markup is gone from the prose.
+        let para = b
+            .iter()
+            .find_map(|blk| match blk {
+                MdBlock::Paragraph(runs) => Some(runs),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("expected a paragraph, got {b:?}"));
+        let refs: Vec<&MdRun> = para
+            .iter()
+            .filter(|r| r.kind == MdRunKind::FootnoteRef)
+            .collect();
+        assert_eq!(refs.len(), 1, "one footnote reference, got {para:?}");
+        assert_eq!(refs[0].text, "1");
+        assert!(
+            !runs_text(para).contains("[^1]"),
+            "raw footnote markup must not survive into the prose: {para:?}"
+        );
+
+        // The definition is a FootnoteDef, at the END, behind a rule separator.
+        let defs = footnote_defs(&b);
+        assert_eq!(defs.len(), 1, "got {b:?}");
+        assert_eq!(defs[0].0, 1, "numbered to match its reference");
+        assert_eq!(defs[0].1, "1", "label preserved");
+        assert!(
+            matches!(defs[0].2.as_slice(), [MdBlock::Paragraph(runs)]
+                if runs_text(runs) == "The footnote body."),
+            "definition body, got {:?}",
+            defs[0].2
+        );
+        assert!(
+            matches!(b.last(), Some(MdBlock::FootnoteDef { .. })),
+            "definitions render last, got {b:?}"
+        );
+        let rule_at = b.iter().position(|x| matches!(x, MdBlock::Rule));
+        let def_at = b
+            .iter()
+            .position(|x| matches!(x, MdBlock::FootnoteDef { .. }));
+        assert!(
+            rule_at.is_some() && rule_at < def_at,
+            "a rule separates the note section, got {b:?}"
+        );
+    }
+
+    #[test]
+    fn footnotes_are_numbered_by_first_appearance_and_emitted_in_number_order() {
+        // References appear b-then-a, but the DEFINITIONS are written a-then-b.
+        // Numbering must follow the references, and the emitted section must be
+        // ordered by number — not by the order the definitions were written.
+        let b = parse("See[^beta] then[^alpha].\n\n[^alpha]: A\n\n[^beta]: B\n");
+        let defs = footnote_defs(&b);
+        assert_eq!(defs.len(), 2, "got {b:?}");
+        assert_eq!(
+            (defs[0].0, defs[0].1),
+            (1, "beta"),
+            "first-referenced note is [1] and comes first, got {defs:?}"
+        );
+        assert_eq!((defs[1].0, defs[1].1), (2, "alpha"));
+        // The in-text markers agree with the definition numbers.
+        let markers: Vec<&str> = b
+            .iter()
+            .filter_map(|blk| match blk {
+                MdBlock::Paragraph(runs) => Some(runs),
+                _ => None,
+            })
+            .flatten()
+            .filter(|r| r.kind == MdRunKind::FootnoteRef)
+            .map(|r| r.text.as_str())
+            .collect();
+        assert_eq!(markers, vec!["1", "2"]);
+    }
+
+    #[test]
+    fn a_footnote_body_stays_inside_the_note_and_never_leaks_into_the_document() {
+        // A footnote whose body contains a LIST is the case that breaks without
+        // the block router: the list items would surface in the main document
+        // flow at the position the definition happens to sit.
+        let b = parse("x[^n]\n\nafter\n\n[^n]: intro\n\n    - one\n    - two\n");
+        let top_level_items = b
+            .iter()
+            .filter(|blk| matches!(blk, MdBlock::ListItem { .. }))
+            .count();
+        assert_eq!(
+            top_level_items, 0,
+            "no list item may appear at document level, got {b:?}"
+        );
+        let defs = footnote_defs(&b);
+        assert_eq!(defs.len(), 1, "got {b:?}");
+        let inner_items = defs[0]
+            .2
+            .iter()
+            .filter(|blk| matches!(blk, MdBlock::ListItem { .. }))
+            .count();
+        assert_eq!(
+            inner_items, 2,
+            "both items belong to the note body, got {:?}",
+            defs[0].2
+        );
+        // The prose that followed the reference is untouched.
+        assert!(
+            b.iter().any(|blk| matches!(blk, MdBlock::Paragraph(runs)
+                if runs_text(runs) == "after")),
+            "got {b:?}"
+        );
+    }
+
+    #[test]
+    fn a_truncated_footnote_definition_is_still_emitted() {
+        // Input that ends mid-definition must not swallow the note entirely.
+        let b = parse("x[^1]\n\n[^1]: dangling body with no trailing newline");
+        let defs = footnote_defs(&b);
+        assert_eq!(defs.len(), 1, "got {b:?}");
+        assert!(
+            format!("{:?}", defs[0].2).contains("dangling body"),
+            "got {:?}",
+            defs[0].2
+        );
+    }
+
+    // ---- Tables ----------------------------------------------------------
+
+    #[test]
+    fn gfm_table_is_parsed_into_alignment_header_and_rows() {
+        // Before ENABLE_TABLES the whole table collapsed into ONE paragraph of
+        // literal pipe text ("| a | b |" + softbreak + …).
+        let b = parse("| a | b | c |\n|:--|:-:|--:|\n| 1 | 2 | 3 |\n| 4 | 5 | 6 |\n");
+        assert!(
+            !b.iter().any(|blk| matches!(blk, MdBlock::Paragraph(runs)
+                if runs_text(runs).contains('|'))),
+            "no literal pipe text may remain, got {b:?}"
+        );
+        let (aligns, header, rows) = first_table(&b);
+        assert_eq!(
+            *aligns,
+            vec![MdAlign::Left, MdAlign::Center, MdAlign::Right],
+            "each delimiter form maps to its alignment"
+        );
+        let head: Vec<String> = header.iter().map(|c| runs_text(c)).collect();
+        assert_eq!(head, vec!["a", "b", "c"]);
+        let body: Vec<Vec<String>> = rows
+            .iter()
+            .map(|r| r.iter().map(|c| runs_text(c)).collect())
+            .collect();
+        assert_eq!(body, vec![vec!["1", "2", "3"], vec!["4", "5", "6"]]);
+    }
+
+    #[test]
+    fn table_without_explicit_alignment_defaults_to_none() {
+        let b = parse("| a |\n|---|\n| 1 |\n");
+        let (aligns, _, _) = first_table(&b);
+        assert_eq!(*aligns, vec![MdAlign::None]);
+    }
+
+    #[test]
+    fn table_cells_keep_inline_styling_and_links() {
+        // Cell content is a full inline stream, not a flat string — bold, code
+        // and links must survive into the cell's runs.
+        let b = parse("| **h** | x |\n|---|---|\n| `c` | [l](https://e.com) |\n");
+        let (_, header, rows) = first_table(&b);
+        assert!(
+            header[0].iter().any(|r| r.bold && r.text == "h"),
+            "bold header cell, got {header:?}"
+        );
+        assert!(
+            rows[0][0].iter().any(|r| r.code && r.text == "c"),
+            "inline code cell, got {rows:?}"
+        );
+        let linked = rows[0][1]
+            .iter()
+            .find(|r| r.link.is_some())
+            .unwrap_or_else(|| panic!("expected a link cell, got {rows:?}"));
+        assert_eq!(linked.text, "l");
+        assert_eq!(linked.link.as_deref(), Some("https://e.com"));
+    }
+
+    #[test]
+    fn a_ragged_table_row_is_reconciled_to_the_header_width_without_inventing_content() {
+        // GFM: a short row is padded with an EMPTY cell and a long row is
+        // truncated — `pulldown-cmark` does this itself. What matters here is
+        // that the builder passes it through faithfully: every row lands at the
+        // header width, the padding cell is genuinely empty, and no text is
+        // duplicated into it.
+        let b = parse("| a | b |\n|---|---|\n| 1 |\n| 2 | 3 | 4 |\n");
+        let (_, header, rows) = first_table(&b);
+        assert_eq!(header.len(), 2);
+        assert_eq!(rows.len(), 2, "got {rows:?}");
+
+        assert_eq!(rows[0].len(), 2, "short row padded, got {rows:?}");
+        assert_eq!(runs_text(&rows[0][0]), "1");
+        assert!(
+            rows[0][1].is_empty(),
+            "the padding cell is empty, not a copy of anything: {rows:?}"
+        );
+
+        assert_eq!(rows[1].len(), 2, "long row truncated, got {rows:?}");
+        assert_eq!(runs_text(&rows[1][0]), "2");
+        assert_eq!(runs_text(&rows[1][1]), "3");
+    }
+
+    #[test]
+    fn render_table_pads_a_ragged_hand_built_table_instead_of_panicking() {
+        // `parse` cannot produce a ragged table (see the test above), but
+        // `MdBlock` is public, so the renderer must stay total for a table it
+        // did not parse. Indexing instead of padding would panic here.
+        use egui_kittest::kittest::Queryable as _;
+        fn cell(text: &str) -> Vec<MdRun> {
+            vec![MdRun {
+                text: text.to_string(),
+                ..MdRun::default()
+            }]
+        }
+        let table = MdBlock::Table {
+            // Three columns declared, but every row is short and the header
+            // shorter still.
+            aligns: vec![MdAlign::Left, MdAlign::Center, MdAlign::Right],
+            header: vec![cell("onlyhead")],
+            rows: vec![vec![cell("solo")], vec![]],
+        };
+        let mut h = egui_kittest::Harness::builder()
+            .with_size(egui::Vec2::new(600.0, 400.0))
+            .build_ui(move |ui| {
+                let mut ctx = RenderCtx {
+                    accent: Color32::WHITE,
+                    muted: Color32::GRAY,
+                    clicked: Vec::new(),
+                    table_seq: 0,
+                };
+                render_blocks(ui, std::slice::from_ref(&table), &mut ctx, 0);
+            });
+        h.run();
+        assert!(h.query_by_label("onlyhead").is_some(), "header cell renders");
+        assert!(h.query_by_label("solo").is_some(), "body cell renders");
+    }
+
+    #[test]
+    fn a_table_inside_a_blockquote_is_still_a_table() {
+        let b = parse("> | a |\n> |---|\n> | 1 |\n");
+        let (_, header, rows) = first_table(&b);
+        assert_eq!(runs_text(&header[0]), "a");
+        assert_eq!(runs_text(&rows[0][0]), "1");
+    }
+
+    // ---- Math ------------------------------------------------------------
+
+    #[test]
+    fn inline_math_is_captured_verbatim_as_its_own_run() {
+        // Without ENABLE_MATH this was one literal Text run "Let $a_i$ and
+        // $b_i$ be terms." with the `$` delimiters shown to the reader.
+        let b = parse("Let $a_i$ and $b_i$ be terms.\n");
+        let MdBlock::Paragraph(runs) = &b[0] else {
+            panic!("expected a paragraph, got {b:?}")
+        };
+        let math: Vec<&str> = runs
+            .iter()
+            .filter(|r| r.kind == MdRunKind::InlineMath)
+            .map(|r| r.text.as_str())
+            .collect();
+        assert_eq!(
+            math,
+            vec!["a_i", "b_i"],
+            "TeX is kept VERBATIM (no delimiters, no transliteration), got {runs:?}"
+        );
+        assert!(
+            !runs_text(runs).contains('$'),
+            "delimiters must not reach the reader: {runs:?}"
+        );
+    }
+
+    #[test]
+    fn math_underscores_are_not_eaten_by_the_emphasis_parser() {
+        // Two `_` across one expression is the classic corruption: CommonMark
+        // reads them as emphasis and the subscripts vanish.
+        let b = parse("$a_1 + b_2$\n");
+        let MdBlock::Paragraph(runs) = &b[0] else {
+            panic!("expected a paragraph, got {b:?}")
+        };
+        assert_eq!(runs.len(), 1, "one math run, got {runs:?}");
+        assert_eq!(runs[0].kind, MdRunKind::InlineMath);
+        assert_eq!(runs[0].text, "a_1 + b_2", "both underscores survive");
+        assert!(
+            !runs.iter().any(|r| r.italic),
+            "nothing was reinterpreted as emphasis: {runs:?}"
+        );
+    }
+
+    #[test]
+    fn display_math_becomes_its_own_block_in_document_order() {
+        let b = parse("before\n\n$$\nE = mc^2\n$$\n\nafter\n");
+        let kinds: Vec<&str> = b
+            .iter()
+            .map(|blk| match blk {
+                MdBlock::Paragraph(_) => "p",
+                MdBlock::MathBlock { .. } => "math",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(kinds, vec!["p", "math", "p"], "got {b:?}");
+        assert!(
+            matches!(&b[1], MdBlock::MathBlock { tex } if tex.trim() == "E = mc^2"),
+            "TeX kept verbatim, got {b:?}"
+        );
+    }
+
+    #[test]
+    fn display_math_mid_paragraph_does_not_reorder_the_text_around_it() {
+        // `$$…$$` can occur inline. The runs collected BEFORE it must be
+        // flushed first, or the leading prose would render after the formula.
+        let b = parse("lead in $$q$$ trail out\n");
+        let texts: Vec<String> = b
+            .iter()
+            .map(|blk| match blk {
+                MdBlock::Paragraph(runs) => format!("p:{}", runs_text(runs).trim()),
+                MdBlock::MathBlock { tex } => format!("math:{tex}"),
+                other => format!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            vec!["p:lead in", "math:q", "p:trail out"],
+            "document order preserved, got {b:?}"
+        );
+    }
+
+    #[test]
+    fn display_math_inside_a_list_item_stays_inline() {
+        // A block cannot be emitted mid-item without breaking the list, so
+        // display math degrades to an inline math run there.
+        let b = parse("- item $$z$$ tail\n");
+        let items: Vec<&Vec<MdRun>> = b
+            .iter()
+            .filter_map(|blk| match blk {
+                MdBlock::ListItem { runs, .. } => Some(runs),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(items.len(), 1, "still one list item, got {b:?}");
+        assert!(
+            items[0]
+                .iter()
+                .any(|r| r.kind == MdRunKind::InlineMath && r.text == "z"),
+            "math kept inline in the item, got {items:?}"
+        );
+        assert!(
+            !b.iter().any(|blk| matches!(blk, MdBlock::MathBlock { .. })),
+            "no stray block was emitted mid-list, got {b:?}"
+        );
+    }
+
+    // ---- Cache wiring ----------------------------------------------------
+
+    #[test]
+    fn show_goes_through_the_cache_and_does_not_reparse_unchanged_source() {
+        // The preview pane redraws every frame. This asserts `show` reads its
+        // blocks from the cache — calling `parse` directly instead would make
+        // the count climb with each frame.
+        let md = "# Cache wiring probe\n\nunique body for this test\n";
+        let before = cache_parses();
+        let mut h = harness_showing(md);
+        let after_first = cache_parses();
+        assert_eq!(
+            after_first,
+            before + 1,
+            "showing a document parses it exactly once"
+        );
+        for _ in 0..5 {
+            h.run();
+        }
+        assert_eq!(
+            cache_parses(),
+            after_first,
+            "five more frames of the SAME source must not re-parse"
+        );
+    }
+
+    // ---- Rendering -------------------------------------------------------
+
+    #[test]
+    fn show_renders_tables_footnotes_and_math_headlessly() {
+        use egui_kittest::kittest::Queryable as _;
+        let h = harness_showing(
+            "| left | right |\n|:--|--:|\n| cellone | celltwo |\n\n\
+             prose[^ref] here\n\n\
+             $$\nE = mc^2\n$$\n\n\
+             [^ref]: the note body\n",
+        );
+        // Table header + body cells reached the accessibility tree.
+        assert!(h.query_by_label("left").is_some(), "table header cell");
+        assert!(h.query_by_label("right").is_some(), "table header cell");
+        assert!(h.query_by_label("cellone").is_some(), "table body cell");
+        assert!(h.query_by_label("celltwo").is_some(), "table body cell");
+        // The footnote marker renders as `[1]` at BOTH the reference and the
+        // definition, and the note body is present.
+        assert_eq!(
+            h.query_all_by_label("[1]").count(),
+            2,
+            "the marker appears at the reference AND at the definition"
+        );
+        assert!(
+            h.query_by_label_contains("the note body").is_some(),
+            "footnote body"
+        );
+        // Display math renders transliterated, not as raw TeX.
+        assert!(
+            h.query_by_label_contains("E = mc²").is_some(),
+            "display math rendered as Unicode"
+        );
+    }
+
+    #[test]
+    fn show_renders_inline_math_transliterated_not_as_raw_tex() {
+        use egui_kittest::kittest::Queryable as _;
+        let h = harness_showing("value $\\alpha_1$ ok\n");
+        assert!(
+            h.query_by_label("α₁").is_some(),
+            "inline math is transliterated for display"
+        );
+        assert!(
+            h.query_by_label_contains("\\alpha").is_none(),
+            "raw TeX must not be shown as body text"
+        );
+    }
+
+    #[test]
+    fn render_blocks_stops_descending_past_the_depth_cap() {
+        use egui_kittest::kittest::Queryable as _;
+        // `parse` cannot currently build this (footnote definitions are always
+        // routed to the top level), so the guard is exercised directly on a
+        // hand-built tree — otherwise a future parse change could turn nesting
+        // into an unbounded recursive walk.
+        fn note(number: usize, text: &str, inner: Option<MdBlock>) -> MdBlock {
+            let mut body = vec![
+                MdBlock::Paragraph(vec![MdRun {
+                    text: text.to_string(),
+                    ..MdRun::default()
+                }]),
+                // A second block forces the nesting arm rather than the
+                // single-paragraph shortcut.
+                MdBlock::Rule,
+            ];
+            if let Some(i) = inner {
+                body.push(i);
+            }
+            MdBlock::FootnoteDef {
+                number,
+                label: text.to_string(),
+                body,
+            }
+        }
+        // Depth 0 renders "lvl0", then each nested note one level deeper.
+        let mut tree = note(99, "deepest", None);
+        for level in (0..MAX_BLOCK_DEPTH + 2).rev() {
+            tree = note(level as usize, &format!("lvl{level}"), Some(tree));
+        }
+        let mut h = egui_kittest::Harness::builder()
+            .with_size(egui::Vec2::new(700.0, 900.0))
+            .build_ui(move |ui| {
+                let mut ctx = RenderCtx {
+                    accent: Color32::WHITE,
+                    muted: Color32::GRAY,
+                    clicked: Vec::new(),
+                    table_seq: 0,
+                };
+                render_blocks(ui, std::slice::from_ref(&tree), &mut ctx, 0);
+            });
+        h.run();
+        assert!(
+            h.query_by_label("lvl0").is_some(),
+            "shallow content still renders"
+        );
+        assert!(
+            h.query_by_label("deepest").is_none(),
+            "content past the depth cap is not descended into"
+        );
+    }
+
+    // ---- HTML export -----------------------------------------------------
+
+    #[test]
+    fn to_html_exports_tables_footnotes_and_math() {
+        // The export used the DEFAULT option set, so none of these rendered —
+        // the stylesheet even carried table CSS that nothing could ever match.
+        let html = to_html(
+            "| a | b |\n|---|--:|\n| 1 | 2 |\n\nnote[^k]\n\n$x^2$\n\n[^k]: body text\n",
+        );
+        assert!(html.contains("<table>"), "table element missing:\n{html}");
+        assert!(html.contains("<th>a</th>"), "header cell missing:\n{html}");
+        assert!(
+            html.contains("text-align: right"),
+            "column alignment missing:\n{html}"
+        );
+        assert!(
+            html.contains("footnote-reference"),
+            "footnote reference missing:\n{html}"
+        );
+        assert!(
+            html.contains("footnote-definition"),
+            "footnote definition missing:\n{html}"
+        );
+        assert!(html.contains("body text"), "footnote body missing:\n{html}");
+        assert!(
+            html.contains("math math-inline"),
+            "inline math missing:\n{html}"
+        );
+        // The stylesheet gained matching rules for the newly-reachable elements.
+        assert!(html.contains(".math{"), "math styling missing:\n{html}");
+    }
+
+    /// SEC-2 regression for the widened parser: tables and footnotes are NEW
+    /// paths into the exported document, so the raw-HTML filter and the
+    /// link-scheme allowlist must still hold on them. Against an unfiltered
+    /// writer this export carries a live `<script>` in a table cell, another in
+    /// the footnote body, and a `javascript:` href.
+    #[test]
+    fn to_html_keeps_the_new_table_and_footnote_paths_free_of_script_and_bad_schemes() {
+        let md = "| <script>alert(1)</script> | <img src=x onerror=alert(1)> |\n\
+                  |---|---|\n\
+                  | [go](javascript:alert(1)) | ok |\n\n\
+                  ref[^p]\n\n\
+                  [^p]: <script>alert(2)</script> and [x](javascript:alert(3))\n";
+        let html = to_html(md);
+        assert!(
+            !html.contains("<script>"),
+            "a live <script> survived the widened parser:\n{html}"
+        );
+        assert!(
+            !html.contains("onerror="),
+            "an event handler survived:\n{html}"
+        );
+        assert!(
+            !html.contains("javascript:"),
+            "a javascript: URI survived:\n{html}"
+        );
+        // The safe structure around the stripped content is still exported.
+        assert!(html.contains("<table>"), "table still rendered:\n{html}");
+        assert!(html.contains("footnote-definition"), "note rendered:\n{html}");
+        assert!(html.contains(">ok<"), "safe cell text kept:\n{html}");
     }
 
     #[test]
@@ -900,6 +2025,7 @@ mod tests {
             italic: false,
             code: false,
             link: None,
+            kind: MdRunKind::Text,
         }];
         assert!(
             callout_split(&runs).is_none(),
@@ -911,6 +2037,7 @@ mod tests {
             italic: false,
             code: false,
             link: None,
+            kind: MdRunKind::Text,
         }];
         assert!(
             callout_split(&empty).is_none(),
@@ -1025,6 +2152,7 @@ mod tests {
             italic: false,
             code: false,
             link: None,
+            kind: MdRunKind::Text,
         }];
         let (title, body) = callout_split(&runs).expect("callout");
         assert!(title.contains("WARNING"));
@@ -1036,6 +2164,7 @@ mod tests {
             italic: false,
             code: false,
             link: None,
+            kind: MdRunKind::Text,
         }];
         assert!(callout_split(&plain).is_none());
     }
