@@ -60,26 +60,26 @@ arms. cargo-llvm-cov 0.8.7 has **no stable inline-comment region-exclusion**
 mechanism (that is a grcov-only feature), so per the WU-0 contract these arms
 are **left in place and accounted for here — never faked**:
 
-| File | Line cov | Uncoverable region + why |
-|---|---|---|
-| `scribe-app/src/app/mod.rs` | 68.92% | `rfd::FileDialog` blocking open/save dialogs (~9 call sites) spawn a **native OS file picker** — no headless return; plus interspersed `ctx`-painter arms (GPU pixels). The *bulk* of the missed lines here is testable GUI-state logic that the WU-1 god-file decomposition did not finish reaching — that residue is ordinary test backlog, NOT an exclusion, and is deliberately left to a future testing WU rather than excluded or faked. |
-| `scribe-app/src/issue_intake.rs` | 94.18% | The OS-launch glue — `webbrowser::open(...)` / `mailto:` `launch()` — hands off to the **OS default browser / mail client**. The URL-assembly + 414-fallback logic around it is covered; the actual `launch()` syscall is not. |
-| `scribe-app/src/updater.rs` | 86.63% | Thread-spawn + `mpsc` + `ctx.request_repaint` orchestration. The pure state-transition reducer is covered; the **spawned background thread** that does the real fetch/apply is not entered in a single-threaded instrumented test. |
-| `scribe-core/src/lsp/mod.rs` | 93.87% | The live **language-server subprocess** surface (`spawn` / `did_open` / `shutdown` / `Drop`). Driving these needs a real LSP child process over stdio; the protocol-framing logic (`lsp/protocol.rs`) is covered, the process lifecycle is not. |
-| `scribe-core/src/update/net.rs` | 90.73% | `ureq` HTTP error/redirect arms that require a **live (or mock) network endpoint**. The happy-path + parse logic is covered; the transport error branches are not (no test server is wired). |
-| `scribe-core/src/document.rs` | 95.84% | The `LARGE_FILE_THRESHOLD = 256 * 1024 * 1024` mmap browse path. The 256 MiB threshold is a **non-injectable `const`**; exercising the mmap arm would require materialising a ≥256 MiB file in CI, which is not a reasonable test fixture. |
-| `scribe-app/src/app/chrome.rs` | 73.97% | `#[cfg(windows)]` titlebar/caption-layout arms that do not compile on the Linux CI target. |
-| `scribe-app/src/app/frame_tick.rs` | 77.21% | The per-frame render loop. Its residue is ~480 lines fragmented across dozens of `if ui.button(..).clicked() { .. }` bodies, the right-click editor context menu, and galley/paint geometry — each reachable only by an AccessKit click or a real layout pass. Ordinary (expensive) backlog, not an exclusion. |
-| `scribe-app/src/app/visual_regression.rs` | 44.81% | The render→diff→assert GPU gate. The scene lane needs a real **wgpu adapter** and is `gpu_available()`-gated, so it honestly SKIPS headless (it never passes falsely). Deliberately NOT whole-file excluded like `visual_qa.rs`: its perceptual-diff math and reduced-motion resting-frame assertions are pure and DO run on every host, and excluding the file would stop counting those real tests. |
-| `scribe-app/src/integration/windows.rs` | n/a on CI | `reg.exe` HKCU file-association registration. `#[cfg(windows)]`-gated, so it is **not compiled on the Linux CI runner** and never enters the CI denominator at all (it reads 0% in a local Windows coverage run, which is a local-only artifact). Its one real test mutates the live HKCU hive and is `#[ignore]`d by design; the pure entry-building logic it delegates to (`windows_entries.rs`) is at 99.17%. |
+These arms fall into a small number of **categories**, each defined by the
+host facility it hands off to:
 
-> The percentages above are the current measured values (local Windows run,
-> `cargo llvm-cov --workspace`). They track the CI (Linux) number closely but not
-> exactly: `cfg(windows)` code compiles locally and not on CI, so files with
-> Windows-gated arms (`chrome.rs`, `integration/windows.rs`) read lower locally.
-> The prior revision of this table had drifted badly — it claimed `app/mod.rs`
-> had "2,684 missed lines" in a file that is 2,176 lines long. Re-measure before
-> citing these rather than trusting the table's age.
+| Category | Why it cannot be entered headless |
+|---|---|
+| Native OS dialogs | Blocking open/save pickers have no headless return value. |
+| OS launch glue | Handing a URL to the default browser / mail client leaves the process. The URL-assembly logic around the hand-off *is* covered. |
+| Background threads | Work moved onto a spawned thread is not entered by a single-threaded instrumented run. The pure state-transition reducers driving them *are* covered. |
+| Child processes | Driving a real child over stdio needs a live process; the pure protocol/message framing around it *is* covered. |
+| Network transport arms | Error/redirect branches need a live or mock endpoint. Happy-path parsing *is* covered. |
+| Very-large-file paths | Guarded by a non-injectable size `const`; materialising a fixture past the threshold is not reasonable in CI. |
+| Platform-gated arms | `#[cfg]`-gated code does not compile on the CI target, so it never enters the CI denominator. |
+| GPU render/diff gates | Need a real graphics adapter; these lanes are capability-gated and honestly **skip** headless — they never pass falsely. |
+| Per-frame render loop | Residue fragmented across many small event-handler bodies and paint geometry, each reachable only by a real layout pass. Ordinary (expensive) backlog, not an exclusion. |
+
+> Per-file coverage numbers are deliberately **not** enumerated here: they are a
+> measurement, not a decision, and a stale table is worse than no table. Read the
+> current values from the coverage run itself (`cargo llvm-cov --workspace`)
+> rather than from this ADR. Note that `cfg`-gated code compiles locally and not
+> on the CI target, so local and CI numbers differ by design.
 
 ### 3. The rule
 
