@@ -27,6 +27,10 @@ use scribe_core::{Config, Document};
 use std::path::{Path, PathBuf};
 
 mod commands;
+/// Note-capture commands: clipboard-image attachments, rename-with-link-refactor,
+/// and dated daily notes. Declared here beside `commands` because it implements
+/// three of that registry's entries.
+mod note_capture;
 // Re-export the command/shortcut/toolbar registries + their pure lookup helpers
 // so existing call sites (`crate::app::BUILTIN_COMMANDS`, `super::*`, …) resolve
 // unchanged after the WU-1 extraction.
@@ -808,6 +812,11 @@ pub struct ScribeApp {
     pending_case: Option<u8>,
     /// P2-1 — format the markdown pipe table under the caret.
     pending_format_table: bool,
+    /// Text a command produced that must land AT THE CARET — currently the
+    /// markdown link for a pasted image attachment, whose file is already on
+    /// disk by the time this is set. Drained by `drain_pending_editor_action`
+    /// on the next frame, where the caret is reachable.
+    pending_insert_text: Option<String>,
     /// F-013 from docs/audits/overlooked-surfaces-2026-05-29.md: when true,
     /// the welcome modal renders this frame. Auto-opened on first launch
     /// (when `config.editor.first_run_completed` is false); reachable
@@ -1407,6 +1416,7 @@ impl ScribeApp {
             pending_wrap_marker: None,
             pending_case: None,
             pending_format_table: false,
+            pending_insert_text: None,
             welcome_open: welcome_on_launch,
             fuzzy_open: false,
             fuzzy_query: String::new(),

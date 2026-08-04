@@ -3778,6 +3778,7 @@ dependencies = [
  "mimalloc",
  "minisign",
  "notify",
+ "png",
  "pollster",
  "pulldown-cmark",
  "raw-window-handle",

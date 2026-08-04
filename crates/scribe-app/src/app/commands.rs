@@ -442,6 +442,13 @@ pub(crate) enum BuiltinCommand {
     NewChecklistNote,
     NewMeetingNote,
     NewDailyNote,
+    // ---- Note-capture actions ----
+    /// Save the clipboard image into the vault's attachments folder and insert
+    /// a markdown link to it at the caret.
+    PasteImageAttachment,
+    /// Rename the active note, retargeting every inbound `[[wiki-link]]` in the
+    /// vault so no backlink is silently broken.
+    RenameNote,
 }
 
 /// A clipboard / history action the palette requests; drained in `frame_tick`
@@ -618,6 +625,12 @@ pub(crate) const BUILTIN_COMMANDS: &[BuiltinEntry] = &[
         bindings: &[],
     },
     BuiltinEntry {
+        label: "Paste image as attachment",
+        shortcut: "",
+        action: BuiltinCommand::PasteImageAttachment,
+        bindings: &[],
+    },
+    BuiltinEntry {
         label: "Previous tab",
         shortcut: "",
         action: BuiltinCommand::CycleTabPrev,
@@ -627,6 +640,12 @@ pub(crate) const BUILTIN_COMMANDS: &[BuiltinEntry] = &[
         label: "Redo",
         shortcut: "Ctrl+Shift+Z",
         action: BuiltinCommand::Redo,
+        bindings: &[],
+    },
+    BuiltinEntry {
+        label: "Rename note (updates links)…",
+        shortcut: "",
+        action: BuiltinCommand::RenameNote,
         bindings: &[],
     },
     BuiltinEntry {
@@ -1189,6 +1208,29 @@ mod tests {
             for b in &actions[i + 1..] {
                 assert_ne!(a, b, "duplicate action in registry: {a:?}");
             }
+        }
+    }
+
+    /// The note-capture commands are palette-only (no default chord), so the
+    /// registry IS their entire discovery surface. A command implemented but
+    /// never listed is unreachable for every user who does not read the source.
+    #[test]
+    fn note_capture_commands_are_discoverable_in_the_palette() {
+        for (action, needle) in [
+            (BuiltinCommand::PasteImageAttachment, "image"),
+            (BuiltinCommand::RenameNote, "Rename"),
+            (BuiltinCommand::NewDailyNote, "daily"),
+        ] {
+            let entry = BUILTIN_COMMANDS
+                .iter()
+                .find(|e| e.action == action)
+                .unwrap_or_else(|| panic!("{action:?} has no palette row"));
+            assert!(
+                entry.label.to_lowercase().contains(&needle.to_lowercase()),
+                "{action:?} is listed as {:?}, which does not say {needle:?} — \
+                 the fuzzy filter is how users find it",
+                entry.label
+            );
         }
     }
 

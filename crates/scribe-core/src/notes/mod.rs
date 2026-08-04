@@ -11,6 +11,11 @@
 //! - [`completion`] — sigil-triggered (`#tag` / `[[note`) completion source: the
 //!   span to replace plus ranked candidates, for a search box or an editor.
 //! - [`frontmatter`] — minimal YAML frontmatter block extraction.
+//! - [`relink`] — retarget `[[wiki-link]]`s across note content, so renaming a
+//!   note rewrites the links that point at it instead of silently breaking
+//!   every backlink.
+//! - [`template`] — closed, declarative `{{placeholder}}` substitution for the
+//!   built-in note templates (daily / meeting / checklist).
 //! - [`vault_path`] — vault-relative path safety: a wiki-link / tag / title is
 //!   UNTRUSTED, so every filesystem target it produces is rejected for traversal
 //!   (`..`, absolute paths, drive letters) and confined to the vault before use.
@@ -24,8 +29,10 @@ pub mod completion;
 pub mod frontmatter;
 pub mod meta;
 pub mod query;
+pub mod relink;
 mod scan_guard;
 pub mod tag_tree;
 pub mod tags;
+pub mod template;
 pub mod vault_path;
 pub mod wikilink;

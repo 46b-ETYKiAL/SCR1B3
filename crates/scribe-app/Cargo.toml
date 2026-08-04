@@ -28,6 +28,12 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 rfd = "0.17"          # native OS file dialogs (native-feel)
 arboard = "3"         # OS clipboard read for palette-driven Paste (egui exposes no read API; already in tree via eframe)
+# PNG encoder for clipboard-image attachments (`arboard::get_image` hands back
+# raw RGBA, so a note app needs an encoder to land it in the vault). Already a
+# PRODUCTION crate in the graph — `arboard` depends on `image`, which depends on
+# `png` — so this direct dependency adds ZERO new crates and reuses the existing
+# `safe-to-deploy` cargo-vet exemption. Pure Rust, no network, no telemetry.
+png = "0.18"
 notify = { workspace = true }                 # config/theme live-reload
 mimalloc = "0.1"                               # global allocator — ~20% faster on egui/editor alloc churn (egui docs); unsafe is in-crate, app stays #![forbid(unsafe_code)]
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }

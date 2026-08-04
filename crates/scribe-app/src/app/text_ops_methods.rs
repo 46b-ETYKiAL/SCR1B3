@@ -6,6 +6,10 @@ use super::*;
 /// P3-3 — built-in "new note from template" seeds (ride the plain-buffer path,
 /// no new subsystem). Bodies are checklist-first so the task features are
 /// discoverable immediately.
+///
+/// Bodies carry `{{placeholder}}` names substituted by
+/// [`scribe_core::notes::template`] — a closed, declarative set rather than a
+/// script pass. See that module for why `rhai` is deliberately NOT wired here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum NoteTemplate {
     Checklist,
@@ -22,16 +26,43 @@ impl NoteTemplate {
         }
     }
 
-    fn body(self) -> &'static str {
+    /// The raw template source, placeholders unsubstituted. `pub(super)` so the
+    /// daily-note writer can render the same body it would have seeded a buffer
+    /// with — one template, two destinations.
+    pub(super) fn body(self) -> &'static str {
         match self {
             NoteTemplate::Checklist => "# Checklist\n\n- [ ] \n- [ ] \n- [ ] \n",
             NoteTemplate::Meeting => {
-                "# Meeting notes\n\n**Date:** \n**Attendees:** \n\n\
+                "# Meeting notes\n\n**Date:** {{date}}\n**Time:** {{time}}\n**Attendees:** \n\n\
                  ## Agenda\n\n- \n\n## Decisions\n\n- \n\n## Action items\n\n- [ ] \n"
             }
             NoteTemplate::Daily => {
-                "# Daily note\n\n## Focus\n\n- [ ] \n\n## Notes\n\n- \n\n## Done\n\n- [x] \n"
+                "# {{date}}\n\n## Focus\n\n- [ ] \n\n## Notes\n\n- \n\n## Done\n\n- [x] \n"
             }
+        }
+    }
+
+    /// The template body with `ctx` substituted.
+    ///
+    /// The ONE rendering seam: both the scratch-buffer seeder and the dated
+    /// daily-note writer go through it, so there is no second substitution path
+    /// to drift out of step with this one.
+    pub(super) fn render_with(self, ctx: &scribe_core::notes::template::TemplateContext) -> String {
+        scribe_core::notes::template::render(self.body(), ctx)
+    }
+
+    /// The template body with today's date/time substituted, titled after the
+    /// template itself.
+    ///
+    /// A clock the [`scribe_core::notes::template`] parser cannot read leaves
+    /// the body UNSUBSTITUTED rather than blanking the placeholders: a visible
+    /// `{{date}}` reports the failure, an empty heading hides it.
+    pub(super) fn rendered_body(self) -> String {
+        let stamp = crate::datetime::now_iso8601_utc();
+        let title = self.label();
+        match scribe_core::notes::template::TemplateContext::from_iso8601_utc(&stamp, title) {
+            Some(ctx) => self.render_with(&ctx),
+            None => self.body().to_string(),
         }
     }
 }
@@ -683,7 +714,7 @@ impl ScribeApp {
     pub(super) fn new_note_from_template(&mut self, kind: NoteTemplate) {
         self.new_tab();
         let active = self.active;
-        self.tabs[active].set_text(kind.body().to_string());
+        self.tabs[active].set_text(kind.rendered_body());
         self.status = format!("new note: {}", kind.label());
     }
 

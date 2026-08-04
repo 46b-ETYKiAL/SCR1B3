@@ -258,9 +258,12 @@ impl ScribeApp {
             BuiltinCommand::NewMeetingNote => {
                 self.new_note_from_template(super::text_ops_methods::NoteTemplate::Meeting)
             }
-            BuiltinCommand::NewDailyNote => {
-                self.new_note_from_template(super::text_ops_methods::NoteTemplate::Daily)
-            }
+            // A daily note is a real dated file in the vault, not a scratch
+            // buffer — so it routes through `new_daily_note`, which falls back
+            // to the seeded buffer only when there is no vault to write to.
+            BuiltinCommand::NewDailyNote => self.new_daily_note(),
+            BuiltinCommand::PasteImageAttachment => self.paste_image_attachment(),
+            BuiltinCommand::RenameNote => self.rename_note_active(),
         }
     }
 
@@ -327,6 +330,15 @@ impl ScribeApp {
             };
             self.pending_editor_action.get_or_insert(action);
         }
+        // A command that produced TEXT to insert (currently the image-paste
+        // attachment link) rides the same delivery path as a clipboard paste:
+        // the file is already on disk, only the caret insertion is deferred.
+        // Delivered as `Event::Paste` because that is what both editor surfaces
+        // already implement as "insert this string at the caret, replacing the
+        // selection" — no second insertion path to keep in lockstep.
+        if let Some(text) = self.pending_insert_text.take() {
+            self.deliver_editor_event(ctx, egui::Event::Paste(text));
+        }
         let Some(action) = self.pending_editor_action.take() else {
             return;
         };
@@ -349,6 +361,14 @@ impl ScribeApp {
                 egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
             ),
         };
+        self.deliver_editor_event(ctx, event);
+    }
+
+    /// Deliver one synthesised egui event to whichever surface is rendering the
+    /// active tab. Extracted so every command that has to reach the caret
+    /// (clipboard actions, the pasted-image link) uses ONE mode-aware delivery
+    /// path rather than each re-deriving the rope/TextEdit/grid split.
+    fn deliver_editor_event(&mut self, ctx: &egui::Context, event: egui::Event) {
         if self.active_editor_is_rope() {
             let tab = &mut self.tabs[self.active];
             tab.rope_state
