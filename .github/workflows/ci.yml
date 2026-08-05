@@ -326,9 +326,30 @@ jobs:
     # `windows_module_is_cfg_gated_so_the_mutation_exclusion_stays_honest` fails
     # if that premise ever stops holding, so the exclusion cannot silently rot
     # into a real blind spot.
+    #
+    # WALL-CLOCK — why this job is sharded and capped rather than left to run.
+    #
+    # It previously declared no `timeout-minutes:` at all, so it inherited
+    # GitHub's 360-minute ceiling. On a PR that changed enough lines to yield
+    # 1763 in-diff mutants it was CANCELLED at 6h00m17s — and a cancelled job
+    # reports neither pass nor fail, it simply vanishes from the checks list.
+    # That is the worst of the three outcomes: the gate looked absent rather
+    # than red, so nobody knew mutation had stopped covering the PR.
+    #
+    # Two changes make it fail LOUDLY instead. The matrix raises the ceiling
+    # (same 12-shard precedent as `mutation-app` below), and the explicit
+    # per-shard `timeout-minutes` is comfortably under GitHub's limit so a
+    # genuine overrun is reported as a failed step. The pre-flight cap then
+    # turns "too big to finish" into an actionable message BEFORE burning the
+    # budget, rather than a silent cancellation five hours later.
     name: mutation testing (in-diff)
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    timeout-minutes: 100
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
     steps:
       - name: Harden the runner (egress audit)
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
@@ -350,6 +371,35 @@ jobs:
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: git diff "$BASE_SHA"...HEAD -- '*.rs' > pr.diff
+      - name: Refuse to start a run that cannot finish
+        # The loud half of the timeout fix. `--list` is seconds (it parses, it
+        # does not build), so this converts "this PR is too large to mutation
+        # test in the budget" from a 6-hour silent cancellation into an
+        # immediate, actionable failure that names the number and the options.
+        #
+        # The cap is derived, not guessed: ~60s per mutant observed, a 100
+        # minute per-shard timeout, 8 shards, and a ~40% margin for the build
+        # and for slower mutants => 80 per shard, 640 in total.
+        env:
+          MAX_PER_SHARD: 80
+          SHARDS: 8
+        run: |
+          set -euo pipefail
+          n=$(cargo mutants --list --in-diff pr.diff \
+                --exclude '**/src/integration/windows.rs' \
+                --exclude '**/scribe-win32-chrome/src/imp.rs' | wc -l)
+          echo "in-diff mutants: $n (cap $((MAX_PER_SHARD * SHARDS)))"
+          echo "in-diff mutants: **$n**" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$n" -gt "$((MAX_PER_SHARD * SHARDS))" ]; then
+            echo "::error::This PR yields $n in-diff mutants, more than the" \
+                 "$((MAX_PER_SHARD * SHARDS)) this gate can test within its" \
+                 "wall-clock budget. It has NOT been mutation tested. Either" \
+                 "split the PR, or run it locally with" \
+                 "\`cargo mutants --in-diff pr.diff --test-tool nextest\` and" \
+                 "attach the survivor list. Do not ignore this: silently" \
+                 "skipping is the failure mode this check replaced."
+            exit 1
+          fi
       - name: Mutation test (only what this PR changed)
         # A surviving mutant here means a line this PR touched can be broken with
         # the suite still green. Fix the test, or document the mutant as
@@ -376,6 +426,7 @@ jobs:
         # split keeps every compiled line of `lib.rs` under mutation.
         run: >
           cargo mutants --in-diff pr.diff --test-tool nextest --timeout 300 --in-place
+          --shard ${{ matrix.shard }}/8
           --exclude '**/src/integration/windows.rs'
           --exclude '**/scribe-win32-chrome/src/imp.rs'
 
