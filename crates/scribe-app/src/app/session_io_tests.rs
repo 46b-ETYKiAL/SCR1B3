@@ -37,28 +37,16 @@ fn temp_dir(tag: &str) -> PathBuf {
     dir
 }
 
-/// Serializes tests that mutate the process-global `SCR1B3_CONFIG_DIR`.
 /// `restore_tabs_from_manifest` is an associated fn that reads the GLOBAL
 /// `Config::config_dir()` (not the instance `config_dir`), so redirecting the
-/// env is the only way to drive it — and cargo runs tests in parallel, so the
-/// redirect must be exclusive or two tests clobber each other.
-static CONFIG_DIR_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-fn with_config_dir<T>(dir: &Path, body: impl FnOnce() -> T) -> T {
-    // A poisoned lock only means some test panicked; the guard's job is mutual
-    // exclusion, not protecting data, so recover rather than cascade failures.
-    let _guard = CONFIG_DIR_ENV_LOCK
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
-    let prev = std::env::var_os("SCR1B3_CONFIG_DIR");
-    std::env::set_var("SCR1B3_CONFIG_DIR", dir);
-    let out = body();
-    match prev {
-        Some(v) => std::env::set_var("SCR1B3_CONFIG_DIR", v),
-        None => std::env::remove_var("SCR1B3_CONFIG_DIR"),
-    }
-    out
-}
+/// env is the only way to drive it.
+///
+/// The redirect is serialised by the CRATE-WIDE lock in
+/// [`crate::test_config_env`], not a lock private to this module. A private one
+/// excluded only this file's tests: every module doing the same redirect
+/// compiles into the SAME test binary and cargo runs them in parallel, so a
+/// per-module mutex left them free to clobber each other's redirect.
+use crate::test_config_env::with_config_dir;
 
 /// An app with one tab opened from a real file on disk.
 fn app_with_file(name: &str, text: &str) -> (ScribeApp, PathBuf) {

@@ -10,25 +10,13 @@
 #![allow(clippy::wildcard_imports)]
 use super::*;
 
-/// Serializes tests that mutate the process-global `SCR1B3_CONFIG_DIR`.
-/// The restore-list + config-reload functions read the GLOBAL config dir
-/// (not the instance one), so redirecting the env is the only way to drive
-/// them — and cargo runs tests in parallel, so it must be exclusive.
-static CONFIG_DIR_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-fn with_config_dir<T>(dir: &Path, body: impl FnOnce() -> T) -> T {
-    let _guard = CONFIG_DIR_ENV_LOCK
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
-    let prev = std::env::var_os("SCR1B3_CONFIG_DIR");
-    std::env::set_var("SCR1B3_CONFIG_DIR", dir);
-    let out = body();
-    match prev {
-        Some(v) => std::env::set_var("SCR1B3_CONFIG_DIR", v),
-        None => std::env::remove_var("SCR1B3_CONFIG_DIR"),
-    }
-    out
-}
+/// The restore-list + config-reload functions read the GLOBAL config dir (not
+/// the instance one), so redirecting the env is the only way to drive them.
+///
+/// Serialised by the CRATE-WIDE lock in [`crate::test_config_env`]: a mutex
+/// private to this module excluded only this module, while every other module
+/// redirecting the same process-global var ran in parallel in the same binary.
+use crate::test_config_env::with_config_dir;
 
 fn temp_dir(tag: &str) -> PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};

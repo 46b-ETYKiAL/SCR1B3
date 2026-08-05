@@ -914,8 +914,10 @@ mod tint_tests {
         // SCR1B3_CONFIG_DIR at a temp dir holding a real one and assert the
         // parsed set is non-empty + contains the trigger — this kills the whole
         // `load_snippets -> Default::default()` (empty-set) body replacement.
-        static LK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _g = LK.lock().unwrap_or_else(|e| e.into_inner());
+        // The crate-wide lock, not a function-local mutex: `SCR1B3_CONFIG_DIR`
+        // is process-global and several other modules in this test binary
+        // redirect it, so a mutex scoped to this one function excluded nothing.
+        let _g = crate::test_config_env::config_dir_env_guard();
         let prev = std::env::var_os("SCR1B3_CONFIG_DIR");
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(

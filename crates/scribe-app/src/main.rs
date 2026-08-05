@@ -33,6 +33,10 @@ mod reporting;
 mod session_path_guard;
 mod settings;
 mod single_instance;
+/// The crate-wide `SCR1B3_CONFIG_DIR` test lock (see the module docs for why
+/// there must be exactly one).
+#[cfg(test)]
+mod test_config_env;
 mod theme_editor;
 mod to_markdown;
 mod tray;

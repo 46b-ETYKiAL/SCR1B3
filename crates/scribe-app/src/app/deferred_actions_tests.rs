@@ -973,20 +973,12 @@ fn bookmark_navigation_says_so_when_there_are_none() {
 // so the button does nothing at all.
 //
 // These read the GLOBAL `Config::config_file_path()` (not the instance dir), so
-// the env redirect has to be exclusive: cargo runs tests in parallel.
-static CFG_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-fn with_config_dir<T>(dir: &Path, body: impl FnOnce() -> T) -> T {
-    let _guard = CFG_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    let prev = std::env::var_os("SCR1B3_CONFIG_DIR");
-    std::env::set_var("SCR1B3_CONFIG_DIR", dir);
-    let out = body();
-    match prev {
-        Some(v) => std::env::set_var("SCR1B3_CONFIG_DIR", v),
-        None => std::env::remove_var("SCR1B3_CONFIG_DIR"),
-    }
-    out
-}
+// the env redirect has to be exclusive against EVERY other module that mutates
+// the same process-global var — hence the crate-wide lock in
+// `crate::test_config_env` rather than a local one. This module's copy was
+// additionally named `CFG_ENV_LOCK` rather than the name the other three used,
+// so a grep for the common name did not even reveal it existed.
+use crate::test_config_env::with_config_dir;
 
 fn cfg_temp_dir(tag: &str) -> PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};

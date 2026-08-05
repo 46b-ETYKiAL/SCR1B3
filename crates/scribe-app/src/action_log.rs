@@ -123,13 +123,16 @@ mod tests {
         assert!(!rotated.exists(), "no rotation at exactly the cap");
     }
 
-    /// Serializes tests that mutate the process-global action-log env vars.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     /// Run `body` with the two action-log env vars set as given, restoring the
-    /// previous values afterwards. Serialized because these vars are process-global.
+    /// previous values afterwards.
+    ///
+    /// One of the two is `SCR1B3_CONFIG_DIR`, which other modules in this same
+    /// test binary also redirect, so this holds the CRATE-WIDE lock from
+    /// [`crate::test_config_env`] rather than a private `ENV_LOCK` — a private
+    /// one excluded only this module and left the cross-module race open. The
+    /// body stays here because `SCR1B3_NO_ACTION_LOG` is this module's own var.
     fn with_env(no_log: Option<&str>, config_dir: Option<&std::path::Path>, body: impl FnOnce()) {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _g = crate::test_config_env::config_dir_env_guard();
         let prev_no = std::env::var_os("SCR1B3_NO_ACTION_LOG");
         let prev_cfg = std::env::var_os("SCR1B3_CONFIG_DIR");
         match no_log {

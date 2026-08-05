@@ -30,23 +30,11 @@ use scribe_core::Config;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-/// Serializes tests that mutate the process-global `SCR1B3_CONFIG_DIR`.
-/// cargo runs tests in parallel, so the redirect must be exclusive.
-static CONFIG_DIR_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-fn with_config_dir<T>(dir: &Path, body: impl FnOnce() -> T) -> T {
-    let _guard = CONFIG_DIR_ENV_LOCK
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
-    let prev = std::env::var_os("SCR1B3_CONFIG_DIR");
-    std::env::set_var("SCR1B3_CONFIG_DIR", dir);
-    let out = body();
-    match prev {
-        Some(v) => std::env::set_var("SCR1B3_CONFIG_DIR", v),
-        None => std::env::remove_var("SCR1B3_CONFIG_DIR"),
-    }
-    out
-}
+/// The redirect is serialised by the CRATE-WIDE lock in
+/// [`crate::test_config_env`]. cargo runs tests in parallel and every module
+/// doing this redirect shares one process, so a module-private mutex was
+/// exclusion in name only.
+use crate::test_config_env::with_config_dir;
 
 fn temp_dir(tag: &str) -> PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};

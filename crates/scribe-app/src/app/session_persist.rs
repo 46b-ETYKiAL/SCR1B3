@@ -221,9 +221,13 @@ mod tests {
         );
     }
 
-    /// Serializes the SCR1B3_CONFIG_DIR-mutating session-save test (belt-and-
-    /// suspenders; the CI `test` job runs single-threaded, nextest per-process).
-    static CFG_DIR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// Serialises the `SCR1B3_CONFIG_DIR`-mutating session-save test against
+    /// EVERY other module that redirects the same process-global var — hence
+    /// the crate-wide lock rather than the module-private `CFG_DIR_LOCK` this
+    /// replaces. Nor was it belt-and-suspenders: the local `cargo test` run is
+    /// multi-threaded, and the private mutex never excluded the other modules
+    /// in this one test binary regardless.
+    use crate::test_config_env::config_dir_env_guard;
 
     #[test]
     fn session_is_persisted_when_the_open_set_signature_changes() {
@@ -232,7 +236,7 @@ mod tests {
         // session_sig, clean detects the change and updates it; == leaves it stale.
         // save_session writes into Config::config_dir(); SCR1B3_CONFIG_DIR relocates
         // that to a temp dir so the real config is never touched.
-        let _g = CFG_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = config_dir_env_guard();
         let dir = tempfile::tempdir().unwrap();
         let prev = std::env::var_os("SCR1B3_CONFIG_DIR");
         std::env::set_var("SCR1B3_CONFIG_DIR", dir.path());
