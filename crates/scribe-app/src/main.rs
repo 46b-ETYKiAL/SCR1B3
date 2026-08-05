@@ -118,6 +118,11 @@ fn main() -> ExitCode {
     let instance_lock = match instance_root.as_deref() {
         Some(root) => match single_instance::acquire(root) {
             Ok(single_instance::Startup::Primary(lock)) => Some(lock),
+            // Gated to match the variant itself: only the `#[cfg(windows)]`
+            // `open_lock` can return `Secondary`, so off Windows the variant
+            // does not exist and this arm would not compile. The match stays
+            // exhaustive either way — `Primary` plus `Err` covers it.
+            #[cfg(windows)]
             Ok(single_instance::Startup::Secondary) => {
                 let request = single_instance::Request {
                     paths: cli_paths.clone(),

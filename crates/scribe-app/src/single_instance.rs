@@ -64,11 +64,33 @@ use serde::{Deserialize, Serialize};
 /// "give me a second window right now" is per-launch.
 pub const NEW_INSTANCE_ENV: &str = "SCR1B3_NEW_INSTANCE";
 
+// ---- the Windows-only lock-classification half ----
+//
+// Everything from here to `classify_lock_error` is reachable ONLY from the
+// `#[cfg(windows)]` `open_lock` below: the non-Windows `open_lock` cannot fail
+// with a sharing violation because it never asks for an exclusive share mode,
+// so it always reports `Primary` and never classifies anything (see "Platform
+// scope" in the module docs).
+//
+// Hence `#[cfg(any(test, windows))]` rather than a bare `#[cfg(windows)]`: the
+// `test` arm is load-bearing, because the whole reason `classify_lock_error` is
+// split out as a pure function is that its mapping stays testable on EVERY
+// host. A bare `#[cfg(windows)]` would compile the tests away on Linux and
+// macOS and quietly drop that coverage.
+//
+// `#[allow(dead_code)]` would have been the wrong tool: these items are not
+// "dead but wanted", they are genuinely unreachable on two of the three
+// platforms, and an allow would suppress that true signal for every future item
+// in the block too. The same `#[cfg(any(test, windows))]` shape is already used
+// by `integration::windows_entries`.
+
 /// `ERROR_SHARING_VIOLATION` — another process holds the file open in a mode
 /// that excludes our requested access. This is the "an instance is already
 /// running" signal.
+#[cfg(any(test, windows))]
 const ERROR_SHARING_VIOLATION: i32 = 32;
 /// `ERROR_LOCK_VIOLATION` — the same class of "someone else owns it" refusal.
+#[cfg(any(test, windows))]
 const ERROR_LOCK_VIOLATION: i32 = 33;
 /// `FILE_SHARE_READ`. The primary lets others READ the lock file (so a
 /// diagnostic `type instance.lock` works) but never WRITE it — which is exactly
@@ -100,6 +122,21 @@ pub enum Startup {
     Primary(InstanceLock),
     /// Another instance already owns the lock; this process should [`forward`]
     /// its arguments and exit.
+    ///
+    /// Windows-only for the same reason as the classification block above: only
+    /// the `#[cfg(windows)]` `open_lock` can ever construct it. Left ungated it
+    /// is a "variant is never constructed" error under `-D warnings` on Linux
+    /// and macOS — which is a TRUE report, not a lint to silence.
+    ///
+    /// A bare `#[cfg(windows)]` and not `#[cfg(any(test, windows))]`, unlike the
+    /// constants above: dead-code analysis asks whether a variant is ever
+    /// CONSTRUCTED, and a `matches!` in a test does not construct one — so the
+    /// `test` arm would keep the error alive on Linux while looking like it had
+    /// fixed it. Nothing is lost by the narrower gate: the only test that names
+    /// this variant (`a_second_acquire_while_the_first_is_held_is_secondary`) is
+    /// itself already `#[cfg(windows)]`, because it needs a real share-mode lock
+    /// to produce a second acquire.
+    #[cfg(windows)]
     Secondary,
 }
 
@@ -113,6 +150,7 @@ pub struct InstanceLock {
 }
 
 /// Verdict for a failed lock open.
+#[cfg(any(test, windows))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LockVerdict {
     /// Another instance owns the lock — become a secondary.
@@ -130,6 +168,7 @@ pub enum LockVerdict {
 /// directory yields — so matching on `ErrorKind` would make a permissions
 /// misconfiguration silently masquerade as "already running" and swallow the
 /// user's files.
+#[cfg(any(test, windows))]
 #[must_use]
 pub fn classify_lock_error(raw_os_error: Option<i32>) -> LockVerdict {
     match raw_os_error {
@@ -227,6 +266,13 @@ fn open_lock(path: &Path) -> io::Result<Startup> {
 ///
 /// Returns the underlying [`io::Error`] if the hand-off directory cannot be
 /// created or written.
+/// Windows-only in a NON-test build, for the same reason as `Startup::Secondary`:
+/// a hand-off only ever happens when this process lost the lock race, and off
+/// Windows `open_lock` never reports `Secondary`, so `main` has no arm that can
+/// reach this. The `test` arm keeps the four cross-platform hand-off tests
+/// (atomic rename, submission ordering, drain semantics) compiling everywhere -
+/// they exercise the file protocol directly and do not need a real lock.
+#[cfg(any(test, windows))]
 pub fn forward(root: &Path, request: &Request) -> io::Result<()> {
     let dir = handoff_dir(root);
     fs::create_dir_all(&dir)?;
@@ -493,7 +539,10 @@ mod tests {
         let (_tmp, root) = root();
         fs::create_dir_all(&root).unwrap();
         let nasty = vec![
-            "C:/Users/.46b_/My Documents/ノート.md".to_string(),
+            // A documentation placeholder account, never a real one: this file
+            // ships in a public repo, and the fixture only needs a path with
+            // SPACES and NON-ASCII in it to be a valid probe.
+            "C:/Users/you/My Documents/ノート.md".to_string(),
             "/tmp/line\nbreak.txt".to_string(),
             "/tmp/quote\"and\\slash.txt".to_string(),
         ];
