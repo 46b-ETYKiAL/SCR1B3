@@ -13,6 +13,9 @@
 # serve the matching `.sha256` alongside it. The authenticity control is the
 # signature checked against PUBKEY below, which is embedded in this script and
 # therefore shares the trust root you accepted by choosing to run this script.
+# The checksum this script compares against is therefore taken from the SIGNED
+# aggregate `SHA256SUMS` manifest (verified against PUBKEY before it is read),
+# not from an unsigned per-artifact `.sha256` sidecar.
 #
 # This script FAILS CLOSED. Previously the checksum was entirely optional --
 # `curl ... || true` plus `if [ -f sum ] && command -v sha256sum` -- so a
@@ -86,31 +89,55 @@ echo "downloading ${asset} ..."
 curl -fsSL "${base}/${asset}" -o "${tmp}/${asset}" \
   || die "download failed: ${base}/${asset}"
 
-# Both sidecars are REQUIRED. A missing one aborts rather than skipping the
-# check that a missing sidecar would otherwise silently disable.
-curl -fsSL "${base}/${asset}.sha256" -o "${tmp}/sum" \
-  || die "no .sha256 published for ${asset} — refusing to install unverified"
+# --- the trusted key, written once and reused by every verification ---------
+printf 'untrusted comment: minisign public key: %s\n%s\n' \
+  "${PUBKEY_ID}" "${PUBKEY}" > "${tmp}/minisign.pub"
+
+# verify_sig <file> <detached-signature> — Ed25519 (minisign) against PUBKEY.
+verify_sig() {
+  if [ "$VERIFIER" = "minisign" ]; then
+    minisign -V -p "${tmp}/minisign.pub" -x "$2" -m "$1" >/dev/null 2>&1
+  else
+    rsign verify -p "${tmp}/minisign.pub" -x "$2" "$1" >/dev/null 2>&1
+  fi
+}
+
+# Release checksums now ship as ONE aggregate manifest (SHA256SUMS) plus its
+# detached signature, instead of a per-artifact `.sha256` + `.sha256.minisig`
+# pair for every asset. That is not just less release clutter: the previous
+# per-artifact `.sha256` was UNSIGNED, so the checksum check it fed was a
+# corruption check with no authenticity value whatsoever (see the header note).
+# SHA256SUMS is signed with the SAME key as the artifact, so the digest we
+# compare against is now an AUTHENTICATED value.
+#
+# All three downloads are REQUIRED. A missing one aborts rather than skipping
+# the check that a missing sidecar would otherwise silently disable.
+curl -fsSL "${base}/SHA256SUMS" -o "${tmp}/SHA256SUMS" \
+  || die "no SHA256SUMS published in this release — refusing to install unverified"
+curl -fsSL "${base}/SHA256SUMS.minisig" -o "${tmp}/SHA256SUMS.minisig" \
+  || die "no SHA256SUMS.minisig published — refusing to trust an unsigned checksum manifest"
 curl -fsSL "${base}/${asset}.minisig" -o "${tmp}/sig" \
   || die "no .minisig published for ${asset} — refusing to install unverified"
-[ -s "${tmp}/sum" ] || die "checksum file is empty"
+[ -s "${tmp}/SHA256SUMS" ] || die "checksum manifest is empty"
+[ -s "${tmp}/SHA256SUMS.minisig" ] || die "checksum manifest signature is empty"
 [ -s "${tmp}/sig" ] || die "signature file is empty"
 
+echo "verifying checksum manifest signature ..."
+verify_sig "${tmp}/SHA256SUMS" "${tmp}/SHA256SUMS.minisig" \
+  || die "SHA256SUMS SIGNATURE VERIFICATION FAILED — not authentic. Aborting."
+
 echo "verifying checksum ..."
-expected=$(awk '{print $1}' "${tmp}/sum")
+# Exact-name match on the second field. `grep "$asset"` would substring-match a
+# longer asset name (e.g. the aarch64 line when installing x86_64 would not
+# collide, but a future `-full` suffix would), so match the whole field.
+expected=$(awk -v a="${asset}" '$2 == a || $2 == "*" a { print $1; exit }' "${tmp}/SHA256SUMS")
+[ -n "$expected" ] || die "SHA256SUMS has no entry for ${asset} — refusing to install unverified"
 actual=$(${SHACMD} "${tmp}/${asset}" | awk '{print $1}')
-[ -n "$expected" ] || die "checksum file is malformed"
 [ "$expected" = "$actual" ] || die "checksum mismatch — aborting"
 
 echo "verifying signature ..."
-printf 'untrusted comment: minisign public key: %s\n%s\n' \
-  "${PUBKEY_ID}" "${PUBKEY}" > "${tmp}/minisign.pub"
-if [ "$VERIFIER" = "minisign" ]; then
-  minisign -V -p "${tmp}/minisign.pub" -x "${tmp}/sig" -m "${tmp}/${asset}" \
-    >/dev/null 2>&1 || die "SIGNATURE VERIFICATION FAILED — not authentic. Aborting."
-else
-  rsign verify -p "${tmp}/minisign.pub" -x "${tmp}/sig" "${tmp}/${asset}" \
-    >/dev/null 2>&1 || die "SIGNATURE VERIFICATION FAILED — not authentic. Aborting."
-fi
+verify_sig "${tmp}/${asset}" "${tmp}/sig" \
+  || die "SIGNATURE VERIFICATION FAILED — not authentic. Aborting."
 echo "signature verified (${VERIFIER}, key ${PUBKEY_ID})"
 
 tar -xzf "${tmp}/${asset}" -C "$tmp"

@@ -41,8 +41,10 @@ The name is a nod to *Serial Experiments Lain*. Good tools don't call attention 
 
 Download the build for your platform from the
 [**Releases**](https://github.com/46b-ETYKiAL/Itasha.Corp_S4F3-SCR1B3/releases)
-page — that is the single maintained install channel. Every release ships a
-`.sha256` checksum next to each artifact; verify it before running.
+page — that is the single maintained install channel. Every release ships one
+signed `SHA256SUMS` manifest (plus `SHA256SUMS.minisig`) covering every
+artifact, and a `.minisig` signature next to each artifact; verify before
+running.
 
 ### Windows
 

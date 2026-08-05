@@ -70,6 +70,17 @@ jobs:
             target: x86_64-pc-windows-msvc
           - os: macos-latest
             target: aarch64-apple-darwin
+          # Intel macOS. SCR1B3 previously shipped NO x86_64 macOS build at all,
+          # so every Intel Mac was unserved — `packaging/install.sh` resolves
+          # `scr1b3-x86_64-apple-darwin.tar.gz` on such a host and 404'd, and the
+          # in-app updater reported "no build for your platform". It is
+          # CROSS-BUILT on the Apple-Silicon runner via the universal Apple
+          # toolchain (rustup adds the target; Apple's clang emits a native
+          # x86_64 Mach-O) rather than on the scarce, queue-starved `macos-13`
+          # Intel runner. This is the identical mechanism the sibling C0PL4ND
+          # release matrix already uses for this exact triple.
+          - os: macos-latest
+            target: x86_64-apple-darwin
     runs-on: ${{ matrix.os }}
     steps:
       - name: Harden the runner (egress audit)
@@ -214,14 +225,35 @@ jobs:
 
           cd dist
           # The checksum sidecar MUST be named `<asset>.sha256` —
-          # `scr1b3-<target>.tar.gz.sha256` — to match the in-app updater
-          # (`build_release_info` looks for `{asset}.sha256`) and the signature
-          # convention (`<asset>.tar.gz.minisig`). The old `scr1b3-<target>.sha256`
-          # name (without the `.tar.gz` infix) is why every auto-update wrongly
-          # reported "no build for your platform": the updater found the tarball +
-          # its `.minisig` but never the mis-named sha, so `find()` returned None.
+          # `scr1b3-<target>.tar.gz.sha256` — because the `release` job
+          # concatenates every one of these into the single published
+          # `SHA256SUMS` manifest, and each line's filename field must be the
+          # exact published asset name. (The per-artifact `.sha256` itself is
+          # pruned before upload; it is a build-internal intermediate now.)
+          #
+          # This was previously
+          #   if command -v sha256sum >/dev/null; then ... 2>/dev/null || true; fi
+          # — a DOUBLE silent-skip: stock macOS ships `shasum`, not `sha256sum`,
+          # so on the macOS leg the guard was false and the checksum was skipped
+          # with no error, and even on Linux a failure was swallowed by
+          # `|| true`. A skipped checksum silently dropped that platform's line
+          # from SHA256SUMS, and `packaging/install.sh` refuses to install an
+          # asset it cannot find a checksum for. Handle BOTH tool names and fail
+          # LOUDLY when neither exists.
+          if command -v sha256sum >/dev/null 2>&1; then
+            SHACMD="sha256sum"
+          elif command -v shasum >/dev/null 2>&1; then
+            SHACMD="shasum -a 256"
+          else
+            echo "::error::no sha256 tool on this runner (need sha256sum or shasum) — refusing to publish an unchecksummed artifact"
+            exit 1
+          fi
           tgz="scr1b3-${{ matrix.target }}.tar.gz"
-          if command -v sha256sum >/dev/null; then sha256sum "$tgz" > "$tgz.sha256" 2>/dev/null || true; fi
+          $SHACMD "$tgz" > "$tgz.sha256"
+          # A zero-byte sidecar would satisfy `[ -f ]` downstream and produce an
+          # empty SHA256SUMS line. Assert real content.
+          [ -s "$tgz.sha256" ] || { echo "::error::checksum for $tgz is empty"; exit 1; }
+          cat "$tgz.sha256"
       - name: Upload artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -600,13 +632,27 @@ jobs:
           if-no-files-found: error
 
   macos-installer:
-    # Builds the macOS first-install artifacts from the compiled aarch64 binary:
-    # a proper SCR1B3.app bundle and a compressed .dmg. First-install only (not
-    # an auto-update target). The .icns is generated on the runner from the
-    # 1024px master PNG via iconutil (preinstalled) — no committed binary icon.
-    name: macOS installer (.app + .dmg)
+    # Builds the macOS first-install artifacts from the compiled binary: a proper
+    # SCR1B3.app bundle and a compressed .dmg. First-install only (not an
+    # auto-update target). The .icns is generated on the runner from the 1024px
+    # master PNG via iconutil (preinstalled) — no committed binary icon.
+    #
+    # Matrixed over BOTH macOS arches. It previously produced an aarch64 .dmg
+    # only, so an Intel Mac user had no installer at all; the Intel leg consumes
+    # the x86_64-apple-darwin tarball the build matrix now produces. Per-arch
+    # .dmg (rather than one `lipo` universal bundle) keeps the naming aligned
+    # with the tarballs and keeps each leg independently reproducible.
+    name: macOS installer (.app + .dmg, ${{ matrix.arch }})
     needs: build
     runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: aarch64
+            target: aarch64-apple-darwin
+          - arch: x86_64
+            target: x86_64-apple-darwin
     permissions:
       contents: read
     steps:
@@ -622,7 +668,7 @@ jobs:
       - name: Download macOS binary artifact
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: scr1b3-aarch64-apple-darwin
+          name: scr1b3-${{ matrix.target }}
           path: macbin
       - name: Build .app bundle + .dmg
         shell: bash
@@ -666,7 +712,7 @@ jobs:
           rm -rf "$stage"; mkdir -p "$stage"
           cp -R "$appbundle" "$stage/"
           ln -s /Applications "$stage/Applications"
-          dmg="dist/scr1b3-${TAG}-aarch64.dmg"
+          dmg="dist/scr1b3-${TAG}-${{ matrix.arch }}.dmg"
           hdiutil create -volname "SCR1B3" -srcfolder "$stage" -ov -format UDZO "$dmg"
 
           # ---- checksum (macOS ships `shasum`, not `sha256sum`) --------------
@@ -676,7 +722,7 @@ jobs:
       - name: Upload macOS installer
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: scr1b3-macos-installer
+          name: scr1b3-macos-installer-${{ matrix.arch }}
           path: dist/*
           if-no-files-found: error
 
@@ -712,6 +758,58 @@ jobs:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: dist
+      # Aggregate every per-artifact `.sha256` into ONE published `SHA256SUMS`
+      # manifest, mirroring the sibling C0PL4ND release. Generated BEFORE the
+      # signing step so the existing sign loop produces `SHA256SUMS.minisig` and
+      # the fail-closed self-verify gate checks it like any other asset.
+      #
+      # Why: the release previously published FOUR files per artifact — X,
+      # X.minisig, X.sha256 and X.sha256.minisig — i.e. a signature over a
+      # checksum whose artifact is already independently signed. That
+      # quadruplication was 28 of the 31 published assets and added no security
+      # (nothing in this repo, the installer, or the updater ever fetched a
+      # `.sha256.minisig`). One SIGNED aggregate manifest is strictly stronger
+      # than N UNSIGNED per-artifact sidecars: `packaging/install.sh` now
+      # verifies SHA256SUMS against the embedded key before reading a digest
+      # out of it, so the checksum comparison is finally an authenticity
+      # control rather than a corruption check.
+      #
+      # Each producing job runs its checksum tool from INSIDE its `dist/`, so
+      # every `.sha256` line already carries the BARE published asset name —
+      # exactly what a consumer greps for.
+      - name: Aggregate checksums (SHA256SUMS)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t shas < <(find dist -type f -name '*.sha256' | sort)
+          if [ "${#shas[@]}" -eq 0 ]; then
+            echo "::error::no .sha256 sidecars found under dist/ — refusing to publish a release with no checksum manifest"
+            exit 1
+          fi
+          # NOT `cat *.sha256 > SHA256SUMS 2>/dev/null || true` — that form
+          # publishes an EMPTY manifest when the glob misses, and an empty
+          # SHA256SUMS still satisfies a `[ -f ]` guard downstream while making
+          # every consumer's lookup fail.
+          # `tr -d '\r'` is defence-in-depth against a CRLF-writing producer. The
+          # sibling C0PL4ND release shipped a SHA256SUMS whose two Windows lines
+          # ended in a stray CR (a PowerShell `Out-File`), which silently breaks
+          # every exact-name lookup a consumer does. SCR1B3 generates all of its
+          # sidecars from bash today, but the aggregate is load-bearing enough to
+          # normalise unconditionally.
+          cat "${shas[@]}" | tr -d '\r' | sort -u > dist/SHA256SUMS
+          lines=$(grep -c . dist/SHA256SUMS || true)
+          [ "$lines" -eq "${#shas[@]}" ] || {
+            echo "::error::SHA256SUMS has $lines line(s) from ${#shas[@]} sidecar(s) — malformed or duplicated"; exit 1; }
+          # Every published archive/installer MUST have a line. A silently
+          # skipped checksum on one platform is exactly the defect this asserts
+          # away (stock macOS has `shasum`, not `sha256sum`).
+          missing=0
+          while IFS= read -r a; do
+            base=$(basename "$a")
+            grep -qE "[ *]${base}\$" dist/SHA256SUMS || { echo "::error::no SHA256SUMS entry for $base"; missing=1; }
+          done < <(find dist -type f \( -name '*.tar.gz' -o -name '*.exe' -o -name '*.msi' -o -name '*.deb' -o -name '*.AppImage' -o -name '*.dmg' \))
+          [ "$missing" -eq 0 ] || exit 1
+          echo "----- dist/SHA256SUMS -----"; cat dist/SHA256SUMS
       # Generate the Tier-1 signed-manifest payload (latest.json) BEFORE the
       # signing step, so the existing sign loop produces `latest.json.minisig`
       # and the fail-closed self-verify gate checks it like any other asset. The
@@ -794,7 +892,22 @@ jobs:
               "product": "scr1b3",
               "version": ver,
               "release_index": release_index,
-              "minimum_version": "0.4.0",
+              # Raised to 0.4.63 (the first sidecar-tolerant updater —
+              # `sidecar_urls` returning an EMPTY url for an absent sidecar
+              # instead of a hard Err) BECAUSE this release stops publishing the
+              # per-artifact `.sha256`. A client BELOW this floor is a pre-0.4.63
+              # updater that still REQUIRES that sidecar; the floor check in
+              # `resolve_update` runs BEFORE sidecar resolution, so such a client
+              # is told "a fresh install is required" — a graceful message —
+              # instead of the cryptic "missing its .sha256 sidecar" refusal it
+              # would otherwise hit. v0.4.63+ clients verify via the signed
+              # manifest SHA-256 and auto-update seamlessly.
+              #
+              # This floor MUST NOT be raised without a matching
+              # `crates/scribe-core/src/update/net.rs` change, and it must name
+              # the FIRST version whose updater tolerates the absent sidecar —
+              # never a later one, which would strand clients needlessly.
+              "minimum_version": "0.4.63",
               "published_utc": now.strftime(fmt),
               "valid_until_utc": (now + datetime.timedelta(days=14)).strftime(fmt),
               "assets": assets,
@@ -817,7 +930,7 @@ jobs:
       - name: Attest build provenance (SLSA)
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
-          subject-path: "dist/**/*.tar.gz, dist/**/*.exe, dist/**/*.msi, dist/**/*.deb, dist/**/*.AppImage, dist/**/*.dmg, dist/latest.json"
+          subject-path: "dist/**/*.tar.gz, dist/**/*.exe, dist/**/*.msi, dist/**/*.deb, dist/**/*.AppImage, dist/**/*.dmg, dist/latest.json, dist/SHA256SUMS"
       # Sign every release asset with minisign (via rsign2 — the same tool the
       # key was generated with; its signatures verify against the embedded key
       # through the app's `minisign-verify` crate). The passwordless secret key
@@ -900,6 +1013,40 @@ jobs:
           fi
           rm -f rsign.pub
           echo "release gate GREEN: $assets verified vs embedded key (crypto+identity+digest+parity+tamper)."
+      # De-clutter the published asset list. The sign + fail-closed self-verify
+      # gate above is UNCHANGED — it still signs and verifies EVERY staged file,
+      # including each per-artifact `.sha256`, so the hardening (coverage,
+      # crypto, identity, digest cross-check, count parity, tamper) is fully
+      # intact. We only drop, AFTER the gate and BEFORE upload, the sidecars the
+      # published set no longer needs:
+      #
+      #   * `<asset>.sha256`         — superseded by the SIGNED aggregate SHA256SUMS
+      #   * `<asset>.sha256.minisig` — a signature over a checksum whose artifact
+      #                                is already independently signed; nothing in
+      #                                this repo, `packaging/install.sh`, or the
+      #                                in-app updater has ever fetched one
+      #
+      # Every artifact KEEPS its own `<asset>.minisig` (the installer and the
+      # updater both bind to it), and `latest.json` / `SHA256SUMS` keep theirs.
+      # Net effect: ~31 published assets drop to ~17 with ZERO builds removed.
+      - name: Prune superseded checksum sidecars before publish
+        shell: bash
+        run: |
+          set -euo pipefail
+          before=$(find dist -type f | wc -l | tr -d ' ')
+          find dist -type f \( -name '*.sha256' -o -name '*.sha256.minisig' \) -delete
+          after=$(find dist -type f | wc -l | tr -d ' ')
+          echo "pruned $((before - after)) sidecar(s); ${after} asset(s) will be published"
+          # Guard: the SIGNED aggregate manifests MUST survive the prune, and so
+          # must every artifact's own signature. A prune that ate them would
+          # strand both the installer and the in-app updater.
+          for keep in latest.json latest.json.minisig SHA256SUMS SHA256SUMS.minisig; do
+            [ -f "dist/$keep" ] || { echo "::error::prune removed required $keep"; exit 1; }
+          done
+          n_art=$(find dist -type f \( -name '*.tar.gz' -o -name '*.exe' -o -name '*.msi' -o -name '*.deb' -o -name '*.AppImage' -o -name '*.dmg' \) | wc -l | tr -d ' ')
+          n_sig=$(find dist -type f \( -name '*.tar.gz.minisig' -o -name '*.exe.minisig' -o -name '*.msi.minisig' -o -name '*.deb.minisig' -o -name '*.AppImage.minisig' -o -name '*.dmg.minisig' \) | wc -l | tr -d ' ')
+          [ "$n_art" -eq "$n_sig" ] || { echo "::error::artifact/signature parity broken after prune ($n_art artifacts, $n_sig signatures)"; exit 1; }
+          find dist -type f | sort
       - name: Create GitHub Release
         # `gh release` ships on every GitHub-hosted runner, so no third-party
         # action is needed (zizmor superfluous-actions). The default GITHUB_TOKEN
