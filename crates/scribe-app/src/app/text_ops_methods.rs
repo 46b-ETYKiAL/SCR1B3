@@ -1071,7 +1071,24 @@ mod rope_writeback_tests {
     // invalidation; these tests pin it at the call site, because a stale
     // `rope_buf` is the precondition for the write-back that destroys an edit.
 
-    /// Rebuild the rope, then prove `f` left NO stale rope behind.
+    /// Rebuild the rope, then prove `f` performed the WHOLE invalidation.
+    ///
+    /// `note_text_mutated` has THREE duties — drop `rope_buf`, invalidate
+    /// `rope_state`, bump `edit_gen` — and this helper used to assert only the
+    /// first. That is one third of the contract, and the gap was not
+    /// theoretical: replacing BOTH splicer call sites with a bare
+    /// `self.tabs[active].rope_buf = None` left the entire scribe-app suite
+    /// green at 1710/1710. A call site could therefore silently drop the other
+    /// two duties — leaving an undo that resurrects pre-splice content, a caret
+    /// indexing past the end, and every `edit_gen`-keyed cache (minimap,
+    /// spellcheck, symbol scopes, change bar) serving stale content — with no
+    /// test objecting.
+    ///
+    /// The whole-function mutants ARE caught (dropping `invalidate_rope_state`
+    /// or the `edit_gen` bump from `note_text_mutated` itself fails 3 and 10
+    /// tests respectively) because `set_text` delegates to the same function.
+    /// What was unpinned is the CALL SITE: that these two in-place splicers
+    /// invoke the shared invalidation rather than hand-rolling a subset of it.
     fn assert_in_place_splice_invalidates_the_rope(
         label: &str,
         setup: impl FnOnce(&mut ScribeApp, usize),
@@ -1089,7 +1106,30 @@ mod rope_writeback_tests {
             app.tabs[idx].rope_buf.is_some(),
             "{label}: precondition — a live persistent rope must exist"
         );
-        let before = app.tabs[idx].text.clone();
+
+        // Give the rope editor REAL state to lose: an undo snapshot of the
+        // pre-splice content, and a caret parked at the very end of the buffer.
+        // Typing through `apply_event` is what records the snapshot — the test
+        // never fabricates one, so it cannot pass by asserting its own setup.
+        let pre_splice_content = {
+            let tab = &mut app.tabs[idx];
+            let state = tab
+                .rope_state
+                .as_mut()
+                .expect("the rope path creates its editing state on first frame");
+            let rope = tab
+                .rope_buf
+                .as_mut()
+                .and_then(scribe_core::buffer::Buffer::as_rope_mut)
+                .expect("the rope path builds a persistent rope");
+            scribe_render::apply_event(rope, state, &text_event("Z"));
+            tab.text = rope.to_string();
+            state.edit = scribe_core::editing::EditState::at(rope.len_chars());
+            tab.text.clone()
+        };
+
+        let before = pre_splice_content.clone();
+        let gen_before = app.tabs[idx].edit_gen;
 
         splice(&mut app, idx);
 
@@ -1097,11 +1137,58 @@ mod rope_writeback_tests {
             before, app.tabs[idx].text,
             "{label}: precondition — the splice must actually change the buffer"
         );
+
+        // Duty 1 — the stale rope is gone.
         assert!(
             app.tabs[idx].rope_buf.is_none(),
             "{label}: the splice left the PRE-splice rope alive — the next \
              content edit's `tab.text = rope.to_string()` write-back would \
              overwrite `text` with it and destroy the edit"
+        );
+
+        // Duty 3 — every `edit_gen`-keyed cache is invalidated.
+        assert_ne!(
+            app.tabs[idx].edit_gen, gen_before,
+            "{label}: `edit_gen` did not move, so the minimap, spellcheck, \
+             symbol-scope and change-bar caches all keep serving PRE-splice \
+             content"
+        );
+
+        // Duty 2 — `rope_state` is invalidated: the caret is clamped into the
+        // new text, and the history no longer describes content that is gone.
+        run_frames(&mut app, 2);
+        let after_splice = app.tabs[idx].text.clone();
+        let cursor = app.tabs[idx]
+            .rope_state
+            .as_ref()
+            .map_or(0, |s| s.edit.cursor);
+        assert!(
+            cursor <= after_splice.chars().count(),
+            "{label}: caret {cursor} is past the end of the {}-char buffer — a \
+             stale `rope_state` survived the splice",
+            after_splice.chars().count()
+        );
+        {
+            let tab = &mut app.tabs[idx];
+            let state = tab.rope_state.as_mut().expect("rope state present");
+            let rope = tab
+                .rope_buf
+                .as_mut()
+                .and_then(scribe_core::buffer::Buffer::as_rope_mut)
+                .expect("rope rebuilt after the splice");
+            scribe_render::apply_event(rope, state, &ctrl_z());
+            tab.text = rope.to_string();
+        }
+        assert_ne!(
+            app.tabs[idx].text, before,
+            "{label}: undo resurrected the PRE-splice content — the splice kept \
+             a history describing a buffer the user no longer has, and one \
+             Ctrl+Z silently destroys the splice"
+        );
+        assert_eq!(
+            app.tabs[idx].text, after_splice,
+            "{label}: the history described content that no longer exists, so \
+             undo must be a no-op and leave the spliced buffer intact"
         );
     }
 
