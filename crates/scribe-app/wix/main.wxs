@@ -500,6 +500,24 @@
       <ComponentRef Id="MainExecutable" />
       <ComponentRef Id="FileAssociations" />
       <ComponentRef Id="StartMenuShortcut" />
+      <!--
+        License texts. MANDATORY, not decoration: SCR1B3 include_bytes!-embeds
+        22 typefaces (21 OFL-1.1 + Syncopate Apache-2.0) and include_str!-embeds
+        a third-party word list. OFL-1.1 s2 requires the license text to
+        accompany EVERY copy, and a compiled-in font does not self-serve its
+        license. Until this ref existed the MSI carried exactly ONE File -
+        scr1b3.exe - so an MSI install put 22 fonts on disk with no license text
+        anywhere, the same breach the .deb/.AppImage/.dmg once had.
+
+        The group is NOT hand-authored. `heat` harvests the tree that
+        packaging/collect-licenses.sh stages, so adding or removing a font
+        changes the package without anyone remembering to edit this file. A
+        hand-written list of 22 font directories is precisely the thing that
+        rots silently. The collector fails closed if any bundled font has no
+        license text, so an incomplete tree fails the build rather than
+        producing a package that quietly under-delivers.
+      -->
+      <ComponentGroupRef Id="LicenseComponents" />
     </Feature>
 
     <SetProperty Id="ARPINSTALLLOCATION" Value="[APPLICATIONFOLDER]" After="CostFinalize" />

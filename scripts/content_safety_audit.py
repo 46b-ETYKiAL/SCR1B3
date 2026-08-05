@@ -240,7 +240,7 @@ def scan_text(text: str, origin: str, *, third_party: bool = False) -> list[str]
 TEXT_EXT = {
     ".rs", ".toml", ".md", ".yml", ".yaml", ".json", ".txt", ".svg", ".sh",
     ".ps1", ".bat", ".cmd", ".lua", ".wgsl", ".cfg", ".conf", ".ini", ".lock",
-    ".py", ".rb", ".rhai", ".wxs", ".desktop", ".plist", ".xml", ".html",
+    ".py", ".rb", ".rhai", ".wxs", ".xsl", ".desktop", ".plist", ".xml", ".html",
     ".css", ".js", ".ts", ".tsx", ".jsx", ".nsi", ".spec", ".service", ".env",
     ".gitignore", ".gitattributes", ".editorconfig", ".sql", ".proto", ".rc",
     ".c", ".h", ".cpp", ".m", ".mm", ".java", ".kt", ".swift", ".go",
