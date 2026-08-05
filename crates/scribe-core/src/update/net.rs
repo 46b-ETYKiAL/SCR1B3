@@ -499,9 +499,22 @@ fn resolve_tier1_update(
 }
 
 /// Resolve a manifest asset's per-asset `.minisig` + `.sha256` sidecar URLs from
-/// the release asset list (the manifest does not enumerate the sidecars; they
-/// are kept as defense-in-depth). A missing sidecar is a malformed release —
-/// fail-closed `Err`.
+/// the release asset list (the manifest does not enumerate the sidecars).
+///
+/// The `.minisig` is REQUIRED — a manifest asset with no signature in the
+/// release is a malformed release, fail-closed `Err`.
+///
+/// The `.sha256` is OPTIONAL, and an ABSENT one yields an EMPTY url rather than
+/// an error. That is NOT a relaxation of the integrity check: every
+/// [`ReleaseInfo`] carries `pinned_sha256`, taken from the `latest.json`
+/// manifest that was ITSELF minisign-verified against the embedded key before
+/// any of this ran, so the download is always bound to a SIGNED digest. The
+/// per-artifact `.sha256` was only ever an UNSIGNED defense-in-depth
+/// cross-check, and releases from v0.4.63 on publish one SIGNED aggregate
+/// `SHA256SUMS` instead of N unsigned per-artifact sidecars. When a release DOES
+/// still enumerate the sidecar it is fetched and must still AGREE with the
+/// pinned digest (see [`resolve_expected_sha`]) — the check is relaxed only for
+/// a release that deliberately omits it, never for one that ships a wrong one.
 fn sidecar_urls(raw: &RawRelease, asset_name: &str) -> Result<(String, String), String> {
     let url_of = |name: &str| -> Option<String> {
         raw.assets
@@ -514,10 +527,25 @@ fn sidecar_urls(raw: &RawRelease, asset_name: &str) -> Result<(String, String), 
     let sig_url = url_of(&sig_name).ok_or_else(|| {
         format!("manifest asset {asset_name:?} is missing its .minisig sidecar in the release — refusing")
     })?;
-    let sha_url = url_of(&sha_name).ok_or_else(|| {
-        format!("manifest asset {asset_name:?} is missing its .sha256 sidecar in the release — refusing")
-    })?;
+    // Empty == "the release does not enumerate this sidecar" (see doc above).
+    let sha_url = url_of(&sha_name).unwrap_or_default();
     Ok((sig_url, sha_url))
+}
+
+/// Fetch a per-artifact `.sha256` sidecar that MAY be absent.
+///
+/// An EMPTY `url` means the release does not enumerate the sidecar; return
+/// `Ok(None)` WITHOUT touching the network. A present url is fetched over the
+/// same https/host-confined, size-capped path as every other sidecar and must
+/// parse as UTF-8.
+fn fetch_optional_sha_sidecar(url: &str) -> Result<Option<String>, String> {
+    if url.trim().is_empty() {
+        return Ok(None);
+    }
+    let bytes = download_small(url)?;
+    let text =
+        String::from_utf8(bytes).map_err(|e| format!("sha256 sidecar is not valid UTF-8: {e}"))?;
+    Ok(Some(text))
 }
 
 /// Build the download plumbing for a Tier-1 update: the SIGNED archive url from
@@ -586,12 +614,18 @@ fn build_tier1_installer(
 /// Resolve the expected SHA-256 the downloaded artifact is verified against.
 ///
 /// The `pinned` (signed-manifest) digest is AUTHORITATIVE; the `.sha256` sidecar
-/// is kept as defense-in-depth and MUST AGREE with it — a disagreement is a
-/// tampered sidecar or a manifest/asset mismatch and is refused (fail-closed).
-/// Comparison is case-insensitive and whitespace-trimmed (hex digests). The
-/// pinned (manifest) value is returned, so the load-bearing digest is always the
-/// signed one.
-fn resolve_expected_sha<'a>(pinned: &'a str, sidecar: &str) -> Result<&'a str, String> {
+/// is kept as defense-in-depth and, WHEN PRESENT, MUST AGREE with it — a
+/// disagreement is a tampered sidecar or a manifest/asset mismatch and is
+/// refused (fail-closed). `None` means the release does not publish a
+/// per-artifact sidecar (v0.4.63+ ship one SIGNED aggregate `SHA256SUMS`
+/// instead); the pinned digest then stands alone, which is the SIGNED value and
+/// therefore the stronger of the two. Comparison is case-insensitive and
+/// whitespace-trimmed (hex digests). The pinned (manifest) value is always what
+/// is returned, so the load-bearing digest is always the signed one.
+fn resolve_expected_sha<'a>(pinned: &'a str, sidecar: Option<&str>) -> Result<&'a str, String> {
+    let Some(sidecar) = sidecar else {
+        return Ok(pinned.trim());
+    };
     if pinned.trim().eq_ignore_ascii_case(sidecar.trim()) {
         Ok(pinned.trim())
     } else {
@@ -896,15 +930,17 @@ fn download_verify_installer_inner(
 
     let exe_bytes = download_asset(&installer.url, progress)?;
     let sig_bytes = download_small(&installer.sig_url)?;
-    let sha_text = download_small(&installer.sha_url)?;
-
-    let sha_str = String::from_utf8(sha_text)
-        .map_err(|e| format!("sha256 sidecar is not valid UTF-8: {e}"))?;
-    let sidecar_sha = sha_str
-        .split_whitespace()
-        .next()
-        .ok_or_else(|| "sha256 sidecar was empty".to_string())?;
-    // The manifest's SIGNED digest is authoritative; the sidecar must AGREE.
+    // OPTIONAL: absent in v0.4.63+ releases (one signed SHA256SUMS instead).
+    let sha_str = fetch_optional_sha_sidecar(&installer.sha_url)?;
+    let sidecar_sha = match sha_str.as_deref() {
+        Some(s) => Some(
+            s.split_whitespace()
+                .next()
+                .ok_or_else(|| "sha256 sidecar was empty".to_string())?,
+        ),
+        None => None,
+    };
+    // The manifest's SIGNED digest is authoritative; a PRESENT sidecar must AGREE.
     let expected_sha = resolve_expected_sha(&installer.pinned_sha256, sidecar_sha)?;
     let sig_str =
         String::from_utf8(sig_bytes).map_err(|e| format!("minisig is not valid UTF-8: {e}"))?;
@@ -926,23 +962,28 @@ fn download_verify_extract_inner(
 ) -> Result<PathBuf, String> {
     fs::create_dir_all(staging_dir).map_err(|e| format!("failed to create staging dir: {e}"))?;
 
-    // Big asset (streamed for progress) + the two tiny sidecars.
+    // Big asset (streamed for progress) + the REQUIRED signature + the OPTIONAL
+    // checksum sidecar (absent in v0.4.63+ releases, which publish one signed
+    // aggregate SHA256SUMS instead of N unsigned per-artifact `.sha256`).
     let asset_bytes = download_asset(&info.asset_url, progress)?;
     let sig_bytes = download_small(&info.sig_url)?;
-    let sha_text = download_small(&info.sha_url)?;
+    let sha_str = fetch_optional_sha_sidecar(&info.sha_url)?;
 
     // The .sha256 sidecar is text — either a bare hex digest or the
     // `<hex>  <filename>` `sha256sum` form. Take the first whitespace token.
-    let sha_str = String::from_utf8(sha_text)
-        .map_err(|e| format!("sha256 sidecar is not valid UTF-8: {e}"))?;
-    let sidecar_sha = sha_str
-        .split_whitespace()
-        .next()
-        .ok_or_else(|| "sha256 sidecar was empty".to_string())?;
+    let sidecar_sha = match sha_str.as_deref() {
+        Some(s) => Some(
+            s.split_whitespace()
+                .next()
+                .ok_or_else(|| "sha256 sidecar was empty".to_string())?,
+        ),
+        None => None,
+    };
 
-    // The manifest's SIGNED digest is authoritative and the sidecar must AGREE
-    // (defense-in-depth — a disagreement fails closed). Every `ReleaseInfo`
-    // carries a pin, so the download is always bound to the signed hash.
+    // The manifest's SIGNED digest is authoritative and a PRESENT sidecar must
+    // AGREE (defense-in-depth — a disagreement fails closed). Every
+    // `ReleaseInfo` carries a pin, so the download is ALWAYS bound to the signed
+    // hash whether or not the unsigned sidecar exists.
     let expected_sha = resolve_expected_sha(&info.pinned_sha256, sidecar_sha)?;
 
     let sig_str =
@@ -1431,19 +1472,69 @@ mod tests {
         assert!(err.contains("missing its .minisig sidecar"), "got: {err}");
     }
 
+    #[test]
+    fn build_info_tolerates_an_absent_sha256_sidecar() {
+        // v0.4.63+ releases publish ONE signed aggregate SHA256SUMS instead of a
+        // per-artifact `.sha256`. The archive is still bound to the SIGNED
+        // manifest digest, so an absent `.sha256` must resolve (empty url =
+        // "not enumerated"), NOT fail closed the way an absent `.minisig` does.
+        let mut raw = raw_release("v0.5.0", "0.5.0");
+        raw.assets
+            .retain(|a| a.name != "scr1b3-x86_64-unknown-linux-gnu.tar.gz.sha256");
+        let cand = semver::Version::parse("0.5.0").unwrap();
+        let m = tier1_manifest("0.5.0", 5000, FUTURE);
+        let masset = manifest_asset(
+            "x86_64-unknown-linux-gnu",
+            "tar.gz",
+            "scr1b3-x86_64-unknown-linux-gnu.tar.gz",
+            "2222bbbb",
+        );
+        let info =
+            build_tier1_release_info(&raw, &m, &masset, &cand, 5000, "x86_64-unknown-linux-gnu")
+                .expect("an absent .sha256 sidecar must be tolerated");
+        assert!(info.sha_url.is_empty(), "got: {:?}", info.sha_url);
+        assert!(
+            info.sig_url
+                .ends_with("scr1b3-x86_64-unknown-linux-gnu.tar.gz.minisig"),
+            "the .minisig binding must survive: {:?}",
+            info.sig_url
+        );
+        assert_eq!(info.pinned_sha256, "2222bbbb");
+    }
+
+    #[test]
+    fn optional_sha_sidecar_is_not_fetched_when_absent() {
+        // An empty url must short-circuit BEFORE any network I/O.
+        assert_eq!(fetch_optional_sha_sidecar("").unwrap(), None);
+        assert_eq!(fetch_optional_sha_sidecar("   ").unwrap(), None);
+    }
+
     // --- resolve_expected_sha (manifest authoritative, sidecar must agree) ---
 
     #[test]
     fn expected_sha_agrees_case_insensitively() {
-        assert_eq!(resolve_expected_sha("ABCDEF", "abcdef").unwrap(), "ABCDEF");
-        assert_eq!(resolve_expected_sha("  dead  ", "dead").unwrap(), "dead");
+        assert_eq!(
+            resolve_expected_sha("ABCDEF", Some("abcdef")).unwrap(),
+            "ABCDEF"
+        );
+        assert_eq!(
+            resolve_expected_sha("  dead  ", Some("dead")).unwrap(),
+            "dead"
+        );
     }
 
     #[test]
     fn expected_sha_disagreement_is_refused() {
-        let err = resolve_expected_sha("aaaa", "bbbb")
+        let err = resolve_expected_sha("aaaa", Some("bbbb"))
             .expect_err("a manifest/sidecar sha disagreement must be refused");
         assert!(err.contains("sha256 disagreement"), "got: {err}");
+    }
+
+    #[test]
+    fn expected_sha_falls_back_to_the_signed_pin_when_absent() {
+        // No sidecar => the SIGNED manifest digest stands alone. It must still
+        // be returned (trimmed) — never an empty/"any hash accepted" value.
+        assert_eq!(resolve_expected_sha("  abc123  ", None).unwrap(), "abc123");
     }
 
     // --- ensure_upgrade (apply-time anti-downgrade) -------------------------
