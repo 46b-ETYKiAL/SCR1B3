@@ -164,6 +164,7 @@ impl<'a> RopeEditor<'a> {
                 visible_line_range: 0..0,
                 buffer_mode: BufferModeSeen::Mmap,
                 content_changed: false, // read-only `show` path — never edits
+                rows: std::collections::HashMap::new(),
             };
         };
         let total_lines = rope.len_lines();
@@ -229,6 +230,10 @@ impl<'a> RopeEditor<'a> {
             visible_line_range: scroll.inner,
             buffer_mode: BufferModeSeen::Rope,
             content_changed: false, // read-only `show` path — never edits
+            // The read-only browse path lays no per-row galley out, so there is
+            // no row geometry to publish and a host overlay must degrade rather
+            // than guess. See `RopeEditorResponse::rows`.
+            rows: std::collections::HashMap::new(),
         }
     }
 
@@ -323,6 +328,7 @@ impl<'a> RopeEditor<'a> {
                     visible_line_range: 0..0,
                     buffer_mode: BufferModeSeen::Mmap,
                     content_changed,
+                    rows: std::collections::HashMap::new(),
                 },
                 clipboard,
             );
@@ -372,10 +378,8 @@ impl<'a> RopeEditor<'a> {
         // non-uniform glyph width), so the click hit-test (after the scroll
         // closure) inverse-maps a pointer x through the SAME galley the row
         // painted with, instead of arithmetic on the monospace advance.
-        let mut line_galleys: std::collections::HashMap<
-            usize,
-            (std::sync::Arc<egui::Galley>, f32),
-        > = std::collections::HashMap::new();
+        let mut line_galleys: std::collections::HashMap<usize, RopeRowGeom> =
+            std::collections::HashMap::new();
 
         // ---- highlight phase (P-02 fix + C-01 cross-line correctness) ----
         //
@@ -476,7 +480,16 @@ impl<'a> RopeEditor<'a> {
                     // NOT `col * char_w`. `col_x(col)` is the absolute screen x
                     // of the left edge of column `col`.
                     let line_galley = layout_line(ui, s, font.clone(), text_color);
-                    line_galleys.insert(li, (line_galley.clone(), text_rect.left()));
+                    line_galleys.insert(
+                        li,
+                        RopeRowGeom {
+                            row_left: row.response.rect.left(),
+                            text_left: text_rect.left(),
+                            top: text_rect.top(),
+                            bottom: text_rect.bottom(),
+                            galley: line_galley.clone(),
+                        },
+                    );
                     let col_x = |col: usize| text_rect.left() + col_to_rel_x(&line_galley, col);
 
                     // Render-whitespace overlay: paint a faint `·` centered in
@@ -648,7 +661,7 @@ impl<'a> RopeEditor<'a> {
             let clicked_line = (range_start as f32 + rel)
                 .clamp(0.0, total_lines.saturating_sub(1) as f32)
                 as usize;
-            let galley = line_galleys.get(&clicked_line).map(|(g, _)| g.as_ref());
+            let galley = line_galleys.get(&clicked_line).map(|g| g.galley.as_ref());
             Some(pos_to_char_offset(
                 rope,
                 pos,
@@ -758,9 +771,54 @@ impl<'a> RopeEditor<'a> {
                 visible_line_range: scroll.inner,
                 buffer_mode: BufferModeSeen::Rope,
                 content_changed,
+                rows: line_galleys,
             },
             clipboard,
         )
+    }
+}
+
+/// Where one visible row actually landed on screen this frame.
+///
+/// The `TextEdit` path hands its host a galley, which is how the app paints
+/// overlays (LSP diagnostic squiggles, gutter marks) at a COLUMN. This widget
+/// culls to the viewport and lays every row out itself, so the host had nothing
+/// to hang an overlay off and its overlays silently vanished on this path.
+/// Publishing the painted rect plus the SAME galley the row drew with is what
+/// closes that gap — and it means the host never re-derives the gutter width,
+/// the glyph advance or the scroll offset, the three things a host-side copy
+/// would desync on the moment this widget's layout changed.
+#[derive(Debug, Clone)]
+pub struct RopeRowGeom {
+    /// Absolute screen x of the row's left edge — the gutter's left edge when
+    /// line numbers are on. Where a host paints a per-line gutter marker.
+    pub row_left: f32,
+    /// Absolute screen x of character column 0 (i.e. past the gutter).
+    pub text_left: f32,
+    /// Absolute screen y of the row's text top / bottom.
+    pub top: f32,
+    pub bottom: f32,
+    /// The row's laid-out galley — the authority for column ↔ x, tab stops
+    /// included.
+    pub galley: std::sync::Arc<egui::Galley>,
+}
+
+impl RopeRowGeom {
+    /// Absolute screen x of the left edge of character column `col`.
+    ///
+    /// Resolved through the row's own galley, so a `\t` advances to its tab
+    /// stop instead of `col * char_w`. Columns past the end of the row clamp to
+    /// the row's right edge (`Galley::pos_from_cursor` does the clamping).
+    #[must_use]
+    pub fn col_x(&self, col: usize) -> f32 {
+        self.text_left + col_to_rel_x(&self.galley, col)
+    }
+
+    /// The character column nearest absolute screen x `x` — the inverse of
+    /// [`col_x`](Self::col_x), for a host hit-test.
+    #[must_use]
+    pub fn col_at_x(&self, x: f32) -> usize {
+        rel_x_to_col(&self.galley, x - self.text_left)
     }
 }
 
@@ -776,6 +834,15 @@ pub struct RopeEditorResponse {
     /// The app uses this to sync `tab.text` from the persistent rope ONLY
     /// when a real edit occurred — avoiding a per-frame `rope.to_string()`.
     pub content_changed: bool,
+    /// Painted geometry for every row that was visible this frame, keyed by
+    /// ABSOLUTE line number.
+    ///
+    /// Populated by [`show_editable`](RopeEditor::show_editable). EMPTY on the
+    /// read-only [`show`](RopeEditor::show) browse path and whenever the buffer
+    /// is still memory-mapped — neither lays a galley out per row, so a host
+    /// overlay has nothing to position against and must say so rather than
+    /// pretend it painted.
+    pub rows: std::collections::HashMap<usize, RopeRowGeom>,
 }
 
 /// Monospace text layout geometry for pointer hit-testing: the top-left of the

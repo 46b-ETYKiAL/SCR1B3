@@ -169,7 +169,8 @@ impl EditorMode {
             Self::Rope => {
                 "Large-file editor: this buffer is past the rope-editor size threshold, so it \
                  renders through the in-house viewport-culled editor. Still working: typing, \
-                 undo/redo, find, line numbers, whitespace markers, snippets. Unavailable \
+                 undo/redo, find, line numbers, whitespace markers, snippets, and inline LSP \
+                 diagnostics (squiggle, gutter bar and hover message). Unavailable \
                  here: breadcrumbs, sticky scroll, spellcheck underlines, the completion \
                  popup, the find highlight-all wash, the right-click menu, multi-cursor \
                  (Ctrl+D / Ctrl+click / Alt+drag column select), the markdown caret chords and \
@@ -184,13 +185,18 @@ impl EditorMode {
             Self::RopeMmap => {
                 "Large-file editor on a memory-mapped buffer — read-only until the file is \
                  loaded into a rope. Everything the ROPE badge lists as unavailable is \
-                 unavailable here too, and editing is disabled on top of that."
+                 unavailable here too, and editing is disabled on top of that. Inline LSP \
+                 diagnostics do NOT paint here either: a memory-mapped buffer lays out no \
+                 per-row galley, so the overlay has nothing to position against. The \
+                 status-bar problem counter is still live."
             }
             Self::ReadOnlyLarge => {
                 "Read-only browse: this file is past the hard size cap, so it opens read-only \
                  for O(viewport) navigation. Editing is disabled, and so is every \
                  TextEdit-only convenience the ROPE badge lists (overlays, caret ops, \
-                 multi-cursor, the right-click menu, completion and spellcheck)."
+                 multi-cursor, the right-click menu, completion and spellcheck). Inline LSP \
+                 diagnostics do NOT paint here: the browse path lays out no per-row galley, \
+                 so the overlay has nothing to position against."
             }
             Self::Fold => "Folded preview — read-only projection. Exit folds to edit.",
         }
@@ -209,10 +215,30 @@ impl EditorMode {
     /// "[ large file: read-only ]" segment next to the badge.
     pub(super) fn entry_notice(self) -> Option<&'static str> {
         match self {
-            Self::Rope | Self::RopeMmap => Some(
+            // The wording NAMES diagnostics, and that is the point of it. It used
+            // to stop at "Editing, undo and find still work", which was a
+            // half-truth in the most damaging direction available: inline
+            // diagnostics did NOT work on this path, and a banner that lists
+            // three surviving features and omits the one that just died reads as
+            // "everything important still works". The rope path now paints
+            // diagnostics, so saying so is both true and the answer to the
+            // question the user actually has.
+            Self::Rope => Some(
+                "This file crossed the large-file threshold, so SCR1B3 switched to the \
+                 viewport-culled editor to stay responsive. Editing, undo, find and \
+                 inline diagnostics still work — hover the mode badge in the status bar \
+                 for what is unavailable.",
+            ),
+            // Split off from `Rope` because the claim differs: a memory-mapped
+            // buffer lays out no per-row galley, so the diagnostic overlay has
+            // nothing to position against and paints nothing. Telling an MMAP
+            // user "inline diagnostics still work" would re-create the exact
+            // false claim above, one surface over.
+            Self::RopeMmap => Some(
                 "This file crossed the large-file threshold, so SCR1B3 switched to the \
                  viewport-culled editor to stay responsive. Editing, undo and find still \
-                 work — hover the mode badge in the status bar for what is unavailable.",
+                 work; inline diagnostics do NOT paint until the file is loaded into a \
+                 rope — hover the mode badge in the status bar for what is unavailable.",
             ),
             Self::Standard | Self::ReadOnlyLarge | Self::Fold => None,
         }
@@ -513,6 +539,121 @@ impl ScribeApp {
             return Vec::new();
         };
         super::diagnostics_overlay::diagnostic_spans(&tab.text, &self.diagnostics)
+    }
+
+    /// Paint the inline diagnostic overlay over the ROPE editor's painted rows.
+    ///
+    /// The `TextEdit` path walks `out.galley.rows`; this path has no galley of
+    /// its own, so it walks [`RopeEditorResponse::rows`] — the rects and
+    /// per-row galleys the widget reports for the rows it actually painted this
+    /// frame. Everything else (severity colours, the gutter bar, the hover
+    /// tooltip) is deliberately the SAME as the `TextEdit` overlay: a user who
+    /// crosses the size threshold should not have to learn a second visual
+    /// language for the same information.
+    ///
+    /// Silent when the widget reports no rows — the read-only browse path and a
+    /// still-memory-mapped buffer lay no per-row galley out, so there is nothing
+    /// to position against. That gap is stated in the mode badge's hover text
+    /// rather than left for the user to discover.
+    fn paint_rope_diagnostics(
+        &self,
+        ui: &egui::Ui,
+        resp: &scribe_render::RopeEditorResponse,
+        active: usize,
+        viewport: egui::Rect,
+        accent: Color32,
+        muted: Color32,
+    ) {
+        if self.diagnostics.is_empty() || resp.rows.is_empty() {
+            return;
+        }
+        let Some(tab) = self.tabs.get(active) else {
+            return;
+        };
+        let spans = super::diagnostics_overlay::diagnostic_spans(&tab.text, &self.diagnostics);
+        if spans.is_empty() {
+            return;
+        }
+        let err_c = ui_color(&self.theme, "error", Rgba::new(0xe5, 0x3e, 0x3e, 255));
+        let warn_c = ui_color(&self.theme, "warning", Rgba::new(0xf2, 0xb3, 0x3d, 255));
+        let color_of = |sev: u8| match sev {
+            super::diagnostics_overlay::SEVERITY_ERROR => err_c,
+            super::diagnostics_overlay::SEVERITY_WARNING => warn_c,
+            super::diagnostics_overlay::SEVERITY_INFO => accent,
+            _ => muted,
+        };
+        // Clip to the editor viewport: a row scrolled half out of the top of the
+        // scroll area is clipped by the widget, and an overlay that ignored that
+        // would paint a squiggle across the toolbar.
+        let painter = ui.painter().with_clip_rect(viewport);
+        let visible = resp.visible_line_range.clone();
+
+        // Squiggles, one segment per (span × source line) in view.
+        let mut painted: Vec<(usize, egui::Rect)> = Vec::new();
+        for seg in super::diagnostics_overlay::row_segments(&tab.text, &spans, visible.clone()) {
+            let Some(geom) = resp.rows.get(&seg.line) else {
+                continue;
+            };
+            let x0 = geom.col_x(seg.start_col);
+            let x1 = geom.col_x(seg.end_col);
+            if x1 <= x0 {
+                continue;
+            }
+            paint_squiggle(&painter, x0, x1, geom.bottom, color_of(seg.severity));
+            painted.push((
+                seg.line,
+                egui::Rect::from_min_max(egui::pos2(x0, geom.top), egui::pos2(x1, geom.bottom)),
+            ));
+        }
+
+        // Gutter bar on each diagnosed line's START line, at the left edge of
+        // the rope editor's own gutter — the same shape and lane as the
+        // `TextEdit` path's bar in the external gutter panel.
+        for (line, sev) in super::diagnostics_overlay::gutter_marks(&self.diagnostics) {
+            let line = line as usize;
+            if !visible.contains(&line) {
+                continue;
+            }
+            let Some(geom) = resp.rows.get(&line) else {
+                continue;
+            };
+            let h = geom.bottom - geom.top;
+            painter.rect_filled(
+                egui::Rect::from_min_max(
+                    egui::pos2(geom.row_left, h.mul_add(0.2, geom.top)),
+                    egui::pos2(geom.row_left + 2.5, h.mul_add(-0.2, geom.bottom)),
+                ),
+                1.0,
+                color_of(sev),
+            );
+        }
+
+        // Hover: resolved through the hovered ROW's galley, so the message
+        // belongs to the character under the pointer rather than to the line.
+        let Some(p) = ui.ctx().pointer_hover_pos() else {
+            return;
+        };
+        if !viewport.contains(p) {
+            return;
+        }
+        let Some((line, _)) = painted.iter().find(|(_, r)| r.contains(p)) else {
+            return;
+        };
+        let Some(geom) = resp.rows.get(line) else {
+            return;
+        };
+        let byte =
+            super::diagnostics_overlay::byte_of_line_col(&tab.text, *line, geom.col_at_x(p.x));
+        if let Some(text) = super::diagnostics_overlay::hover_text(&spans, byte) {
+            egui::show_tooltip_at_pointer(
+                ui.ctx(),
+                ui.layer_id(),
+                egui::Id::new("scr1b3-diagnostic-tooltip"),
+                |ui| {
+                    ui.label(text);
+                },
+            );
+        }
     }
 
     /// Titles of the tabs holding unsaved edits, for the close prompt. Listing
@@ -2522,9 +2663,16 @@ impl ScribeApp {
                         // one line). Errors win over warnings on a shared line.
                         if let Ok(m) = diag_marks.binary_search_by_key(&(i as u32), |(l, _)| *l) {
                             let sev = diag_marks[m].1;
+                            // INFO resolves to the theme accent, exactly as the
+                            // squiggle's own `match` does. Without this arm an
+                            // info diagnostic fell through to `muted` and drew a
+                            // GREY bar under a GREEN underline — the same
+                            // diagnostic wearing two colours, which reads as two
+                            // unrelated marks.
                             let col = match sev {
                                 super::diagnostics_overlay::SEVERITY_ERROR => diag_err,
                                 super::diagnostics_overlay::SEVERITY_WARNING => diag_warn,
+                                super::diagnostics_overlay::SEVERITY_INFO => accent,
                                 _ => muted,
                             };
                             painter.rect_filled(
@@ -2702,6 +2850,15 @@ impl ScribeApp {
                     // bar can tell the user they are in the degraded editor
                     // instead of silently swapping it in under them.
                     publish_editor_mode(ctx, EditorMode::from_buffer_mode(&resp.buffer_mode));
+                    // Inline LSP diagnostics on the ROPE path. `paint_squiggle`
+                    // used to be reachable ONLY from the `TextEdit` body below,
+                    // so this path — the one a buffer is AUTO-promoted into past
+                    // `rope_editor_auto_threshold_bytes`, i.e. exactly the files
+                    // where an LSP is worth having — showed no squiggle and no
+                    // gutter mark at all. The two integers in the status bar were
+                    // the whole of it. The widget now reports the geometry of the
+                    // rows it painted, so the same spans can be drawn here.
+                    self.paint_rope_diagnostics(ui, &resp, active, viewport, accent, muted);
                     // Join the shared autoscroll + minimap-metrics implementation, the
                     // same call the read-only-large path makes above. Without this the
                     // editable rope path recorded no `scroll_metrics` (freezing the

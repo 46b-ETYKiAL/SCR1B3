@@ -1788,6 +1788,65 @@ fn diag_gutter_bar_marks_the_start_line_only() {
         row_h * 0.5,
         row_h * 0.35,
     );
+
+    // ---- and the bar is the SAME COLOUR as the underline, per severity ----
+    //
+    // Extends this scene rather than adding a sibling, because "the gutter mark
+    // is correct" is one property and colour is half of it. The severity match
+    // in the gutter had no `SEVERITY_INFO` arm and fell through to `_ => muted`,
+    // while the squiggle's own match resolved INFO to the theme accent — so one
+    // diagnostic wore a GREEN underline and a GREY bar and read as two
+    // unrelated marks. Every other assertion in this file passes with that bug
+    // present: the previous phase publishes only an ERROR, whose two arms agree.
+    //
+    // The classifier is what makes this decisive. `ink_pixels(.., i)` accepts a
+    // pixel only if it reads BETTER as severity `i` than as either of the other
+    // two, so a grey bar cannot be counted as accent ink — it classifies as
+    // nothing and the gutter simply has no info-coloured band.
+    let app = diag_app(DIAG_SRC, inline_diags(), false);
+    let targets = severity_colors(&app);
+    let Some(shot) = render_frame("diagnostics_gutter_colours", SCENE_W, SCENE_H, app) else {
+        return;
+    };
+    for (i, name) in ["error", "warning", "info"].iter().enumerate() {
+        let ink = ink_pixels(&shot, &control, &targets, i);
+        let in_gutter: Vec<(u32, u32)> = ink
+            .iter()
+            .copied()
+            .filter(|(x, _)| gutter.contains(x))
+            .collect();
+        let in_text: Vec<(u32, u32)> = ink
+            .iter()
+            .copied()
+            .filter(|(x, _)| text.contains(x))
+            .collect();
+        assert!(
+            !in_text.is_empty(),
+            "precondition: severity {name} must underline something, or the \
+             gutter check below is vacuous"
+        );
+        assert!(
+            !in_gutter.is_empty(),
+            "the {name} gutter bar is not painted in the {name} colour — the \
+             squiggle is, so this diagnostic wears two different colours. \
+             (That is exactly what a missing severity arm in the gutter's \
+             `match` does: it falls through to the muted default.)"
+        );
+        // Same row, too: a bar of the right colour on the wrong line would
+        // still satisfy the two checks above.
+        let gb = ink_bands(&in_gutter, 3);
+        let tb = ink_bands(&in_text, 3);
+        assert_eq!(gb.len(), 1, "{name}: gutter bands {gb:?}");
+        assert_eq!(tb.len(), 1, "{name}: text bands {tb:?}");
+        eprintln!("[diag-colours] {name}: gutter {gb:?} text {tb:?}");
+        assert!(
+            gb[0].0 <= tb[0].1 && tb[0].0 <= gb[0].1 + row_h as u32,
+            "{name}: the gutter bar ({:?}) and its squiggle ({:?}) are on \
+             different rows",
+            gb[0],
+            tb[0]
+        );
+    }
 }
 
 /// A multi-line range underlines every row it covers, starting at the diagnostic
@@ -2173,4 +2232,295 @@ fn changed_pixels_in(a: &RgbaImage, b: &RgbaImage, rect: egui::Rect) -> usize {
         }
     }
     n
+}
+
+// ───────────────── the ROPE path's inline diagnostics ─────────────────
+//
+// `paint_squiggle` used to be reachable ONLY from the `TextEdit` body, so with
+// the rope editor engaged the frame carried ZERO diagnostic ink of any
+// severity and the gutter marks went with it — the status-bar counter was the
+// whole of the language server's output. That path AUTO-ENGAGES past
+// `rope_editor_auto_threshold_bytes`, i.e. on exactly the large files where an
+// LSP earns its keep, so it was the worst available place to lose it.
+//
+// These scenes are the ones that can tell: they render the REAL rope frame and
+// classify its pixels. Every state-level test in the crate passed throughout
+// the outage, because none of them looked at what was painted.
+
+/// [`diag_app`], but with the rope editor forced on.
+///
+/// `experimental_rope_editor` rather than a 16 MiB buffer on purpose: the
+/// threshold selects the SAME `show_editable` path, and a real 16 MiB fixture
+/// would make the scene minutes long for no additional coverage.
+fn diag_app_rope(text: &str, diags: Vec<Diagnostic>) -> ScribeApp {
+    let mut cfg = diag_config(false);
+    cfg.editor.experimental_rope_editor = true;
+    let mut app = ScribeApp::new_test(cfg);
+    app.tabs.clear();
+    let mut t = EditorTab::scratch();
+    t.text = text.to_string();
+    t.session_baseline = text.to_string();
+    t.saved_baseline = text.to_string();
+    app.tabs.push(t);
+    app.active = 0;
+    app.diagnostics = diags;
+    app
+}
+
+/// The rope control frame must carry ZERO diagnostic ink, or every positive
+/// assertion below is measuring something other than the overlay.
+fn rope_control(name: &str) -> Option<RgbaImage> {
+    render_frame(
+        &format!("{name}_control"),
+        SCENE_W,
+        SCENE_H,
+        diag_app_rope(DIAG_SRC, Vec::new()),
+    )
+}
+
+/// THE rope scene. Read the PNG: three squiggles under `error`, `warning` and
+/// `info`, and a matching coloured bar at the left edge of each diagnosed row.
+///
+/// Asserted as three separate properties, because each one fails for a
+/// different real bug: ink EXISTS (the outage), ink is DECISIVELY its own
+/// severity (a painter that drew everything red passes a presence check), and
+/// the rows DESCEND in source order (a painter that resolved spans against the
+/// wrong text lands them all on one row).
+#[test]
+#[ignore = "GPU render; run with --ignored on a host with a wgpu adapter"]
+fn rope_path_paints_the_inline_diagnostic_overlay() {
+    let Some(control) = rope_control("rope_diagnostics") else {
+        return;
+    };
+    let app = diag_app_rope(DIAG_SRC, inline_diags());
+    let targets = severity_colors(&app);
+    let Some(shot) = render_frame("rope_diagnostics", SCENE_W, SCENE_H, app) else {
+        return;
+    };
+    let mut rows: Vec<(usize, u32)> = Vec::new();
+    for (i, name) in ["error", "warning", "info"].iter().enumerate() {
+        let ink = ink_pixels(&shot, &control, &targets, i);
+        assert!(
+            !ink.is_empty(),
+            "the ROPE path painted NO {name}-coloured ink. This is the whole \
+             defect: with the rope editor engaged the diagnostic overlay was \
+             unreachable, so a buffer past the auto-promotion threshold showed \
+             the status-bar counter and nothing else."
+        );
+        let bands = ink_bands(&ink, 3);
+        assert_eq!(
+            bands.len(),
+            1,
+            "{name} must ink exactly one row on the rope path, got {bands:?}"
+        );
+        rows.push((i, bands[0].0));
+        eprintln!("[rope-diag] {name}: {} px, band {:?}", ink.len(), bands[0]);
+    }
+    assert!(
+        rows[0].1 < rows[1].1 && rows[1].1 < rows[2].1,
+        "the three severities must land on descending source lines (error line \
+         1, warning line 2, info line 3), got {rows:?}"
+    );
+}
+
+/// The rope overlay paints BOTH halves — the gutter bar and the squiggle — and
+/// they belong to the same row.
+///
+/// Split off from the presence scene because the gutter bar is the half that
+/// silently went missing on its own: `RopeEditorResponse` publishes the row's
+/// left edge separately from its text origin, so a painter can perfectly well
+/// draw the underline and no bar (or draw the bar in the text area).
+/// [`text_origin`] measures the gutter↔text boundary from the render itself and
+/// ASSERTS the two are well separated, so this cannot pass on one blob of ink.
+#[test]
+#[ignore = "GPU render; run with --ignored on a host with a wgpu adapter"]
+fn the_rope_path_paints_a_gutter_bar_beside_its_squiggle() {
+    let Some(control) = rope_control("rope_diagnostics_gutter") else {
+        return;
+    };
+    let app = diag_app_rope(
+        DIAG_SRC,
+        vec![diag(
+            1,
+            ERR_COLS.0,
+            1,
+            ERR_COLS.1,
+            super::diagnostics_overlay::SEVERITY_ERROR,
+            "cannot find value `error` in this scope",
+        )],
+    );
+    let targets = severity_colors(&app);
+    let Some(shot) = render_frame("rope_diagnostics_gutter", SCENE_W, SCENE_H, app) else {
+        return;
+    };
+    let ink = ink_pixels(&shot, &control, &targets, 0);
+    assert!(!ink.is_empty(), "no error ink on the rope path at all");
+    // Panics with a named message unless there is a clear horizontal gap
+    // between two groups of ink — i.e. unless BOTH the gutter bar and the
+    // squiggle were painted.
+    let split = text_origin(&ink);
+    let gutter: Vec<(u32, u32)> = ink.iter().copied().filter(|(x, _)| *x < split).collect();
+    let text: Vec<(u32, u32)> = ink.iter().copied().filter(|(x, _)| *x >= split).collect();
+    assert!(
+        !gutter.is_empty() && !text.is_empty(),
+        "the rope overlay must paint a gutter bar AND a squiggle (split at \
+         x={split}; gutter {} px, text {} px)",
+        gutter.len(),
+        text.len()
+    );
+    // …on the same row. The bar is centred on the row and the squiggle sits at
+    // its bottom, so they overlap vertically to well within a row.
+    let gb = ink_bands(&gutter, 3);
+    let tb = ink_bands(&text, 3);
+    assert_eq!(gb.len(), 1, "one gutter band expected, got {gb:?}");
+    assert_eq!(tb.len(), 1, "one squiggle band expected, got {tb:?}");
+    eprintln!("[rope-gutter] split={split} gutter band {gb:?} text band {tb:?}");
+    // Tolerance derived from the render, not a magic number: the painter draws
+    // the bar over the middle 60% of the row, so the bar's own measured height
+    // IS ~0.6 of a row. Allowing the squiggle to sit up to one bar-height below
+    // the bar therefore admits the real layout (bar centred, squiggle on the
+    // row's bottom edge) while a mark one WHOLE row out — the classic gutter
+    // regression — lands well outside it.
+    let bar_h = gb[0].1 - gb[0].0;
+    assert!(
+        gb[0].0 <= tb[0].1 && tb[0].0 <= gb[0].1 + bar_h,
+        "the gutter bar must sit on the SAME row as the squiggle it marks \
+         (gutter {:?}, squiggle {:?}, bar height {bar_h}px)",
+        gb[0],
+        tb[0]
+    );
+}
+
+// ─────────────── the SPLIT-VIEW path's inline diagnostics ───────────────
+//
+// The diagnostics paint block lived inside the CentralPanel branch of
+// `if self.grid_tree.is_some() { render_grid_central_panel(..) } else { .. }`,
+// and `grid_render.rs` did not contain the string "diagnostic" at all — so
+// turning split view ON silently removed the squiggle and the hover, leaving
+// the user with the two status-bar integers that do not say WHICH line is
+// wrong.
+//
+// `grid_parity_tests` pins this from the SHAPE LIST, which is decidable
+// without a GPU and is what CI runs. This scene is the pixel counterpart: it
+// renders the real two-pane frame so the result can be LOOKED AT, because a
+// shape in the list is not proof it survived clipping, z-order, or a pane rect
+// that put it off-screen.
+
+/// A two-pane grid app carrying [`DIAG_SRC`] in both panes.
+///
+/// Both panes hold the SAME text so that the only thing which can move the ink
+/// between them is which pane is ACTIVE — the property `grid_methods` resolves
+/// `diag_spans` against.
+fn diag_app_grid(diags: Vec<Diagnostic>) -> ScribeApp {
+    let mut cfg = diag_config(false);
+    cfg.editor.grid_enabled = true;
+    // Never auto-promote to the rope pane: this scene is about the `TextEdit`
+    // pane's overlay, and the rope path has scenes of its own above.
+    cfg.editor.rope_editor_auto_threshold_bytes = 0;
+    let mut app = ScribeApp::new_test(cfg);
+    app.tabs.clear();
+    for _ in 0..2 {
+        let mut t = EditorTab::scratch();
+        t.text = DIAG_SRC.to_string();
+        t.session_baseline = DIAG_SRC.to_string();
+        t.saved_baseline = DIAG_SRC.to_string();
+        app.tabs.push(t);
+    }
+    app.active = 0;
+    app.diagnostics = diags;
+    app
+}
+
+/// Split view paints the inline diagnostic overlay. Read the PNG: two panes
+/// side by side, with the squiggles in the ACTIVE one.
+///
+/// Wider than the other scenes because two panes share the width — at
+/// [`SCENE_W`] each pane is too narrow to lay `DIAG_SRC` out without wrapping,
+/// which would move the ink for reasons that have nothing to do with the
+/// overlay.
+#[test]
+#[ignore = "GPU render; run with --ignored on a host with a wgpu adapter"]
+fn split_view_paints_the_inline_diagnostic_overlay() {
+    const GRID_W: f32 = 1400.0;
+    let Some(control) = render_frame(
+        "grid_diagnostics_control",
+        GRID_W,
+        SCENE_H,
+        diag_app_grid(Vec::new()),
+    ) else {
+        return;
+    };
+    let app = diag_app_grid(inline_diags());
+    let targets = severity_colors(&app);
+    let Some(shot) = render_frame("grid_diagnostics", GRID_W, SCENE_H, app) else {
+        return;
+    };
+    let mut rows: Vec<(usize, u32)> = Vec::new();
+    for (i, name) in ["error", "warning", "info"].iter().enumerate() {
+        let ink = ink_pixels(&shot, &control, &targets, i);
+        assert!(
+            !ink.is_empty(),
+            "split view painted NO {name}-coloured ink. This is the defect: the \
+             diagnostics block sits in the single-pane arm of the \
+             `grid_tree.is_some()` fork, so turning split view on removed the \
+             overlay entirely."
+        );
+        let bands = ink_bands(&ink, 3);
+        assert_eq!(
+            bands.len(),
+            1,
+            "{name} must ink exactly one row in split view, got {bands:?}"
+        );
+        rows.push((i, bands[0].0));
+        eprintln!("[grid-diag] {name}: {} px, band {:?}", ink.len(), bands[0]);
+    }
+    assert!(
+        rows[0].1 < rows[1].1 && rows[1].1 < rows[2].1,
+        "the three severities must land on descending source lines, got {rows:?}"
+    );
+
+    // The ink belongs to ONE pane, not both. `diag_spans` are resolved against
+    // the ACTIVE tab's byte offsets, so painting them over the inactive pane's
+    // galley would underline unrelated text — the reason `grid_methods` gates
+    // the call on `is_active`. Measured as a horizontal extent: ink confined to
+    // one pane cannot span more than about half the window.
+    let all: Vec<(u32, u32)> = (0..3)
+        .flat_map(|i| ink_pixels(&shot, &control, &targets, i))
+        .collect();
+    let (min_x, max_x) = (
+        all.iter().map(|(x, _)| *x).min().expect("ink"),
+        all.iter().map(|(x, _)| *x).max().expect("ink"),
+    );
+    eprintln!(
+        "[grid-diag] ink x extent {min_x}..{max_x} of {}",
+        shot.width()
+    );
+    assert!(
+        (max_x - min_x) < shot.width() / 2,
+        "the overlay must paint in the ACTIVE pane only; ink spans x \
+         {min_x}..{max_x} of a {}px frame, i.e. across both panes",
+        shot.width()
+    );
+}
+
+/// Two rope renders of the same diagnostic-free app must differ by nothing, or
+/// the classifier is reading GPU noise and both scenes above are worthless.
+#[test]
+#[ignore = "GPU render; run with --ignored on a host with a wgpu adapter"]
+fn the_rope_control_frame_carries_no_diagnostic_ink() {
+    let Some(a) = rope_control("rope_diagnostics_zero_a") else {
+        return;
+    };
+    let Some(b) = rope_control("rope_diagnostics_zero_b") else {
+        return;
+    };
+    let targets = severity_colors(&diag_app_rope(DIAG_SRC, Vec::new()));
+    for (i, name) in ["error", "warning", "info"].iter().enumerate() {
+        let n = ink_pixels(&b, &a, &targets, i).len();
+        assert_eq!(
+            n, 0,
+            "two diagnostic-free ROPE renders differ by {n} {name}-coloured \
+             pixels; the ink classifier is reading noise"
+        );
+    }
 }

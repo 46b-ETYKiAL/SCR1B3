@@ -108,6 +108,100 @@ pub(crate) fn gutter_marks(diags: &[Diagnostic]) -> Vec<(u32, u8)> {
     marks
 }
 
+/// One diagnostic's ink on ONE source line, in CHARACTER columns.
+///
+/// The `TextEdit` path paints per GALLEY row and gets its columns from the
+/// galley it was handed. The rope editor lays every row out itself and hands
+/// the host [`scribe_render::RopeRowGeom`] per SOURCE line instead, so the
+/// overlay for that path needs the same spans re-expressed as `(line, column
+/// range)` — which is what [`row_segments`] produces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RowSegment {
+    /// 0-based source line.
+    pub line: usize,
+    /// First character column to underline.
+    pub start_col: usize,
+    /// One past the last character column to underline.
+    pub end_col: usize,
+    pub severity: u8,
+}
+
+/// Byte range of source line `line`, EXCLUDING its line break.
+///
+/// `(text.len(), text.len())` for a line past the end of the buffer, so an
+/// overlap test against it is empty rather than panicking.
+fn line_byte_range(index: &LineIndex, text: &str, line: usize) -> (usize, usize) {
+    let Ok(line) = u32::try_from(line) else {
+        return (text.len(), text.len());
+    };
+    if line as usize >= index.line_count() {
+        return (text.len(), text.len());
+    }
+    // `offset_of` stops at the line's break (or its end), so column 0 is the
+    // line start and a column past every character is the line end.
+    (
+        index.offset_of(text, line, 0),
+        index.offset_of(text, line, u32::MAX),
+    )
+}
+
+/// Project byte spans onto per-line character-column segments, for the source
+/// lines in `visible` only.
+///
+/// Scoped to the visible range on purpose: the rope path exists because the
+/// buffer is large (16 MiB+ by default), and the whole point of that path is
+/// that per-frame work is O(viewport). A projection over the whole document
+/// would hand the rope editor back the O(n) cost it was introduced to remove.
+///
+/// A span covering several lines yields one segment per line — the same
+/// per-row treatment the `TextEdit` painter applies, so a multi-line
+/// diagnostic underlines every line it covers instead of being dropped.
+/// Columns are CHARACTER indices into the line (what the row galley is keyed
+/// on), never bytes and never UTF-16 units.
+pub(crate) fn row_segments(
+    text: &str,
+    spans: &[DiagSpan],
+    visible: std::ops::Range<usize>,
+) -> Vec<RowSegment> {
+    if spans.is_empty() || text.is_empty() || visible.is_empty() {
+        return Vec::new();
+    }
+    let index = LineIndex::new(text);
+    let mut out = Vec::new();
+    for line in visible {
+        if line >= index.line_count() {
+            break; // past the end of the buffer, and so is every later line
+        }
+        let (ls, le) = line_byte_range(&index, text, line);
+        for span in spans {
+            let s = span.start.max(ls);
+            let e = span.end.min(le);
+            if s >= e {
+                continue;
+            }
+            out.push(RowSegment {
+                line,
+                start_col: text[ls..s].chars().count(),
+                end_col: text[ls..e].chars().count(),
+                severity: span.severity,
+            });
+        }
+    }
+    out
+}
+
+/// Byte offset of character column `col` on source line `line`, clamped to the
+/// line's end. The inverse of the column arithmetic in [`row_segments`], used
+/// to resolve a pointer on a rope row back to a buffer offset for the hover.
+pub(crate) fn byte_of_line_col(text: &str, line: usize, col: usize) -> usize {
+    let index = LineIndex::new(text);
+    let (ls, le) = line_byte_range(&index, text, line);
+    text[ls..le]
+        .char_indices()
+        .nth(col)
+        .map_or(le, |(i, _)| ls + i)
+}
+
 /// The hover text for a set of overlapping diagnostics at one offset.
 ///
 /// The NARROWEST span leads: an inner "unknown field" inside an outer "this
@@ -355,5 +449,167 @@ mod tests {
             hover_text(&spans, stmt).as_deref(),
             Some("warning: outer statement problem")
         );
+    }
+
+    // ---- the ROPE path's projection: byte spans -> per-line char columns ----
+    //
+    // The `TextEdit` overlay walks a galley and gets its columns from it. The
+    // rope editor lays every row out itself and publishes per-SOURCE-LINE
+    // geometry, so the overlay for that path needs the spans re-expressed as
+    // `(line, column range)`. That arithmetic is where a rope-path squiggle
+    // silently lands under the wrong characters, and it is invisible to the
+    // `TextEdit` tests — hence its own set.
+
+    /// Render `row_segments`' output as `line:"underlined text"`, so an
+    /// off-by-one is a wrong STRING rather than a plausible-looking integer.
+    fn underlined(text: &str, segs: &[RowSegment]) -> Vec<String> {
+        segs.iter()
+            .map(|s| {
+                let line_start = byte_of_line_col(text, s.line, 0);
+                let a = byte_of_line_col(text, s.line, s.start_col);
+                let b = byte_of_line_col(text, s.line, s.end_col);
+                debug_assert!(a >= line_start);
+                format!("{}:{:?}", s.line, &text[a..b])
+            })
+            .collect()
+    }
+
+    #[test]
+    fn row_segments_underlines_exactly_the_identifier_on_its_own_line() {
+        let spans = diagnostic_spans(SRC, &[diag(1, 12, 1, 27, 1, "undefined")]);
+        let segs = row_segments(SRC, &spans, 0..4);
+        assert_eq!(underlined(SRC, &segs), vec![r#"1:"undefined_thing""#]);
+        assert_eq!(segs[0].severity, SEVERITY_ERROR);
+    }
+
+    #[test]
+    fn a_multi_line_span_yields_one_segment_per_line_it_covers() {
+        // The behaviour a naive "underline start..end on the start line"
+        // implementation gets wrong: the middle line must be underlined WHOLE,
+        // the first from the diagnostic column to the line end, the last from
+        // the line start to the diagnostic column.
+        const SRC3: &str = "alpha bravo\ncharlie delta\necho foxtrot\n";
+        let spans = diagnostic_spans(SRC3, &[diag(0, 6, 2, 4, 1, "spans three lines")]);
+        let segs = row_segments(SRC3, &spans, 0..3);
+        assert_eq!(
+            underlined(SRC3, &segs),
+            vec![r#"0:"bravo""#, r#"1:"charlie delta""#, r#"2:"echo""#],
+            "each covered line gets its own segment, clipped to that line"
+        );
+        // …and the line break itself is never underlined: the last column of a
+        // segment must not run past the line's own text.
+        for s in &segs {
+            let end = byte_of_line_col(SRC3, s.line, s.end_col);
+            assert!(
+                !SRC3[..end].ends_with('\n'),
+                "segment on line {} underlines its line break",
+                s.line
+            );
+        }
+    }
+
+    #[test]
+    fn row_segments_is_scoped_to_the_visible_range() {
+        // The whole reason the rope path exists is that per-frame work must be
+        // O(viewport). A projection over the whole document would hand back the
+        // O(n) cost the rope editor was introduced to remove — so a line
+        // outside `visible` must produce NO segment even though its span
+        // resolves perfectly well.
+        const SRC3: &str = "alpha bravo\ncharlie delta\necho foxtrot\n";
+        let spans = diagnostic_spans(SRC3, &[diag(2, 0, 2, 4, 1, "on the last line")]);
+        assert!(
+            row_segments(SRC3, &spans, 0..2).is_empty(),
+            "line 2 is outside the visible range 0..2"
+        );
+        assert_eq!(row_segments(SRC3, &spans, 2..3).len(), 1);
+        // An empty viewport is not a reason to walk the buffer.
+        assert!(row_segments(SRC3, &spans, 0..0).is_empty());
+    }
+
+    #[test]
+    fn columns_are_characters_not_bytes() {
+        // A multibyte line is where byte arithmetic masquerading as columns
+        // shows up: the row galley is keyed on CHARACTER index, so a span after
+        // a multi-byte glyph must report the character column, not the byte
+        // offset. `é` is 2 bytes, `→` is 3, `日` is 3.
+        const SRC_U: &str = "é→日 tail\nplain\n";
+        let start = SRC_U.find("tail").expect("fixture");
+        let spans = diagnostic_spans(
+            SRC_U,
+            &[Diagnostic {
+                uri: "file:///u.rs".into(),
+                line: 0,
+                character: 4, // UTF-16 units: é(1) →(1) 日(1) space(1)
+                end_line: 0,
+                end_character: 8,
+                severity: SEVERITY_WARNING,
+                message: "tail".into(),
+            }],
+        );
+        assert_eq!(spans[0].start, start, "precondition: the span is on `tail`");
+        let segs = row_segments(SRC_U, &spans, 0..2);
+        assert_eq!(
+            segs,
+            vec![RowSegment {
+                line: 0,
+                start_col: 4,
+                end_col: 8,
+                severity: SEVERITY_WARNING,
+            }],
+            "columns must be CHARACTER indices (4..8), not byte offsets (9..13)"
+        );
+        assert_eq!(underlined(SRC_U, &segs), vec![r#"0:"tail""#]);
+    }
+
+    #[test]
+    fn byte_of_line_col_is_the_inverse_of_the_column_arithmetic() {
+        // The hover resolves a pointer x to a column and then back to a byte;
+        // if the two disagree the tooltip names the wrong diagnostic.
+        const SRC_U: &str = "é→日 tail\nplain\n";
+        for (line, col, expect) in [(0usize, 0usize, "é"), (0, 3, " "), (1, 2, "a")] {
+            let b = byte_of_line_col(SRC_U, line, col);
+            assert!(
+                SRC_U[b..].starts_with(expect),
+                "line {line} col {col} resolved to byte {b}, which starts {:?} not {expect:?}",
+                &SRC_U[b..(b + 4).min(SRC_U.len())]
+            );
+        }
+        // A column past the end of the line clamps to the line's end — never
+        // into the NEXT line, or a hover past the last character would report a
+        // diagnostic belonging to the row below.
+        let eol = byte_of_line_col(SRC_U, 0, 999);
+        assert_eq!(&SRC_U[eol..eol + 1], "\n", "clamped to the line break");
+        // …and a line past the end of the buffer clamps to the buffer end
+        // rather than panicking.
+        assert_eq!(byte_of_line_col(SRC_U, 99, 0), SRC_U.len());
+    }
+
+    /// The three empty-input short-circuits, each on its own.
+    ///
+    /// MUTATION NOTE — `cargo mutants -F row_segments` leaves exactly two
+    /// survivors, both `replace || with && ` in this function's guard, and both
+    /// are EQUIVALENT rather than a gap in the assertions below. With `&&` the
+    /// guard stops short-circuiting and control falls into the main loop, which
+    /// produces the same empty `Vec` for every one of the three cases: no spans
+    /// means the inner loop never pushes, empty text means `line_count()` is 0
+    /// so the outer loop breaks immediately, and an empty visible range means it
+    /// never iterates. The only difference is the `LineIndex::new(text)` the
+    /// guard avoids — an O(text) construction, which on the 16 MiB buffers this
+    /// path exists for is the whole reason the short-circuit is written this
+    /// way, but which has no output an assertion can read and no non-flaky
+    /// timing test. Recorded here rather than pardoned or silenced, so the next
+    /// reader knows these two were analysed and not missed.
+    #[test]
+    fn row_segments_handles_the_empty_cases_without_walking_the_buffer() {
+        assert!(row_segments("", &[], 0..10).is_empty());
+        assert!(row_segments(SRC, &[], 0..10).is_empty());
+        let spans = diagnostic_spans(SRC, &[diag(1, 12, 1, 27, 1, "x")]);
+        assert!(
+            row_segments("", &spans, 0..10).is_empty(),
+            "an empty buffer has no lines to project onto"
+        );
+        // A visible range that runs off the end of the buffer stops at the last
+        // line instead of indexing past it.
+        assert_eq!(row_segments(SRC, &spans, 0..9_999).len(), 1);
     }
 }

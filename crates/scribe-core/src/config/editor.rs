@@ -128,6 +128,20 @@ pub struct EditorConfig {
     /// spellcheck squiggles and Tab→spaces) for O(viewport) rendering, which is
     /// the right call at this size. `0` disables auto-promotion entirely. Default
     /// 16 MiB (aligns with the core mmap threshold).
+    ///
+    /// **Inline LSP diagnostics DO survive the promotion** — the squiggle, the
+    /// gutter bar and the hover message are painted on the rope path too. That
+    /// is worth stating because it was not always true, and the omission was
+    /// actively misleading: the trade-off list above named four casualties and
+    /// said nothing about diagnostics, while the rope path in fact showed NO
+    /// diagnostic ink of any severity. A file past this threshold is exactly a
+    /// file where a language server earns its keep, so silently dropping its
+    /// output there was the worst possible place to drop it.
+    ///
+    /// The one remaining gap is honest and narrow: a buffer still MEMORY-MAPPED
+    /// (the read-only browse surface past the hard size cap) lays out no
+    /// per-row galley, so there is nothing to hang an overlay off and no
+    /// diagnostics paint. The status bar's MMAP / READ-ONLY badge hover says so.
     #[serde(default = "default_rope_auto_threshold")]
     pub rope_editor_auto_threshold_bytes: usize,
     /// Persist UNSAVED buffer content (incl. untitled scratch notes) so it
