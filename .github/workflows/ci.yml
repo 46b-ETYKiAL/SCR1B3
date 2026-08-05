@@ -337,11 +337,17 @@ jobs:
     # than red, so nobody knew mutation had stopped covering the PR.
     #
     # Two changes make it fail LOUDLY instead. The matrix raises the ceiling
-    # (same 12-shard precedent as `mutation-app` below), and the explicit
+    # (the `mutation-app` job below is the 12-shard precedent), and the explicit
     # per-shard `timeout-minutes` is comfortably under GitHub's limit so a
     # genuine overrun is reported as a failed step. The pre-flight cap then
     # turns "too big to finish" into an actionable message BEFORE burning the
     # budget, rather than a silent cancellation five hours later.
+    #
+    # The shard count is the throughput dial. It was raised 8 -> 24 because
+    # real PRs in this repo exceed the 640-mutant cap the 8-shard matrix could
+    # test — a capped-out PR is refused, i.e. NOT mutation tested, which is a
+    # coverage hole even though it is a loud one. The fix is more shards, never
+    # a bigger per-shard cap: see the derivation on the pre-flight step.
     name: mutation testing (in-diff)
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
@@ -349,7 +355,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+        shard:
+          [
+            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11,
+            12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
+          ]
     steps:
       - name: Harden the runner (egress audit)
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
@@ -378,11 +388,26 @@ jobs:
         # immediate, actionable failure that names the number and the options.
         #
         # The cap is derived, not guessed: ~60s per mutant observed, a 100
-        # minute per-shard timeout, 8 shards, and a ~40% margin for the build
-        # and for slower mutants => 80 per shard, 640 in total.
+        # minute per-shard timeout, and a ~40% margin for the build and for
+        # slower mutants => 80 per shard. Total = MAX_PER_SHARD * SHARDS.
+        #
+        # `MAX_PER_SHARD` is the WALL-CLOCK property and is deliberately
+        # untouched: it is what the 100-minute per-shard `timeout-minutes`
+        # above is derived from (80 x ~60s = ~80 min of mutants, leaving ~20
+        # min for checkout, toolchain install and build). Raising it would
+        # invalidate that timeout and re-introduce the silent cancellation this
+        # whole block exists to prevent.
+        #
+        # `SHARDS` is the THROUGHPUT property, and is the only half raised:
+        # 8 -> 24 widens the total cap 640 -> 1920 while every shard still does
+        # at most 80 mutants, so the per-shard arithmetic — and therefore the
+        # 100-minute timeout — is unchanged. 24 shards also exceeds the free
+        # concurrency ceiling, so some shards queue rather than start at once;
+        # that costs latency, not correctness, because each shard carries its
+        # own independent timeout.
         env:
           MAX_PER_SHARD: 80
-          SHARDS: 8
+          SHARDS: 24
         run: |
           set -euo pipefail
           n=$(cargo mutants --list --in-diff pr.diff \
@@ -426,7 +451,7 @@ jobs:
         # split keeps every compiled line of `lib.rs` under mutation.
         run: >
           cargo mutants --in-diff pr.diff --test-tool nextest --timeout 300 --in-place
-          --shard ${{ matrix.shard }}/8
+          --shard ${{ matrix.shard }}/24
           --exclude '**/src/integration/windows.rs'
           --exclude '**/scribe-win32-chrome/src/imp.rs'
 

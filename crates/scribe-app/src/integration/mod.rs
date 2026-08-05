@@ -481,4 +481,94 @@ mod packaging_consistency_tests {
              gate that silently skips a file it claims to cover."
         );
     }
+
+    /// The `mutation-in-diff` shard count is stated THREE times and all three
+    /// must agree: the matrix entry list, the `SHARDS` the pre-flight cap
+    /// multiplies by, and the denominator in `--shard N/D`.
+    ///
+    /// A divergence is silent in the worst direction. If the matrix lists fewer
+    /// entries than the denominator, the missing shards' mutants are never run
+    /// and every job still reports green — the gate claims to have tested the
+    /// diff while a slice of it was skipped. If `SHARDS` disagrees with either,
+    /// the pre-flight either refuses a PR it could have handled or waves
+    /// through one it cannot finish, which is the 6-hour silent cancellation
+    /// the pre-flight exists to prevent.
+    ///
+    /// Scoped to the `mutation-in-diff` job body: `mutation-app` legitimately
+    /// shards 12 ways, so a whole-file scan would conflate the two.
+    #[test]
+    fn the_mutation_in_diff_shard_count_agrees_in_all_three_places() {
+        let ci = include_str!("../../../../.github/workflows/ci.yml");
+        let start = ci
+            .find("\n  mutation-in-diff:")
+            .expect("the mutation-in-diff job must exist");
+        let end = start
+            + ci[start + 1..]
+                .find("\n  mutation:")
+                .expect("mutation-in-diff must be followed by the mutation job");
+        let job = &ci[start..end];
+
+        // 1. the `--shard N/D` denominator
+        let flag = "--shard ${{ matrix.shard }}/";
+        let after = job
+            .split(flag)
+            .nth(1)
+            .expect("the mutation step must pass --shard");
+        let denominator: usize = after
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect::<String>()
+            .parse()
+            .expect("--shard denominator must be a number");
+
+        // 2. the `SHARDS:` the pre-flight cap multiplies by
+        let after = job
+            .split("SHARDS: ")
+            .nth(1)
+            .expect("the pre-flight must declare SHARDS");
+        let declared: usize = after
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect::<String>()
+            .parse()
+            .expect("SHARDS must be a number");
+
+        // 3. the matrix entries actually dispatched
+        let after = job
+            .split("shard:")
+            .nth(1)
+            .expect("the matrix must declare shard entries");
+        let list = &after[..after.find(']').expect("the shard list must be closed")];
+        let mut entries: Vec<usize> = list
+            .trim_start()
+            .trim_start_matches('[')
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.parse().expect("every shard entry must be a number"))
+            .collect();
+        entries.sort_unstable();
+
+        assert_eq!(
+            entries.len(),
+            denominator,
+            "the matrix dispatches {} shard(s) but `--shard N/{denominator}` \
+             splits the work {denominator} ways — the shards with no matrix \
+             entry are NEVER RUN and the job still reports green",
+            entries.len()
+        );
+        assert_eq!(
+            declared, denominator,
+            "the pre-flight cap multiplies MAX_PER_SHARD by {declared} while the \
+             work is split {denominator} ways, so the refusal threshold does not \
+             match what the gate can actually test"
+        );
+        assert_eq!(
+            entries,
+            (0..denominator).collect::<Vec<_>>(),
+            "the shard entries must be exactly 0..{denominator} with no gaps or \
+             duplicates — cargo-mutants indexes shards from 0, so a gap silently \
+             drops that shard's mutants and a duplicate wastes a runner"
+        );
+    }
 }
