@@ -11,10 +11,36 @@
 #
 # MIXED files (mod.rs, render_support.rs, text_ops_methods.rs, builtins.rs, …)
 # are DELIBERATELY NOT glob-excluded here: they carry real logic that must stay
-# mutation-gated. Their individual UI-render functions are excluded precisely
-# via `#[cfg_attr(test, mutants::skip)]` on the function, each with an ADR-0007
-# justification — never by a broad file/regex glob that could silently hide a
-# logic gap (a green-that-isn't-green).
+# mutation-gated. Their individual UI-render functions are excluded one at a
+# time by NAME in the `exclude_re` array below, each with an ADR-0007
+# justification — never by a whole-file glob that would silently hide the logic
+# sharing the file (a green-that-isn't-green).
+#
+# This comment previously claimed those functions were excluded "precisely via
+# `#[cfg_attr(test, mutants::skip)]` on the function … never by a broad
+# file/regex glob". That was false in both halves, and is corrected here rather
+# than left describing a mechanism the file does not use. There is not one
+# `mutants::skip` attribute anywhere in this tree (`git grep mutants::skip`
+# returns a single hit, and it is a COMMENT); the exclusions are, and always
+# were, `exclude_re` name tokens — exactly the shape the old text disclaimed.
+# A doc that describes the safe design while the file implements the one it
+# warns against is worse than no doc: it retires the reader's suspicion without
+# retiring the risk.
+#
+# What that means for the two residual risks in the array, and what holds them:
+#
+#   * A bare function-name token is a SUBSTRING match. Every name token below is
+#     `\b`-bounded for that reason, so `\bshow_minimap\b` cannot also swallow a
+#     `show_minimap_legend` added later. Where a bare word is shared across files
+#     (`show`) the token is additionally file-qualified.
+#   * `'<impl eframe::App for ScribeApp>'` is a genuine blanket over every method
+#     of that impl — present AND future. It is kept (all three of
+#     clear_color/save/ui are live-frame/eframe-host only, with no headless
+#     observable), but it is no longer unbounded in time: the test
+#     `the_eframe_app_blanket_pardon_covers_only_the_documented_methods` in
+#     crates/scribe-app/tests/mutation_pardons_are_not_stale.rs pins that impl's
+#     method set, so adding a fourth method turns the suite RED and forces the
+#     pardon decision to be made explicitly instead of inherited.
 
 exclude_globs = [
   # egui/eframe per-frame render + modal painting (no testable logic)
@@ -81,13 +107,27 @@ test_tool = "nextest"
 # When a bare description would match SEVERAL mutants and over-suppress a
 # neighbour the tests actually kill, pin the mutant's COLUMN and leave the LINE
 # as `\d+` — e.g. `'find_in_files\.rs:\d+:32: replace > with (==|<|>=) in
-# walk_project'`. A column does not move when something above it is edited, so
-# the rotation class is still closed, and the pardon stays exactly as tight as a
-# line anchor was. Over-suppression is worse than rotation: never widen a
-# description to swallow a mutant you did not mean to pardon.
+# walk_project'`. A column does not move when something ABOVE it is edited, so
+# it closes the VERTICAL half of the rotation class, and the pardon stays
+# exactly as tight as a line anchor was. Over-suppression is worse than
+# rotation: never widen a description to swallow a mutant you did not mean to
+# pardon.
 #
-# `crates/scribe-app/tests/mutation_pardons_are_not_stale.rs` REJECTS any new
-# literal-line anchor outright.
+# A COLUMN IS NOT ROTATION-PROOF. An earlier version of this header claimed the
+# rotation class was "still closed" once the line was wildcarded. It is not:
+# re-indenting the line (wrapping the block in an `if`) or renaming an
+# identifier to the LEFT of the pardoned operator moves the column, and the
+# anchor then matches nothing — or comes to rest on a DIFFERENT operator at the
+# same column and silently pardons the wrong mutant. That is the original
+# `drag_scroll.rs:189` -> `page_key_assist` failure reproduced horizontally.
+#
+# So every pardon that pins a coordinate — LINE-pinned or COLUMN-pinned — must
+# be registered in `POSITIONAL_ANCHORS` in
+# `crates/scribe-app/tests/mutation_pardons_are_not_stale.rs`, together with the
+# source text that must still sit at each pinned column. That test verifies both
+# axes on every run and REJECTS any unregistered coordinate anchor, in any regex
+# spelling (escaped colons, character classes, parenthesised or `\d`-substituted
+# numbers, and a bare `:LINE:COL:` with no filename all classify the same).
 
 # Pardoned mutants (equivalent or untestable — never a floor-lowering shortcut):
 #
@@ -109,6 +149,17 @@ test_tool = "nextest"
 #   telemetry-disabled suppresses) with a capturing sink. The `\(\)` bound matches
 #   the wrapper's whole-body mutant ONLY, never `log_outcome_with` (the `_with`
 #   breaks the ` with ` match). See crates/scribe-app/src/reporting.rs.
+#   FILE-QUALIFIED as of this pass. The justification above reasons entirely
+#   about reporting.rs, but scribe-app has TWO free `fn log_outcome` returning
+#   `()` — reporting.rs:81 (this thin wrapper) and issue_intake.rs:308, which is
+#   NOT a wrapper: it carries its own `S4F3_DISABLE_TELEMETRY` gate and then
+#   calls `action_log::record`. cargo-mutants names free functions bare, so the
+#   old unqualified `'replace log_outcome with \(\)'` matched BOTH and silently
+#   stretched a reporting.rs rationale over an unrelated function. Scoping it to
+#   reporting.rs is a TIGHTENING, not a widening. It may surface a survivor on
+#   issue_intake::log_outcome — that gate is genuinely testable (inject a sink,
+#   as reporting.rs does) and the honest signal is a real test gap, not a
+#   pardon. Do NOT re-broaden this pattern to silence it.
 # - effects.rs CRT/VHS paint functions (6): each takes `ctx: &egui::Context` and
 #   paints directly (`ctx.layer_painter(...).rect_filled/circle_filled/line_segment`);
 #   their internal alpha/phase/drift/position arithmetic is observable ONLY through
@@ -161,14 +212,19 @@ exclude_re = [
   'replace apply_rounded_corners with \(\)',
   'replace set_backdrop with \(\)',
   "replace path -> Option<&'static PathBuf>",
-  'replace log_outcome with \(\)',
-  "paint_crt_scanlines",
-  "paint_flicker",
-  "paint_vhs_tracking",
-  "paint_wired_mesh",
-  "paint_caret_trail",
-  "paint_boot_glitch",
-  "paint_squiggle",  # render_support.rs spellcheck-underline paint: painter.line_segment only (GPU pixels, no return/observable state) — ADR-0007 egui-paint
+  'reporting\.rs.*replace log_outcome with \(\)',
+  # `\b`-bounded like every other name token in this array. These seven were the
+  # only unbounded SUBSTRINGS left: as a bare `"paint_flicker"` the token would
+  # also have swallowed a `paint_flicker_overlay` added later, pardoning a
+  # function nobody justified. Note the LITERAL quotes — in a TOML *basic*
+  # string `"\b"` is a backspace escape, not a regex word boundary.
+  '\bpaint_crt_scanlines\b',
+  '\bpaint_flicker\b',
+  '\bpaint_vhs_tracking\b',
+  '\bpaint_wired_mesh\b',
+  '\bpaint_caret_trail\b',
+  '\bpaint_boot_glitch\b',
+  '\bpaint_squiggle\b',  # render_support.rs spellcheck-underline paint: painter.line_segment only (GPU pixels, no return/observable state) — ADR-0007 egui-paint
   # settings.rs settings-panel render surfaces
   '\brender_sections\b',
   '\brender_update_status\b',
@@ -369,10 +425,12 @@ exclude_re = [
   # same function at the SAME column — so neither the description nor the column
   # can tell them apart, and widening to cover the neighbour would suppress a
   # mutant the tests actually kill (over-suppression is worse than rotation).
-  # These three are FROZEN: `mutation_pardons_are_not_stale` carries them in an
-  # explicit allowlist together with the source token each anchored line must
-  # still contain, and REJECTS every other literal-line anchor. Do not add a
-  # fourth without demonstrating the same impossibility.
+  # These three are FROZEN: `mutation_pardons_are_not_stale` carries them in
+  # `POSITIONAL_ANCHORS` together with the exact source text that must still
+  # start at each anchored line AND column, and REJECTS every other literal-line
+  # anchor. Do not add a fourth without demonstrating the same impossibility.
+  # (The ten COLUMN-pinned anchors above are registered there too — a wildcarded
+  # line does not exempt an anchor from horizontal-rotation verification.)
   'app/multi_cursor_glue\.rs:77:13:',  # mc_reconcile_owner `is_active() || !secondaries.is_empty()`: unreachable divergence. The `||` on the NEXT line (also column 13, identical description) guards column_anchor and IS tested.
   'app/multi_cursor_glue\.rs:94:13:',  # mc_record_owner: same predicate, same name+column collision with the tested `||` below it.
   'to_markdown\.rs:249:37:',           # parse_csv CRLF `\n` lookahead: the extra [""] record is dropped by the csv_to_md filter. Name- AND column-identical to the escaped-quote lookahead earlier in parse_csv, which IS tested.
