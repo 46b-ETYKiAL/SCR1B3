@@ -1105,6 +1105,124 @@ mod rope_writeback_tests {
         );
     }
 
+    /// Drive one real frame in which the DEFAULT (non-rope) editor is focused
+    /// and receives a keystroke, so egui mutates `tabs[idx].text` in place
+    /// inside `show()` and the `out.response.changed()` arm fires for real.
+    ///
+    /// Nothing here emulates the arm — the test supplies only focus and an
+    /// event, which is what a user supplies. A test that hand-rolled the
+    /// in-place mutation would be asserting its own copy of the writer and
+    /// would stay green no matter what the writer did.
+    fn type_into_the_default_editor(app: &mut ScribeApp, idx: usize, s: &str) {
+        let editor_id = egui::Id::new("scr1b3-central-editor").with(app.tabs[idx].doc_id);
+        let ctx = egui::Context::default();
+        // Frame 1: hand the editor focus (a user clicking into it).
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(1100.0, 720.0),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| {
+            ctx.memory_mut(|m| m.request_focus(editor_id));
+            app.frame_tick(ctx);
+        });
+        // Frame 2: the keystroke lands in the focused TextEdit.
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(1100.0, 720.0),
+            )),
+            events: vec![text_event(s)],
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| app.frame_tick(ctx));
+    }
+
+    /// Put the app on the DEFAULT editor path without disturbing a rope that
+    /// is already built: raise the auto threshold above the buffer size.
+    fn switch_to_default_editor_path(app: &mut ScribeApp, idx: usize) {
+        app.config.editor.experimental_rope_editor = false;
+        app.config.editor.rope_editor_auto_threshold_bytes = app.tabs[idx].text.len() * 4 + 4096;
+    }
+
+    /// F1 — the default editor is a text WRITER that never invalidated the rope.
+    ///
+    /// `set_text` and the two in-place splicers were fixed to call
+    /// `note_text_mutated`; the `out.response.changed()` arm — which the code's
+    /// own comment calls "the ONLY hook for the default editor's text mutation"
+    /// — bumped `edit_gen` alone. `edit_gen` refreshes the gen-keyed minimap and
+    /// spell caches; it does NOT clear `rope_buf`. So the pre-switch rope stayed
+    /// alive across every default-editor keystroke, and because `frame_tick`
+    /// rebuilds only when `rope_buf.is_none()`, switching the rope editor back
+    /// on resurrected the stale content over what the user had just typed.
+    ///
+    /// User-visible path: Settings → toggle "Experimental rope editor" OFF →
+    /// type → toggle it back ON → the first content edit destroys the typing.
+    #[test]
+    fn the_default_editor_invalidates_the_persistent_rope() {
+        let mut app = ScribeApp::new_test(rope_path_config());
+        let (_dir, idx) = open_rope_backed_rs_file(&mut app);
+
+        // The rope is built and live — the state after using the rope editor.
+        run_frames(&mut app, 3);
+        assert!(
+            app.tabs[idx].rope_buf.is_some(),
+            "precondition — a live persistent rope must exist before the switch"
+        );
+
+        switch_to_default_editor_path(&mut app, idx);
+        run_frames(&mut app, 2);
+        assert!(
+            app.tabs[idx].rope_buf.is_some(),
+            "precondition — switching editors must not itself clear the rope, or \
+             this test would pass for the wrong reason"
+        );
+
+        let before = app.tabs[idx].text.clone();
+        type_into_the_default_editor(&mut app, idx, "Z");
+        assert_ne!(
+            before, app.tabs[idx].text,
+            "precondition — the keystroke must actually reach the default editor \
+             and change the buffer, or the assertion below proves nothing"
+        );
+
+        assert!(
+            app.tabs[idx].rope_buf.is_none(),
+            "the default editor changed `text` but left the PRE-edit rope alive — \
+             switching the rope editor back on would write that stale rope over \
+             `text` and silently destroy the user's typing"
+        );
+    }
+
+    /// The same defect at the grid/split-pane writer, which has its own
+    /// `out.response.changed()` arm and had the identical bare `edit_gen` bump.
+    ///
+    /// Asserted STRUCTURALLY, not behaviourally, and deliberately so. Driving a
+    /// real grid pane needs a laid-out split in a headless frame; the obvious
+    /// shortcut — having the test call `note_text_mutated` itself and then
+    /// assert the rope is gone — would be asserting the test's own copy of the
+    /// writer. That passes whatever `grid_methods` does, which is worse than no
+    /// test. This instead reads the writer and requires the invalidating call
+    /// to be present in the arm, which is the property that was missing.
+    #[test]
+    fn the_grid_pane_changed_arm_invalidates_the_rope() {
+        let src = include_str!("grid_methods.rs");
+        let arm = src
+            .split("if out.response.changed()")
+            .nth(1)
+            .expect("the grid pane writer must still have a `.changed()` arm");
+        let body = &arm[..arm.find('}').expect("the arm must have a body")];
+        assert!(
+            body.contains("note_text_mutated"),
+            "the grid pane's `.changed()` arm mutates `text` but does not call \
+             `note_text_mutated`, so it leaves the pre-edit `rope_buf` alive — \
+             the same silent write-back data loss the single-pane writer had. \
+             Arm body was: {body:?}"
+        );
+    }
+
     #[test]
     fn accept_completion_invalidates_the_persistent_rope() {
         assert_in_place_splice_invalidates_the_rope(

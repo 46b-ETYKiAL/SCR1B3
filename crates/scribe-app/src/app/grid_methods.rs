@@ -470,8 +470,12 @@ impl ScribeApp {
                     let out = editor.show(ui);
                     // Wave-3: per-pane edit-gen bump (grid panes share the
                     // single-slot caches; a focus/edit change is a key change).
+                    // The full invalidation, not just the gen bump: a bare
+                    // `edit_gen` bump leaves a stale `rope_buf` alive and the next
+                    // rope-path frame writes it back over `text`. See
+                    // `Tab::note_text_mutated`.
                     if out.response.changed() {
-                        tabs[idx].edit_gen = tabs[idx].edit_gen.wrapping_add(1);
+                        tabs[idx].note_text_mutated();
                     }
                     // A right-click makes this pane the one the menu's commands
                     // act on — recorded BEFORE the menu is built so the pick is

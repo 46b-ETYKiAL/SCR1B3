@@ -3398,9 +3398,17 @@ impl ScribeApp {
                         // Wave-3: the egui in-place edit happened inside show();
                         // `.changed()` is true exactly on the edited frame, so this
                         // is the ONLY hook for the default editor's text mutation.
-                        // Bump the gen counter so the minimap + spell caches refresh.
+                        //
+                        // It must therefore run the FULL invalidation, not just the
+                        // gen bump. `edit_gen` refreshes the gen-keyed minimap and
+                        // spell caches; it does NOT clear `rope_buf`. A bare bump
+                        // left the pre-switch rope alive, and because the rope path
+                        // rebuilds only when `rope_buf.is_none()`, re-enabling the
+                        // rope editor wrote that stale rope back over `text` and
+                        // silently destroyed the user's typing. Same writer duty as
+                        // `set_text` and the two in-place splicers.
                         if out.response.changed() {
-                            self.tabs[active].edit_gen = self.tabs[active].edit_gen.wrapping_add(1);
+                            self.tabs[active].note_text_mutated();
                         }
                         // P1-3 scroll-past-end: pad blank space below the last
                         // line so it can rest at a comfortable height instead of
