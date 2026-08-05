@@ -3903,6 +3903,83 @@ fn rope_select(app: &mut ScribeApp, a: usize, b: usize) {
     st.edit.goal_col = None;
 }
 
+/// ROPE PATH - a SAME-LENGTH selection replacement must reach `tab.text`.
+///
+/// `show_editable` syncs `tab.text` from the rope only when `EventOutcome::
+/// mutated` is set, and `mutated` used to be derived from `rope.len_chars() !=
+/// len_before`. `editing::insert` deletes the selection before inserting, so
+/// selecting "hello" and typing five characters left the length identical, the
+/// flag false, and the sync skipped. The rope held the edit and PAINTED it
+/// while `tab.text` still held the pre-edit content.
+///
+/// Three separate things are lost by that one flag, so all three are asserted
+/// here -- repairing only the save would still lose the edit on close:
+///
+///   1. the SAVE writes `tab.text`, i.e. pre-edit content;
+///   2. `is_dirty()` compares `text` against the document, so it reports FALSE
+///      and the close guard discards the tab with no "unsaved changes" prompt;
+///   3. the hot-exit backup gates on `is_dirty()`, so the tab is skipped and
+///      the edit is absent from crash recovery too.
+///
+/// The length-CHANGING control below runs the identical harness. It must pass
+/// while the same-length case fails, which is what distinguishes "this path is
+/// broken" from "this harness is broken".
+#[test]
+fn same_length_rope_edit_reaches_text_and_marks_the_tab_dirty() {
+    // Focus the editor, THEN select, then type — the order a user produces and
+    // the order the keyboard path requires (an unfocused editor never receives
+    // the Text event, and the focusing click clears any pre-set selection).
+    fn typed_over_selection(replacement: &str) -> ScribeApp {
+        let (d, mut app) = rope_app("hello world");
+        d.frame(
+            &mut app,
+            egui::Modifiers::NONE,
+            click_events(egui::pos2(300.0, 300.0)),
+        );
+        rope_select(&mut app, 0, 5);
+        d.frame(
+            &mut app,
+            egui::Modifiers::NONE,
+            vec![egui::Event::Text(replacement.to_string())],
+        );
+        app
+    }
+
+    // --- CONTROL: a length-CHANGING replacement through the same harness.
+    let app = typed_over_selection("goodbye");
+    assert_eq!(
+        app.tabs[0].text, "goodbye world",
+        "CONTROL - a length-changing replacement must reach `text`; if this \
+         fails the assertion below proves nothing"
+    );
+
+    // --- THE DEFECT: same length, same harness, same code path.
+    let app = typed_over_selection("HELLO");
+
+    let rope = app.tabs[0]
+        .rope_buf
+        .as_ref()
+        .and_then(scribe_core::buffer::Buffer::as_rope)
+        .map(std::string::ToString::to_string)
+        .expect("precondition - the rope path holds the buffer");
+    assert_eq!(
+        rope, "HELLO world",
+        "precondition - the rope really did take the edit (it is what the user \
+         can SEE on screen)"
+    );
+    assert_eq!(
+        app.tabs[0].text, "HELLO world",
+        "the rope holds the edit and paints it, but `tab.text` was never synced \
+         - a save would write the PRE-EDIT content"
+    );
+    assert!(
+        app.tabs[0].is_dirty(),
+        "the tab must be dirty after an edit: `is_dirty()` compares `text`, so \
+         a stale `text` makes the close guard discard the edit with NO prompt \
+         and makes the hot-exit backup skip the tab entirely"
+    );
+}
+
 /// ROPE PATH - a palette `Cut` must actually remove the selected text.
 #[test]
 fn palette_cut_on_rope_path_removes_the_selected_text() {

@@ -1416,6 +1416,34 @@ pub fn apply_event(
             state.set_carets(carets);
         }};
     }
+    // Wrap a body that WRITES text into the rope, setting `mutated` BY
+    // CONSTRUCTION instead of leaving it to the length-delta derivation at the
+    // end of this function.
+    //
+    // That derivation is a PROXY, and it is blind to a same-length write:
+    // `editing::insert` (and `replace_selection`) delete the selection before
+    // inserting, so replacing an N-char selection with N chars — select "cat",
+    // type/paste/IME-commit "dog" — leaves `len_chars()` identical. The flag
+    // stayed false, `show_editable` never folded it into `content_changed`, and
+    // the app never ran `tab.text = rope.to_string()`. The rope held the edit
+    // and RENDERED it while `tab.text` still held the pre-edit content, so the
+    // edit was absent from the save, from `is_dirty()` (close discards it with
+    // no prompt), and from the hot-exit backup (which gates on `is_dirty()`).
+    //
+    // Only two arms set the flag explicitly before this — Ctrl+U case-toggle
+    // and undo/redo — which is exactly why those two same-length edits worked
+    // and every other one did not.
+    //
+    // An insertion is a content write whether or not the bytes happen to
+    // coincide with what was there, so this can over-report when a selection is
+    // replaced by identical text. That costs one redundant `to_string()` sync;
+    // the opposite error costs the user's work, so the flag fails toward true.
+    macro_rules! writes_content {
+        ($body:expr) => {{
+            $body;
+            out.mutated = true;
+        }};
+    }
     // Move every caret (no text change → no offset management needed).
     macro_rules! move_all {
         ($f:expr) => {{
@@ -1478,21 +1506,25 @@ pub fn apply_event(
                 if state.edit.has_selection() {
                     let sel = editing::selected_text(rope, &state.edit);
                     let wrapped = format!("{text}{sel}{close}");
-                    editing::replace_selection(rope, &mut state.edit, &wrapped);
+                    writes_content!(editing::replace_selection(rope, &mut state.edit, &wrapped));
                 } else {
                     let pair = format!("{text}{close}");
-                    editing::insert(rope, &mut state.edit, &pair);
+                    writes_content!(editing::insert(rope, &mut state.edit, &pair));
                     state.edit.cursor = state.edit.cursor.saturating_sub(1);
                     state.edit.anchor = state.edit.cursor;
                 }
             } else {
-                edit_all!(|r: &mut Rope, st: &mut EditState| editing::insert(r, st, text));
+                writes_content!(edit_all!(|r: &mut Rope, st: &mut EditState| {
+                    editing::insert(r, st, text)
+                }));
             }
             out.consumed = true;
         }
         Event::Paste(text) if !text.is_empty() => {
             record_before!(EditKind::Other);
-            edit_all!(|r: &mut Rope, st: &mut EditState| editing::insert(r, st, text));
+            writes_content!(edit_all!(|r: &mut Rope, st: &mut EditState| {
+                editing::insert(r, st, text)
+            }));
             out.consumed = true;
         }
         // IME composition (CJK, dead-keys, compose). The OS candidate window
@@ -1504,7 +1536,9 @@ pub fn apply_event(
             match ime {
                 egui::ImeEvent::Commit(text) if !text.is_empty() => {
                     record_before!(EditKind::Other);
-                    edit_all!(|r: &mut Rope, st: &mut EditState| editing::insert(r, st, text));
+                    writes_content!(edit_all!(|r: &mut Rope, st: &mut EditState| {
+                        editing::insert(r, st, text)
+                    }));
                 }
                 _ => {}
             }
@@ -1609,9 +1643,11 @@ pub fn apply_event(
                         // whitespace onto the new line.
                         let ws = editing::leading_whitespace(rope, state.edit.cursor);
                         let nl = format!("\n{ws}");
-                        editing::insert(rope, &mut state.edit, &nl);
+                        writes_content!(editing::insert(rope, &mut state.edit, &nl));
                     } else {
-                        edit_all!(|r: &mut Rope, st: &mut EditState| editing::insert(r, st, "\n"));
+                        writes_content!(edit_all!(|r: &mut Rope, st: &mut EditState| {
+                            editing::insert(r, st, "\n")
+                        }));
                     }
                     out.consumed = true;
                 }
@@ -1628,9 +1664,14 @@ pub fn apply_event(
                         // Tab indents every line of a multi-line selection.
                         editing::indent_lines(rope, &mut state.edit, "    ", false);
                     } else {
-                        edit_all!(|r: &mut Rope, st: &mut EditState| editing::insert(
-                            r, st, "    "
-                        ));
+                        // Tab over an N-char selection inserts 4 chars — with a
+                        // 4-char selection that is another same-length write.
+                        // (The two `indent_lines` branches above stay
+                        // length-derived: an outdent with nothing to remove is a
+                        // genuine no-op and must NOT report a change.)
+                        writes_content!(edit_all!(|r: &mut Rope, st: &mut EditState| {
+                            editing::insert(r, st, "    ");
+                        }));
                     }
                     out.consumed = true;
                 }
@@ -1756,8 +1797,17 @@ pub fn apply_event(
         }
         _ => {}
     }
-    // Most edits change length — derive `mutated` from that, OR'd with the
-    // explicit same-length flags set above.
+    // BACKSTOP ONLY — never the primary signal. Every arm that WRITES text sets
+    // `mutated` explicitly (via `writes_content!`, plus the two long-standing
+    // explicit sites: Ctrl+U case-toggle and undo/redo). This length delta
+    // catches the delete-class ops (backspace, delete, delete-line, outdent),
+    // which are the ops that can legitimately be NO-OPS — at a buffer edge, or
+    // outdenting a line with no leading whitespace — and so must report false
+    // when nothing happened.
+    //
+    // It must not be relied on for writes: a same-length replacement leaves the
+    // delta at zero, and treating that as "no change" is the false negative
+    // that silently discarded the user's edit.
     out.mutated = out.mutated || rope.len_chars() != len_before;
     // Bump the edit generation on any real content change so the
     // highlight cache (keyed on `edit_gen`) recomputes exactly once per edit —
@@ -2537,6 +2587,184 @@ mod tests {
         // Select-all (Cmd+A) is selection-only — no content change.
         let out = apply_event(&mut r, &mut st, &key_ev(egui::Key::A, false, true));
         assert!(!out.mutated, "select-all must not flag a content change");
+    }
+
+    /// A selection replaced by text of the SAME LENGTH is still a content
+    /// change. `mutated` was derived from `rope.len_chars() != len_before`, a
+    /// PROXY that is blind to exactly this case: `editing::insert` deletes the
+    /// selection then inserts, so replacing a 3-char selection with 3 chars
+    /// leaves the length identical and the flag false.
+    ///
+    /// `mutated` is what `show_editable` folds into `content_changed`, which is
+    /// what makes the app run `tab.text = rope.to_string()`. False here means
+    /// the rope holds the user's edit and RENDERS it while `tab.text` — what
+    /// gets saved, what `is_dirty()` compares, what the hot-exit backup writes —
+    /// still holds the pre-edit content.
+    ///
+    /// Every selection-replacing path goes through `editing::insert`, so all
+    /// three are asserted. Each is paired with a LENGTH-CHANGING control
+    /// through the identical call, so a regression that broke the whole flag
+    /// (rather than just the same-length case) cannot masquerade as this bug,
+    /// and a test that passed for an unrelated reason is ruled out.
+    #[test]
+    fn same_length_selection_replacement_flags_a_content_change() {
+        // Select [0,3) — "cat" — and replace it with an equal-length word.
+        let select_cat = |st: &mut RopeEditorState| {
+            st.edit = EditState {
+                anchor: 0,
+                cursor: 3,
+                goal_col: None,
+            };
+        };
+
+        for (label, event) in [
+            ("typed text", text_event("dog")),
+            ("paste", egui::Event::Paste("dog".to_string())),
+            (
+                "IME commit",
+                egui::Event::Ime(egui::ImeEvent::Commit("dog".to_string())),
+            ),
+        ] {
+            // --- control: a LENGTH-CHANGING replacement through the same call.
+            // If this ever fails, the harness is broken and the real assertion
+            // below would be vacuous.
+            let mut r = Rope::from_str("cat\n");
+            let mut st = RopeEditorState::new();
+            select_cat(&mut st);
+            let longer = match &event {
+                egui::Event::Text(_) => text_event("horse"),
+                egui::Event::Paste(_) => egui::Event::Paste("horse".to_string()),
+                _ => egui::Event::Ime(egui::ImeEvent::Commit("horse".to_string())),
+            };
+            let out = apply_event(&mut r, &mut st, &longer);
+            assert_eq!(r.to_string(), "horse\n", "{label}: control must edit");
+            assert!(
+                out.mutated,
+                "{label}: CONTROL — a length-CHANGING replacement must flag a \
+                 content change; if this fails the case below proves nothing"
+            );
+
+            // --- the defect: same length, same code path.
+            let mut r = Rope::from_str("cat\n");
+            let mut st = RopeEditorState::new();
+            select_cat(&mut st);
+            let out = apply_event(&mut r, &mut st, &event);
+            assert_eq!(
+                r.to_string(),
+                "dog\n",
+                "{label}: precondition — the buffer really was edited"
+            );
+            assert!(
+                out.mutated,
+                "{label}: a same-length selection replacement changed the buffer \
+                 but reported mutated == false — `tab.text` is never synced, so \
+                 the on-screen edit is absent from a save, from is_dirty(), and \
+                 from the hot-exit backup"
+            );
+        }
+    }
+
+    /// Enter and Tab replace a selection too, so they carry the identical
+    /// same-length blindness: Enter over a 1-char selection writes "\n", Tab
+    /// over a 4-char selection writes four spaces. Both leave `len_chars()`
+    /// unchanged.
+    ///
+    /// This is the guard against the fix being whack-a-mole — a future arm that
+    /// writes through the length heuristic instead of `writes_content!` fails
+    /// here.
+    #[test]
+    fn same_length_enter_and_tab_replacements_flag_a_content_change() {
+        // Enter over exactly one selected char: "a" -> "\n", length unchanged.
+        let mut r = Rope::from_str("abc");
+        let mut st = RopeEditorState::new();
+        st.edit = EditState {
+            anchor: 0,
+            cursor: 1,
+            goal_col: None,
+        };
+        let out = apply_event(&mut r, &mut st, &key_ev(egui::Key::Enter, false, false));
+        assert_eq!(r.to_string(), "\nbc", "precondition — Enter replaced it");
+        assert_eq!(r.len_chars(), 3, "precondition — the length did NOT change");
+        assert!(
+            out.mutated,
+            "Enter replacing a 1-char selection with a newline is a content \
+             change the length delta cannot see"
+        );
+
+        // Tab over exactly four selected chars: "abcd" -> "    ", unchanged.
+        let mut r = Rope::from_str("abcdef");
+        let mut st = RopeEditorState::new();
+        st.edit = EditState {
+            anchor: 0,
+            cursor: 4,
+            goal_col: None,
+        };
+        let out = apply_event(&mut r, &mut st, &key_ev(egui::Key::Tab, false, false));
+        assert_eq!(r.to_string(), "    ef", "precondition — Tab replaced it");
+        assert_eq!(r.len_chars(), 6, "precondition — the length did NOT change");
+        assert!(
+            out.mutated,
+            "Tab replacing a 4-char selection with an indent is a content change \
+             the length delta cannot see"
+        );
+    }
+
+    /// The backstop must still report NO change for a genuine no-op, or the
+    /// fix would have simply pinned `mutated` to true and made the flag
+    /// meaningless (every caret move syncing the whole buffer, and `is_dirty()`
+    /// true on an untouched file).
+    #[test]
+    fn genuine_no_ops_still_report_no_content_change() {
+        // Backspace at offset 0 with no selection removes nothing.
+        let mut r = Rope::from_str("abc");
+        let mut st = RopeEditorState::new();
+        st.edit = EditState::at(0);
+        let out = apply_event(&mut r, &mut st, &key_ev(egui::Key::Backspace, false, false));
+        assert_eq!(r.to_string(), "abc", "precondition — nothing was removed");
+        assert!(
+            !out.mutated,
+            "backspace at the start of the buffer changed nothing and must not \
+             report a content change"
+        );
+
+        // Shift+Tab on a line with no leading whitespace removes nothing.
+        let mut r = Rope::from_str("abc\n");
+        let mut st = RopeEditorState::new();
+        st.edit = EditState::at(1);
+        let out = apply_event(&mut r, &mut st, &key_ev(egui::Key::Tab, true, false));
+        assert_eq!(
+            r.to_string(),
+            "abc\n",
+            "precondition — nothing was outdented"
+        );
+        assert!(
+            !out.mutated,
+            "an outdent with nothing to remove must not report a content change"
+        );
+    }
+
+    /// The same blindness, one layer up: `edit_gen` is bumped only when
+    /// `mutated` is set, so a same-length replacement also failed to
+    /// invalidate every `edit_gen`-keyed cache (highlight, minimap,
+    /// spellcheck, change-bar).
+    #[test]
+    fn same_length_selection_replacement_bumps_the_edit_generation() {
+        let mut r = Rope::from_str("cat\n");
+        let mut st = RopeEditorState::new();
+        st.edit = EditState {
+            anchor: 0,
+            cursor: 3,
+            goal_col: None,
+        };
+        let before = st.edit_gen;
+        apply_event(&mut r, &mut st, &text_event("dog"));
+        assert_eq!(r.to_string(), "dog\n", "precondition — the buffer changed");
+        assert_ne!(
+            st.edit_gen, before,
+            "a same-length replacement must bump edit_gen — every cache keyed \
+             on it (highlight, minimap, spellcheck, change bar) otherwise keeps \
+             serving pre-edit content"
+        );
     }
 
     /// IME composition: a `Commit` inserts the finalised text at the caret
