@@ -217,7 +217,9 @@ mod tests {
         assert!(!is_clickable_url("file:///etc/passwd"));
         assert!(!is_clickable_url("javascript:alert(1)"));
         assert!(!is_clickable_url("data:text/html,<script>"));
-        assert!(!is_clickable_url("mailto:a@b.com"));
+        // RFC 2606 reserved documentation domain — see `md_ops`' note: a public
+        // repo must not carry anything that reads as a real mailbox.
+        assert!(!is_clickable_url("mailto:a@example.com"));
         assert!(!is_clickable_url("ftp://example.com"));
         assert!(!is_clickable_url(""));
     }
