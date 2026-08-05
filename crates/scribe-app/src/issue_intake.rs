@@ -305,11 +305,27 @@ pub fn open_mailto(alias: &str, subject: &str, body: &str) -> IntakeOutcome {
 /// `issue-intake` category (counts/enums only — the stable `log_detail`, NEVER
 /// the body text, the URL, the repo, or any persistent identifier). Honours
 /// `S4F3_DISABLE_TELEMETRY=1` by emitting nothing. Best-effort; never blocks.
-pub fn log_outcome(outcome: &IntakeOutcome) {
+///
+/// The sink is a PARAMETER, not a hard-wired call. Production passes
+/// [`crate::action_log::record`]; tests pass a capturing closure. That is what
+/// makes the only logic here — the opt-out gate and the forwarded
+/// `(category, detail)` payload — observable, and therefore killable by a test.
+///
+/// Hard-wiring `action_log::record` instead would make this function untestable
+/// and unkillable: `record` writes through a process-global, first-caller-wins
+/// `OnceLock` path cache, so under a shared test process whichever test runs
+/// first fixes the cached path for the whole binary and no later test can
+/// deterministically observe the write. A whole-body mutant (`log_outcome ->
+/// ()`) then survives every test — which is exactly what it did, silently,
+/// while an unrelated file-unqualified pardon written for [`crate::reporting`]
+/// happened to cover it. Injecting the sink closes that gap with a test rather
+/// than a second pardon. The residual untested surface is the caller's
+/// zero-logic `record` function reference, which has no behaviour to assert.
+pub fn log_outcome(outcome: &IntakeOutcome, sink: impl FnOnce(&str, &str)) {
     if std::env::var_os("S4F3_DISABLE_TELEMETRY").is_some() {
         return;
     }
-    crate::action_log::record("issue-intake", outcome.log_detail());
+    sink("issue-intake", outcome.log_detail());
 }
 
 #[cfg(test)]
@@ -557,32 +573,83 @@ mod tests {
         );
     }
 
+    /// Every outcome variant.
+    fn all_outcomes() -> Vec<IntakeOutcome> {
+        vec![
+            IntakeOutcome::OpenedDeepLink,
+            IntakeOutcome::CopiedToClipboard,
+            IntakeOutcome::OpenedMailto,
+            IntakeOutcome::Failed("clipboard unavailable".into()),
+        ]
+    }
+
     #[test]
     fn log_outcome_is_suppressed_when_telemetry_disabled() {
         // With S4F3_DISABLE_TELEMETRY set, log_outcome must early-return and emit
-        // nothing — the explicit opt-out of any local diagnostic logging. We can't
-        // observe the action-log sink directly here, but we CAN assert the call is
-        // a safe no-op (never panics) under the disable flag, exercising the guard.
-        struct TelemetryGuard {
-            prev: Option<std::ffi::OsString>,
-        }
-        impl Drop for TelemetryGuard {
-            fn drop(&mut self) {
-                match &self.prev {
-                    Some(v) => std::env::set_var("S4F3_DISABLE_TELEMETRY", v),
-                    None => std::env::remove_var("S4F3_DISABLE_TELEMETRY"),
-                }
+        // NOTHING. The previous version of this test could only assert "does not
+        // panic" — which a no-op body satisfies just as well as the real one, so
+        // it proved nothing about suppression. With the sink injected, absence of
+        // the call is directly observable: the sink panics if it is ever reached.
+        crate::test_config_env::with_telemetry_opt_out(true, || {
+            for outcome in all_outcomes() {
+                log_outcome(&outcome, |category, detail| {
+                    panic!(
+                        "the telemetry opt-out must suppress the sink entirely, \
+                         but it was called with ({category:?}, {detail:?})"
+                    )
+                });
             }
-        }
-        let _g = TelemetryGuard {
-            prev: std::env::var_os("S4F3_DISABLE_TELEMETRY"),
-        };
-        std::env::set_var("S4F3_DISABLE_TELEMETRY", "1");
-        // Exercises the early-return guard for every outcome variant.
-        log_outcome(&IntakeOutcome::OpenedDeepLink);
-        log_outcome(&IntakeOutcome::CopiedToClipboard);
-        log_outcome(&IntakeOutcome::OpenedMailto);
-        log_outcome(&IntakeOutcome::Failed("clipboard unavailable".into()));
+        });
+    }
+
+    #[test]
+    fn log_outcome_forwards_category_and_detail_when_telemetry_enabled() {
+        // Telemetry enabled (opt-out unset) => every outcome's stable, non-PII
+        // detail reaches the sink under the "issue-intake" category.
+        //
+        // This is the test that kills `replace log_outcome with ()`. That mutant
+        // survived the whole suite until now: the only test covering this
+        // function ran it under the DISABLE flag, where the real body and a
+        // no-op body are indistinguishable. A gate is only tested when both of
+        // its directions are asserted.
+        crate::test_config_env::with_telemetry_opt_out(false, || {
+            let mut captured: Vec<(String, String)> = Vec::new();
+            for outcome in all_outcomes() {
+                log_outcome(&outcome, |category, detail| {
+                    captured.push((category.to_string(), detail.to_string()));
+                });
+            }
+            assert_eq!(
+                captured,
+                vec![
+                    ("issue-intake".to_string(), "deep-link".to_string()),
+                    ("issue-intake".to_string(), "clipboard".to_string()),
+                    ("issue-intake".to_string(), "mailto".to_string()),
+                    ("issue-intake".to_string(), "failed".to_string()),
+                ],
+                "an enabled telemetry gate forwards (category, detail) for every \
+                 outcome variant"
+            );
+        });
+    }
+
+    #[test]
+    fn the_forwarded_detail_carries_no_failure_payload() {
+        // `Failed` wraps a runtime String that can embed a system error message.
+        // The forwarded detail must stay the stable enum token, never that
+        // payload — the privacy invariant this module exists to hold.
+        crate::test_config_env::with_telemetry_opt_out(false, || {
+            let secret = "could not open mail client: C:/Users/someone/mail.exe";
+            let mut captured = Vec::new();
+            log_outcome(&IntakeOutcome::Failed(secret.into()), |_c, detail| {
+                captured.push(detail.to_string());
+            });
+            assert_eq!(captured, vec!["failed".to_string()]);
+            assert!(
+                !captured[0].contains("someone") && !captured[0].contains("mail client"),
+                "the failure payload must never reach the action log: {captured:?}"
+            );
+        });
     }
 
     #[test]

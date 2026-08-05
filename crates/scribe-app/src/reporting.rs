@@ -502,6 +502,10 @@ mod tests {
         // the call must still return the structured outcome without panicking.
         // Serialized on ENDPOINT_LOCK because it mutates process env.
         let _lock = ENDPOINT_LOCK.lock().unwrap();
+        // The telemetry opt-out is process-global and ALSO mutated by
+        // `issue_intake`; ENDPOINT_LOCK excludes only this module, so the
+        // crate-wide guard is what actually serialises the two.
+        let _tele_lock = crate::test_config_env::telemetry_env_guard();
         let _endpoint = EnvGuard::unset(REPORT_ENDPOINT_ENV);
         let _telemetry = EnvGuard::set("S4F3_DISABLE_TELEMETRY", "1");
         let r = build_crash_report("boom", "src/x.rs:1");
@@ -538,6 +542,7 @@ mod tests {
         // in log_outcome routes through the process-global action_log path cache,
         // so the forwarding logic is proven here with a capturing sink instead.
         let _lock = ENDPOINT_LOCK.lock().unwrap();
+        let _tele_lock = crate::test_config_env::telemetry_env_guard();
         let _telemetry = EnvGuard::unset("S4F3_DISABLE_TELEMETRY");
         let mut captured: Vec<(String, String)> = Vec::new();
         log_outcome_with(&ReportOutcome::Spooled, |category, detail| {
@@ -558,6 +563,7 @@ mod tests {
         // disable_telemetry_suppresses_outcome_logging test can only observe the
         // returned outcome, not the suppressed side effect — this asserts it.)
         let _lock = ENDPOINT_LOCK.lock().unwrap();
+        let _tele_lock = crate::test_config_env::telemetry_env_guard();
         let _telemetry = EnvGuard::set("S4F3_DISABLE_TELEMETRY", "1");
         let mut called = false;
         log_outcome_with(&ReportOutcome::Sent, |_category, _detail| {
