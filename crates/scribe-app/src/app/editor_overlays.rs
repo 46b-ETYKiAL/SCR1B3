@@ -282,7 +282,12 @@ impl ScribeApp {
         if c.prefix_start <= byte && byte <= text.len() && text.is_char_boundary(c.prefix_start) {
             text.replace_range(c.prefix_start..byte, &item);
         }
-        self.tabs[active].edit_gen = self.tabs[active].edit_gen.wrapping_add(1);
+        // The in-place splice above mutates `text` outside the `set_text` seam,
+        // so it owes the buffer the SAME invalidation — not just the `edit_gen`
+        // bump this used to do alone. A bare bump leaves `rope_buf` holding
+        // pre-completion content; if this ever runs on a rope-backed tab the
+        // next write-back restores it over the accepted completion.
+        self.tabs[active].note_text_mutated();
     }
 
     /// 0-based lines of the active buffer carrying a change-bar state, as

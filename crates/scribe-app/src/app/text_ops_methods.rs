@@ -1062,6 +1062,98 @@ mod rope_writeback_tests {
         });
     }
 
+    // ---- The two in-place splicers that also skipped the seam ----
+    //
+    // `accept_completion` and the multi-cursor replay mutate `text` IN PLACE
+    // (`replace_range` / `apply_edit`), so they cannot call `set_text` without
+    // cloning the buffer — but they owe it the identical invalidation. Both
+    // used to do only the `edit_gen` bump. `note_text_mutated` is that shared
+    // invalidation; these tests pin it at the call site, because a stale
+    // `rope_buf` is the precondition for the write-back that destroys an edit.
+
+    /// Rebuild the rope, then prove `f` left NO stale rope behind.
+    fn assert_in_place_splice_invalidates_the_rope(
+        label: &str,
+        setup: impl FnOnce(&mut ScribeApp, usize),
+        splice: impl FnOnce(&mut ScribeApp, usize),
+    ) {
+        let mut app = ScribeApp::new_test(rope_path_config());
+        let (_dir, idx) = open_rope_backed_rs_file(&mut app);
+        run_frames(&mut app, 3);
+        setup(&mut app, idx);
+        // Frames AFTER the setup, so the rope is rebuilt and live at the moment
+        // of the splice. Without this the rope would already be `None` and the
+        // test would pass for the wrong reason.
+        run_frames(&mut app, 2);
+        assert!(
+            app.tabs[idx].rope_buf.is_some(),
+            "{label}: precondition — a live persistent rope must exist"
+        );
+        let before = app.tabs[idx].text.clone();
+
+        splice(&mut app, idx);
+
+        assert_ne!(
+            before, app.tabs[idx].text,
+            "{label}: precondition — the splice must actually change the buffer"
+        );
+        assert!(
+            app.tabs[idx].rope_buf.is_none(),
+            "{label}: the splice left the PRE-splice rope alive — the next \
+             content edit's `tab.text = rope.to_string()` write-back would \
+             overwrite `text` with it and destroy the edit"
+        );
+    }
+
+    #[test]
+    fn accept_completion_invalidates_the_persistent_rope() {
+        assert_in_place_splice_invalidates_the_rope(
+            "accept-completion",
+            |app, idx| {
+                // A completable prefix ("val" → "value"/"valuer") appended to
+                // the rope-sized fixture.
+                let base = app.tabs[idx].text.clone();
+                app.tabs[idx].set_text(format!("{base}value valuer val"));
+            },
+            |app, idx| {
+                let ci = app.tabs[idx].text.chars().count();
+                app.open_completion(idx, Some(ci));
+                assert!(
+                    app.completion.is_some(),
+                    "precondition — the completion popup must open"
+                );
+                app.accept_completion(idx, Some(ci));
+            },
+        );
+    }
+
+    #[test]
+    fn multi_cursor_replay_invalidates_the_persistent_rope() {
+        assert_in_place_splice_invalidates_the_rope(
+            "multi-cursor-replay",
+            |app, _idx| {
+                // A second caret is what makes `multi_cursor.is_active()` true,
+                // which is the gate `handle_multi_cursor_keys` returns on.
+                app.multi_cursor
+                    .add_caret(crate::multi_cursor::Caret::at(11));
+            },
+            |app, idx| {
+                let editor_id = super::super::grid_methods::pane_editor_id(app.tabs[idx].doc_id);
+                let ctx = egui::Context::default();
+                // egui's own caret state for that editor id: the replay reads it
+                // as the primary caret and refuses to run without it.
+                super::super::multi_cursor_glue::mc_set_primary(&ctx, editor_id, 0, 0);
+                let input = egui::RawInput {
+                    events: vec![text_event("X")],
+                    ..Default::default()
+                };
+                let _ = ctx.run(input, |ctx| {
+                    app.handle_multi_cursor_keys(ctx, editor_id, idx);
+                });
+            },
+        );
+    }
+
     // ---- Defect 2: undo after an external edit on the rope path ----
 
     /// Types through the REAL `scribe_render::apply_event` path (so the undo

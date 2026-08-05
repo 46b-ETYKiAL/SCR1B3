@@ -481,6 +481,21 @@ impl EditorTab {
     /// must NOT go through here, or it would discard its own live buffer.
     fn set_text(&mut self, new: String) {
         self.text = new;
+        self.note_text_mutated();
+    }
+
+    /// The same invalidation `set_text` performs, for the few callers that
+    /// must splice `text` IN PLACE rather than replace it wholesale
+    /// (`accept_completion`'s `replace_range`, the multi-cursor replay's
+    /// `apply_edit` loop). Those callers cannot hand `set_text` an owned
+    /// `String` without cloning the whole buffer, but they owe the buffer the
+    /// identical invalidation — a bare `edit_gen` bump refreshes the gen-keyed
+    /// caches while leaving a stale `rope_buf`/`rope_state` alive, which is the
+    /// write-back data loss `set_text` exists to prevent.
+    ///
+    /// Keeping ONE implementation (`set_text` delegates here) is the point:
+    /// two hand-maintained invalidation lists drift, and the drift is silent.
+    fn note_text_mutated(&mut self) {
         self.rope_buf = None;
         self.invalidate_rope_state();
         self.edit_gen = self.edit_gen.wrapping_add(1);
