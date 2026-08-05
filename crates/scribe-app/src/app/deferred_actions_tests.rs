@@ -275,6 +275,115 @@ fn toggle_minimap_flips_the_setting_and_persists_it() {
         .exists());
 }
 
+// ---- CycleTheme: the palette must REPAINT, not only persist ----
+//
+// `self.theme` — the struct the window actually paints from — is assigned in
+// exactly ONE place in the crate: `reapply_theme` (theme_visuals.rs). The
+// palette's `BuiltinCommand::CycleTheme` arm wrote `config.appearance.theme`
+// and saved it without ever reaching that assignment, so the theme persisted
+// to disk while the window kept rendering the previous one until restart. The
+// keyboard shortcut, which called `reapply_theme`, worked.
+//
+// Nothing downstream rescued it: the visuals watcher keys on
+// `visuals_signature()`, which hashes `self.theme.name` (unmoved), and
+// `reload_config_from_disk` early-returns on `cfg == self.config` because
+// `save_config` had just written that config.
+//
+// Every pre-existing CycleTheme test asserts `config.appearance.theme` — which
+// was correct the whole time. That is exactly why three of them passed over
+// this. These assert `app.theme.name`.
+
+/// Like [`app`], but with OS-theme following OFF so `effective_theme_name`
+/// cannot substitute `ghost-paper` / `wired-noir` for the cycled name — the
+/// assertions below are about the palette wire, not the OS-follow branch.
+fn painted_theme_app() -> (ScribeApp, egui::Context) {
+    let mut cfg = Config::default();
+    cfg.editor.first_run_completed = true;
+    cfg.appearance.follow_os_theme = false;
+    (ScribeApp::new_test(cfg), egui::Context::default())
+}
+
+#[test]
+fn palette_cycle_theme_repaints_the_window_not_only_the_config() {
+    let (mut app, ctx) = painted_theme_app();
+    assert_eq!(
+        app.theme.name, app.config.appearance.theme,
+        "precondition — the painted theme starts in step with the config"
+    );
+    let before = app.theme.name.clone();
+
+    // The real palette wire: a builtin selected in the palette arrives as
+    // `DeferredFlags::run_builtin`.
+    let mut f = flags();
+    f.run_builtin = Some(BuiltinCommand::CycleTheme);
+    apply_flags(&mut app, &ctx, f);
+
+    assert_ne!(
+        app.theme.name, before,
+        "the palette entry left the window painting the OLD theme — it wrote \
+         the config and never reached the one place `self.theme` is assigned"
+    );
+    assert_eq!(
+        app.theme.name, app.config.appearance.theme,
+        "the painted theme must be the one that was persisted"
+    );
+}
+
+#[test]
+fn execute_builtin_stages_the_theme_change_and_the_frame_drain_applies_it() {
+    // `execute_builtin` takes no `ctx`, so it can only STAGE the repaint; the
+    // every-frame `drain_pending_editor_action` is the catch-all that applies
+    // it for the dispatch sites that are not the deferred-action path.
+    let (mut app, ctx) = painted_theme_app();
+    let before = app.theme.name.clone();
+
+    app.execute_builtin(BuiltinCommand::CycleTheme);
+    assert_ne!(
+        app.config.appearance.theme, before,
+        "the config advances immediately"
+    );
+    assert_eq!(
+        app.theme.name, before,
+        "but the painted theme cannot change without a ctx"
+    );
+
+    app.drain_pending_editor_action(&ctx);
+    assert_eq!(
+        app.theme.name, app.config.appearance.theme,
+        "the drain applies the staged repaint"
+    );
+}
+
+#[test]
+fn keyboard_and_palette_cycle_theme_land_on_the_same_painted_theme() {
+    // The drift this defect was: both surfaces agreed on the config and
+    // disagreed on what the window showed.
+    let (mut kbd, kctx) = painted_theme_app();
+    apply(
+        &mut kbd,
+        &kctx,
+        &mut Pending {
+            cycle_theme: true,
+            ..Default::default()
+        },
+    );
+
+    let (mut pal, pctx) = painted_theme_app();
+    let mut f = flags();
+    f.run_builtin = Some(BuiltinCommand::CycleTheme);
+    apply_flags(&mut pal, &pctx, f);
+
+    assert_eq!(
+        kbd.config.appearance.theme, pal.config.appearance.theme,
+        "both surfaces persist the same theme"
+    );
+    assert_eq!(
+        kbd.theme.name, pal.theme.name,
+        "and both must PAINT it — this is the assertion the drift hid from"
+    );
+    assert_eq!(pal.theme.name, pal.config.appearance.theme);
+}
+
 #[test]
 fn cycle_theme_advances_to_the_next_builtin_and_persists_it() {
     let (mut app, ctx) = app();

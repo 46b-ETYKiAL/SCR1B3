@@ -111,6 +111,21 @@ impl ScribeApp {
         self.apply_motion_style(ctx);
     }
 
+    /// Apply a theme change requested by a surface that had no `ctx`
+    /// (`execute_builtin(CycleTheme)` — the command palette). Idempotent: the
+    /// flag is taken, so a second call in the same frame is a no-op.
+    ///
+    /// This is what keeps the palette entry and the keyboard shortcut on ONE
+    /// theme-assignment path. Without it the palette wrote the config and the
+    /// window kept painting the previous theme — invisible to the three tests
+    /// that assert `config.appearance.theme`, because the config was correct.
+    pub(super) fn drain_pending_theme_reapply(&mut self, ctx: &egui::Context) {
+        if std::mem::take(&mut self.pending_theme_reapply) {
+            self.reapply_theme(ctx);
+            ctx.request_repaint();
+        }
+    }
+
     /// Push the `motion` preferences into egui's global style. Motion off zeroes
     /// the animation time (instant transitions, no hover fades — idle frames
     /// cost the same as plain egui) and stops the caret blinking; otherwise the

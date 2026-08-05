@@ -818,6 +818,19 @@ pub struct ScribeApp {
     pending_jump_bracket: bool,
     pending_insert_datetime: bool,
     pending_dup_selection: bool,
+    /// Set by `execute_builtin(CycleTheme)`, drained by
+    /// [`Self::drain_pending_theme_reapply`] once a `ctx` is in hand.
+    ///
+    /// `reapply_theme` is the ONLY place `self.theme` is ever assigned
+    /// (`theme_visuals.rs`), and it needs a `ctx`. `execute_builtin` has none,
+    /// so the palette entry could only write `config.appearance.theme` and
+    /// save it — leaving the window painting the OLD theme until restart. The
+    /// visuals watcher cannot rescue that: `visuals_signature()` hashes
+    /// `self.theme.name`, which has not moved, and `reload_config_from_disk`
+    /// early-returns because `save_config` just wrote the config it compares
+    /// against. Hence a pending flag rather than a second theme-assignment
+    /// site — one writer, both surfaces.
+    pending_theme_reapply: bool,
     /// P0-1 — toggle the GFM task checkbox on the caret / selection lines.
     pending_toggle_task: bool,
     /// P0-4 — wrap the selection in this inline marker (`**`, `*`, `` ` ``,
@@ -1432,6 +1445,7 @@ impl ScribeApp {
             pending_jump_bracket: false,
             pending_insert_datetime: false,
             pending_dup_selection: false,
+            pending_theme_reapply: false,
             pending_toggle_task: false,
             pending_wrap_marker: None,
             pending_case: None,

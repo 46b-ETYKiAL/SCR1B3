@@ -10,10 +10,25 @@ use super::*;
 impl ScribeApp {
     /// Dispatch a [`BuiltinCommand`] selected from the command palette.
     ///
-    /// Every editor action surfaced in `BUILTIN_COMMANDS` routes through here
-    /// so the keyboard shortcut and the palette entry produce identical state
-    /// changes (no drift between the two surfaces). Touches `self.config`
-    /// then persists via `save_config` so toggles survive a restart.
+    /// SCOPE — read this before assuming a shortcut and its palette entry share
+    /// an implementation. This is the palette's dispatch route, NOT a universal
+    /// one. The keyboard path is a separate surface: `keyboard_input` sets
+    /// `Pending` (`act.*`) flags that `apply_deferred_actions` handles with its
+    /// own handler per action, and a few shortcuts (`TOGGLE_ZEN`,
+    /// `TOGGLE_MD_PREVIEW`) are re-implemented inline in `keyboard_input`
+    /// without touching either. So an `act.*` action has TWO implementations,
+    /// and they can drift — which is precisely what happened to CycleTheme:
+    /// the `act.cycle_theme` copy called `reapply_theme`, this one did not, and
+    /// the palette entry persisted a theme the window never painted. That arm
+    /// now delegates here, so CycleTheme has one implementation; the rest of
+    /// the `act.*` set does not, and this comment does not claim otherwise.
+    ///
+    /// Commands that need an egui `ctx` (which this method does not take) set a
+    /// `pending_*` flag for a drain that has one — see `pending_theme_reapply`
+    /// and the caret-command bridges.
+    ///
+    /// Touches `self.config` then persists via `save_config` so toggles survive
+    /// a restart.
     pub(super) fn execute_builtin(&mut self, cmd: BuiltinCommand) {
         // Action-log every command dispatch so a session is diagnosable: a
         // command the user invoked that "did nothing" still leaves a trace here.
@@ -121,6 +136,13 @@ impl ScribeApp {
                     let next = names[(idx + 1) % names.len()].to_string();
                     self.config.appearance.theme = next.clone();
                     self.save_config();
+                    // Writing the config name is only half of a theme change:
+                    // `self.theme` (what the window actually paints from) is
+                    // assigned in exactly ONE place — `reapply_theme` — and
+                    // that needs a `ctx` this method does not have. Without
+                    // this flag the palette entry persisted the new theme and
+                    // the window kept rendering the old one until restart.
+                    self.pending_theme_reapply = true;
                     self.status = format!("theme: {next}");
                 }
             }
@@ -316,6 +338,10 @@ impl ScribeApp {
     ///   that cannot be named from here, so the event is pushed WITHOUT
     ///   touching focus: whichever pane the user is in handles it.
     pub(super) fn drain_pending_editor_action(&mut self, ctx: &egui::Context) {
+        // A `ctx`-less command (the palette's CycleTheme) that needs one. Kept
+        // here with the other pending_* drains so every dispatch site of
+        // `execute_builtin` is covered by a single drain rather than three.
+        self.drain_pending_theme_reapply(ctx);
         // A right-click pick on the ROPE editor's context menu arrives as a
         // ctx-data request (scribe-render owns no clipboard dependency). Fold it
         // into the same pending slot the palette uses so both routes share one
