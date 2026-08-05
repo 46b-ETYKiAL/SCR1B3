@@ -176,6 +176,13 @@ pub struct Keybindings {
     /// Toggle the minimap.
     pub toggle_minimap: String,
     /// Toggle the markdown live-preview panel.
+    ///
+    /// NOT `mod+shift+v`, and that is a correctness constraint rather than taste:
+    /// the windowing layer eats every `command`+V press as Paste — Shift and Alt
+    /// are not excluded from its test — so a `mod+shift+v` binding here is
+    /// unmatchable in the shipped app. `app::keymap::swallowed_chord_messages`
+    /// is the check that says so; this crate cannot make it, because the swallow
+    /// lives in the UI layer, not in the combo grammar.
     pub toggle_md_preview: String,
     /// Fold every region in the active buffer.
     pub fold_all: String,
@@ -214,6 +221,12 @@ impl Default for Keybindings {
         // switch), so their defaults are the cross-editor conventions
         // (Ctrl+Shift+S, Ctrl+1..9) rather than a reproduction of a previous
         // hard-wiring. They are additive — no existing chord changed meaning.
+        //
+        // `toggle_md_preview` is the other exception, and a corrective one: it
+        // shipped as `mod+shift+v`, which the windowing layer eats as Paste
+        // (Shift is not excluded from its test), so the shortcut never fired in
+        // the shipped app. Moving it to `mod+e` — the same chord Obsidian uses
+        // for edit/preview — is what makes it reachable at all.
         Keybindings {
             new_file: "mod+n".into(),
             open_file: "mod+o".into(),
@@ -247,7 +260,7 @@ impl Default for Keybindings {
             toggle_zen: "mod+period".into(),
             cycle_theme: "mod+shift+t".into(),
             toggle_minimap: "mod+shift+m".into(),
-            toggle_md_preview: "mod+shift+v".into(),
+            toggle_md_preview: "mod+e".into(),
             fold_all: "mod+shift+openbracket".into(),
             expand_all: "mod+shift+closebracket".into(),
             increase_font: "mod+equals".into(),
@@ -794,7 +807,11 @@ mod tests {
         assert_eq!(kb.toggle_zen, "mod+period"); // Ctrl+.
         assert_eq!(kb.cycle_theme, "mod+shift+t"); // Ctrl+Shift+T
         assert_eq!(kb.toggle_minimap, "mod+shift+m"); // Ctrl+Shift+M
-        assert_eq!(kb.toggle_md_preview, "mod+shift+v"); // Ctrl+Shift+V
+                                                      // Ctrl+E — deliberately NOT Ctrl+Shift+V, which the windowing layer
+                                                      // swallows as Paste. `app::keymap` owns the check that proves it (this
+                                                      // crate has no view of the UI layer); the pin here is what stops the
+                                                      // dead chord being restored by muscle memory.
+        assert_eq!(kb.toggle_md_preview, "mod+e");
         assert_eq!(kb.fold_all, "mod+shift+openbracket"); // Ctrl+Shift+[
         assert_eq!(kb.expand_all, "mod+shift+closebracket"); // Ctrl+Shift+]
                                                              // Font.

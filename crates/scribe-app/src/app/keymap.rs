@@ -298,6 +298,128 @@ impl ResolvedChord {
         out.push_str(key_display(self.key));
         out
     }
+
+    /// The live [`egui::Modifiers`] a physical press of this chord arrives with.
+    ///
+    /// Mirrors what `egui_winit` writes on `WindowEvent::ModifiersChanged`
+    /// (0.34.3 `src/lib.rs:462-478`): off macOS `command` and `ctrl` are the SAME
+    /// physical key, so both flags are set; on macOS `command` rides with
+    /// `mac_cmd`. The combo grammar has no way to spell a macOS-only Ctrl, so
+    /// `ctrl` is never set alone. Needed because the clipboard predicates below
+    /// read `modifiers.ctrl` for one of their arms, and a chord that only set
+    /// `command` would miss it.
+    fn live_modifiers(self) -> egui::Modifiers {
+        let mut m = egui::Modifiers {
+            alt: self.alt,
+            shift: self.shift,
+            ..egui::Modifiers::NONE
+        };
+        if self.cmd {
+            m.command = true;
+            if cfg!(target_os = "macos") {
+                m.mac_cmd = true;
+            } else {
+                m.ctrl = true;
+            }
+        }
+        m
+    }
+}
+
+// ---- chords the windowing layer EATS before egui ever sees them ----
+//
+// `egui_winit::State::on_keyboard_input` (0.34.3 `src/lib.rs:962`) special-cases
+// cut / copy / paste on the key **DOWN** and `return`s at lines 1015 / 1018 /
+// 1026 — BEFORE the `self.egui_input.events.push(egui::Event::Key { … })` at
+// line 1030. For a chord one of those three predicates answers `true` for,
+// `Event::Key { pressed: true }` is therefore NEVER emitted, and a binding
+// matched with `i.key_pressed(…)` is dead code in the shipped app.
+//
+// The load-bearing detail — and the reason a whole CLASS of bindings can rot
+// silently — is that none of the three predicates excludes Shift or Alt. They
+// test `modifiers.command && keycode == X/C/V`, so Ctrl+**Shift**+V is eaten
+// exactly like Ctrl+V. `toggle_md_preview` shipped on `mod+shift+v` and could
+// never fire; a test that synthesises the key press (rather than replaying what
+// the windowing layer really delivers) cannot see that, which is how it lasted.
+//
+// The three functions below are TRANSCRIPTIONS of egui-winit 0.34.3
+// `is_cut_command` (line 1305), `is_copy_command` (1311) and `is_paste_command`
+// (1317). They are the single source both the user-facing diagnostic
+// ([`Keymap::swallowed_chord_messages`]) and the test-side delivery simulator
+// ([`egui_winit_key_down`]) read, so the warning and the guard can never drift
+// apart.
+
+/// egui-winit 0.34.3 `src/lib.rs:1305`.
+fn is_cut_command(modifiers: egui::Modifiers, keycode: egui::Key) -> bool {
+    keycode == egui::Key::Cut
+        || (modifiers.command && keycode == egui::Key::X)
+        || (cfg!(target_os = "windows") && modifiers.shift && keycode == egui::Key::Delete)
+}
+
+/// egui-winit 0.34.3 `src/lib.rs:1311`.
+fn is_copy_command(modifiers: egui::Modifiers, keycode: egui::Key) -> bool {
+    keycode == egui::Key::Copy
+        || (modifiers.command && keycode == egui::Key::C)
+        || (cfg!(target_os = "windows") && modifiers.ctrl && keycode == egui::Key::Insert)
+}
+
+/// egui-winit 0.34.3 `src/lib.rs:1317`.
+fn is_paste_command(modifiers: egui::Modifiers, keycode: egui::Key) -> bool {
+    keycode == egui::Key::Paste
+        || (modifiers.command && keycode == egui::Key::V)
+        || (cfg!(target_os = "windows") && modifiers.shift && keycode == egui::Key::Insert)
+}
+
+/// Which clipboard command the windowing layer turns `chord` into, or `None`
+/// when the chord is genuinely deliverable as a key press.
+///
+/// `Some(_)` means the chord is UNMATCHABLE by [`Keymap::pressed`] on this
+/// platform, no matter how the action behind it is written.
+fn swallowed_by(chord: ResolvedChord) -> Option<&'static str> {
+    let m = chord.live_modifiers();
+    if is_cut_command(m, chord.key) {
+        Some("Cut")
+    } else if is_copy_command(m, chord.key) {
+        Some("Copy")
+    } else if is_paste_command(m, chord.key) {
+        Some("Paste")
+    } else {
+        None
+    }
+}
+
+/// The events `egui_winit` really pushes for a key **DOWN** of `key` + `mods`.
+///
+/// Test-side only, and the whole point of it: `Driver::key` and the local
+/// `press` helpers synthesise `Event::Key { pressed: true }` unconditionally, so
+/// a binding on a swallowed chord passes them while being dead in the shipped
+/// app. Driving a test through THIS instead replays what production receives —
+/// for a swallowed chord, no key press at all.
+///
+/// Models an EMPTY clipboard for the paste arm (egui-winit only pushes
+/// `Event::Paste` when `clipboard.get()` yields non-empty text, at
+/// `src/lib.rs:1020-1025`) because the clipboard's contents are irrelevant here:
+/// the `return` at line 1026 is unconditional, so no `Event::Key` is emitted
+/// either way.
+#[cfg(test)]
+pub(super) fn egui_winit_key_down(key: egui::Key, mods: egui::Modifiers) -> Vec<egui::Event> {
+    // egui-winit 0.34.3 `src/lib.rs:1011-1036`, the `if pressed` arm.
+    if is_cut_command(mods, key) {
+        return vec![egui::Event::Cut];
+    }
+    if is_copy_command(mods, key) {
+        return vec![egui::Event::Copy];
+    }
+    if is_paste_command(mods, key) {
+        return Vec::new();
+    }
+    vec![egui::Event::Key {
+        key,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: mods,
+    }]
 }
 
 /// The user's keymap, resolved once per `[keybindings]` change.
@@ -365,6 +487,44 @@ impl Keymap {
             })
             .map(|(action, combo)| {
                 format!("'{action}' is bound to '{combo}', which is not a key on your keyboard — it cannot be triggered")
+            })
+            .collect()
+    }
+
+    /// Actions bound to a chord the windowing layer turns into a clipboard
+    /// command before egui sees it (see [`swallowed_by`]), reported as ready-made
+    /// user-facing messages.
+    ///
+    /// The third way a well-formed binding can be dead, and the only one that is
+    /// invisible to every other check: the combo parses, the key exists, the
+    /// settings row pretty-prints it — and it can still never fire, because
+    /// `egui_winit` consumes the key-down as Cut / Copy / Paste and returns.
+    /// Left unreported, a user who rebinds an action onto Ctrl+C gets silence and
+    /// no way to find out why; that is exactly how `toggle_md_preview` sat dead
+    /// on `mod+shift+v`.
+    ///
+    /// Neither [`Keybindings::validate`] nor [`Keymap::unknown_key_messages`] can
+    /// cover this: the first owns the combo GRAMMAR and the second the key TABLE,
+    /// while this is a property of the WINDOWING layer — which only this module
+    /// knows about. Blank / unparseable / unknown-key combos are not repeated
+    /// here; they are already reported and cannot reach a resolved chord anyway.
+    pub(super) fn swallowed_chord_messages(kb: &Keybindings) -> Vec<String> {
+        kb.entries()
+            .iter()
+            .filter_map(|(action, combo)| {
+                let chord = Chord::parse(combo).and_then(|c| {
+                    key_from_token(&c.key).map(|key| ResolvedChord {
+                        cmd: c.cmd,
+                        shift: c.shift,
+                        alt: c.alt,
+                        key,
+                    })
+                })?;
+                let eaten_as = swallowed_by(chord)?;
+                Some(format!(
+                    "'{action}' is bound to '{combo}', which your system delivers to the editor as \
+                     {eaten_as} — the shortcut can never fire. Bind it to a different combo."
+                ))
             })
             .collect()
     }
@@ -750,7 +910,12 @@ mod tests {
             (action::TOGGLE_ZEN, true, false, false, egui::Key::Period),
             (action::CYCLE_THEME, true, true, false, egui::Key::T),
             (action::TOGGLE_MINIMAP, true, true, false, egui::Key::M),
-            (action::TOGGLE_MD_PREVIEW, true, true, false, egui::Key::V),
+            // Ctrl+E. The original `mod+shift+v` resolved perfectly well and
+            // still never fired — the windowing layer ate the press as Paste —
+            // which is why this pin is now backed by
+            // `every_default_binding_survives_the_windowing_layer` rather than
+            // resolution alone.
+            (action::TOGGLE_MD_PREVIEW, true, false, false, egui::Key::E),
             (action::FOLD_ALL, true, true, false, egui::Key::OpenBracket),
             (
                 action::EXPAND_ALL,
@@ -958,6 +1123,232 @@ mod tests {
         );
         // …and a live one still renders.
         assert!(display_combo("mod+s").is_some());
+    }
+
+    // ---- the windowing layer eats whole chords (THE class guard) ----
+    //
+    // A binding can resolve to a perfectly good `ResolvedChord`, pretty-print in
+    // Settings, and STILL be unreachable: `egui_winit::State::on_keyboard_input`
+    // turns cut / copy / paste chords into `Event::Cut` / `Copy` / `Paste` on the
+    // key DOWN and returns before pushing the `Event::Key`. `toggle_md_preview`
+    // shipped on `mod+shift+v` — swallowed as Paste, because `is_paste_command`
+    // tests `command && V` and never excludes Shift — and was dead for its whole
+    // life.
+    //
+    // Nothing caught it because every test helper in this crate (`fired` above,
+    // `Driver::key`, the local `press`) SYNTHESISES the key press. A binding that
+    // production never receives a press for still tests green against them. The
+    // tests below are the ones that discriminate: they build their events with
+    // `egui_winit_key_down`, so what the dispatcher sees is what the windowing
+    // layer would really have delivered.
+
+    /// `fired`, but over an explicit event list instead of a synthesised press.
+    fn fired_from(
+        km: &Keymap,
+        action: &str,
+        mods: egui::Modifiers,
+        events: Vec<egui::Event>,
+    ) -> bool {
+        let ctx = egui::Context::default();
+        let mut out = false;
+        let input = egui::RawInput {
+            modifiers: mods,
+            events,
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| {
+            out = ctx.input(|i| km.pressed(i, action));
+        });
+        out
+    }
+
+    #[test]
+    fn every_default_binding_survives_the_windowing_layer() {
+        // THE guard this whole class needs: for all 45 actions, push the chord
+        // through the real delivery path and require the dispatcher to still see
+        // it. A future default (or an egui-winit bump that widens a predicate)
+        // that lands on a swallowed chord fails HERE — at the point the binding
+        // is chosen — instead of shipping as a key that does nothing.
+        //
+        // Asserted end to end (`Keymap::pressed` over the delivered events), not
+        // merely "an Event::Key exists": the contract is that the ACTION fires,
+        // and only running the matcher over the real event stream proves it.
+        let km = Keymap::resolve(&Keybindings::default());
+        for name in action::ALL {
+            let chord = km
+                .chord(name)
+                .unwrap_or_else(|| panic!("default binding '{name}' must resolve"));
+            let mods = chord.live_modifiers();
+            let delivered = egui_winit_key_down(chord.key, mods);
+            assert!(
+                delivered.iter().any(|e| matches!(
+                    e,
+                    egui::Event::Key { key, pressed: true, .. } if *key == chord.key
+                )),
+                "'{name}' is bound to {} — the windowing layer eats that chord as {:?} and \
+                 never emits a key press, so the action can never fire. Bind it elsewhere.",
+                chord.display(),
+                swallowed_by(chord)
+            );
+            assert!(
+                fired_from(&km, name, mods, delivered),
+                "'{name}' ({}) must fire from the events production really delivers",
+                chord.display()
+            );
+        }
+    }
+
+    #[test]
+    fn the_windowing_layer_really_does_eat_the_clipboard_chords() {
+        // The control that keeps the guard above from being vacuous. If
+        // `egui_winit_key_down` simply forwarded everything, the guard would pass
+        // for a binding on Ctrl+V and prove nothing. Each chord here must produce
+        // NO key press — including the shifted and alted variants, which is the
+        // whole surprise: the predicates test `command && <key>` and stop there.
+        let cases: &[(egui::Key, egui::Modifiers, &str)] = &[
+            (egui::Key::X, CMD, "Cut"),
+            (egui::Key::X, CMD | SHIFT, "Cut"),
+            (egui::Key::X, CMD | ALT, "Cut"),
+            (egui::Key::C, CMD, "Copy"),
+            (egui::Key::C, CMD | SHIFT, "Copy"),
+            (egui::Key::C, CMD | ALT, "Copy"),
+            (egui::Key::V, CMD, "Paste"),
+            (egui::Key::V, CMD | SHIFT, "Paste"),
+            (egui::Key::V, CMD | ALT, "Paste"),
+            // The dedicated media keys are eaten with no modifier at all.
+            (egui::Key::Cut, egui::Modifiers::NONE, "Cut"),
+            (egui::Key::Copy, egui::Modifiers::NONE, "Copy"),
+            (egui::Key::Paste, egui::Modifiers::NONE, "Paste"),
+        ];
+        for (key, mods, eaten_as) in cases {
+            let chord = ResolvedChord {
+                cmd: mods.command,
+                shift: mods.shift,
+                alt: mods.alt,
+                key: *key,
+            };
+            assert_eq!(
+                swallowed_by(chord),
+                Some(*eaten_as),
+                "{chord:?} must be reported as eaten by {eaten_as}"
+            );
+            let delivered = egui_winit_key_down(*key, chord.live_modifiers());
+            assert!(
+                !delivered
+                    .iter()
+                    .any(|e| matches!(e, egui::Event::Key { pressed: true, .. })),
+                "{chord:?} must deliver NO key press; got {delivered:?}"
+            );
+        }
+        // Windows also routes the legacy Insert/Delete clipboard chords, and
+        // those arms key off Shift/Ctrl rather than the command modifier.
+        for (key, mods) in [
+            (egui::Key::Delete, SHIFT),
+            (egui::Key::Insert, CMD),
+            (egui::Key::Insert, SHIFT),
+        ] {
+            let chord = ResolvedChord {
+                cmd: mods.command,
+                shift: mods.shift,
+                alt: mods.alt,
+                key,
+            };
+            assert_eq!(
+                swallowed_by(chord).is_some(),
+                cfg!(target_os = "windows"),
+                "{chord:?} is a Windows-only clipboard chord — eaten there, live elsewhere"
+            );
+        }
+        // …and an ordinary chord is NOT eaten, or the predicate would condemn
+        // every binding and the guard above would be unsatisfiable.
+        assert_eq!(
+            swallowed_by(ResolvedChord {
+                cmd: true,
+                shift: false,
+                alt: false,
+                key: egui::Key::E,
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn the_markdown_preview_chord_moved_off_the_paste_chord() {
+        // The specific regression. Both directions, because only re-pinning the
+        // new chord would let the old one creep back beside it.
+        let kb = Keybindings::default();
+        let km = Keymap::resolve(&kb);
+        let dead = ResolvedChord {
+            cmd: true,
+            shift: true,
+            alt: false,
+            key: egui::Key::V,
+        };
+        assert_eq!(
+            swallowed_by(dead),
+            Some("Paste"),
+            "mod+shift+v is eaten as Paste — that is why the binding moved"
+        );
+        assert_ne!(
+            kb.toggle_md_preview, "mod+shift+v",
+            "the preview toggle must not go back onto the paste chord"
+        );
+        let live = km
+            .chord(action::TOGGLE_MD_PREVIEW)
+            .expect("the preview toggle is bound");
+        assert_eq!(swallowed_by(live), None);
+        assert!(
+            fired_from(
+                &km,
+                action::TOGGLE_MD_PREVIEW,
+                live.live_modifiers(),
+                egui_winit_key_down(live.key, live.live_modifiers()),
+            ),
+            "the preview toggle must fire from real delivery, not just a synthesised press"
+        );
+    }
+
+    #[test]
+    fn swallowed_chord_messages_names_a_rebind_onto_a_clipboard_chord() {
+        // The user-facing half. A rebind onto Ctrl+C parses, resolves, and
+        // pretty-prints — every other check passes it — so without this the user
+        // gets silence and no way to learn why.
+        let clean = Keymap::swallowed_chord_messages(&Keybindings::default());
+        assert!(
+            clean.is_empty(),
+            "the shipped defaults must be free of swallowed chords: {clean:?}"
+        );
+
+        let msgs = Keymap::swallowed_chord_messages(&Keybindings {
+            save: "mod+c".into(),
+            find: "mod+shift+x".into(),
+            ..Default::default()
+        });
+        let joined = msgs.join(" | ");
+        assert_eq!(msgs.len(), 2, "one message per swallowed binding: {joined}");
+        assert!(
+            msgs.iter().any(|m| m.contains("'save'")
+                && m.contains("mod+c")
+                && m.contains("Copy")
+                && m.contains("can never fire")),
+            "must name the action, the combo, and what eats it: {joined}"
+        );
+        assert!(
+            msgs.iter()
+                .any(|m| m.contains("'find'") && m.contains("mod+shift+x") && m.contains("Cut")),
+            "a SHIFTED clipboard chord is eaten too and must be reported: {joined}"
+        );
+
+        // Not double-reported: blank / unparseable / unknown-key combos are
+        // `validate`'s and `unknown_key_messages`' business and never reach a
+        // resolved chord anyway.
+        assert!(Keymap::swallowed_chord_messages(&Keybindings {
+            save: String::new(),
+            find: "mod".into(),
+            replace: "mod+nosuchkey".into(),
+            ..Default::default()
+        })
+        .is_empty());
     }
 
     #[test]

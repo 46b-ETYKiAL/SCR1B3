@@ -233,7 +233,10 @@ pub(crate) const KEYBOARD_SHORTCUTS: &[ShortcutEntry] = &[
         bindings: &[action::TOGGLE_MINIMAP],
     },
     ShortcutEntry {
-        chord: "Ctrl+Shift+V",
+        // NOT Ctrl+Shift+V: the windowing layer eats every command+V press as
+        // Paste (Shift is not excluded from its test), so that chord could never
+        // reach the editor. See `keymap::swallowed_by`.
+        chord: "Ctrl+E",
         action: "Toggle the markdown live-preview panel",
         bindings: &[action::TOGGLE_MD_PREVIEW],
     },
@@ -764,7 +767,8 @@ pub(crate) const BUILTIN_COMMANDS: &[BuiltinEntry] = &[
     },
     BuiltinEntry {
         label: "Toggle markdown preview",
-        shortcut: "Ctrl+Shift+V",
+        // See the cheatsheet row above: Ctrl+Shift+V is swallowed as Paste.
+        shortcut: "Ctrl+E",
         action: BuiltinCommand::ToggleMarkdownPreview,
         bindings: &[action::TOGGLE_MD_PREVIEW],
     },
@@ -1269,6 +1273,52 @@ mod tests {
                  the F1 modal claims to show every shortcut",
             );
         }
+    }
+
+    /// The static chord text of a REBINDABLE row must be the chord that action is
+    /// actually bound to by default.
+    ///
+    /// The two are separate strings by design — the fallback is what renders
+    /// before the live keymap is consulted — and nothing tied them together, so
+    /// they could drift apart silently. They did: when `toggle_md_preview` moved
+    /// off the swallowed `mod+shift+v`, these rows still read "Ctrl+Shift+V" and
+    /// the F1 modal (and the palette) would have kept teaching a chord that had
+    /// been deliberately abandoned for being unreachable.
+    ///
+    /// Hard-wired rows (`bindings: &[]`) are exempt: their chord belongs to
+    /// egui or the editor widget, not to the `[keybindings]` schema.
+    #[test]
+    fn a_rebindable_rows_fallback_chord_is_its_real_default_chord() {
+        use crate::app::keymap::Keymap;
+        use scribe_core::config::Keybindings;
+
+        let km = Keymap::resolve(&Keybindings::default());
+        let mut checked = 0usize;
+        let mut check = |what: &str, label: &str, text: &str, bindings: &[&str]| {
+            if bindings.is_empty() {
+                return;
+            }
+            let live = km
+                .display_for(bindings)
+                .expect("a non-empty binding list always renders");
+            assert_eq!(
+                crate::app::keymap::platform_chord_text(text),
+                live,
+                "{what} row '{label}' advertises {text:?} but '{}' is bound to {live:?}",
+                bindings.join(" / ")
+            );
+            checked += 1;
+        };
+        for e in KEYBOARD_SHORTCUTS {
+            check("cheatsheet", e.action, e.chord, e.bindings);
+        }
+        for e in BUILTIN_COMMANDS {
+            check("palette", e.label, e.shortcut, e.bindings);
+        }
+        assert!(
+            checked > 0,
+            "no rebindable row was compared — the test would be vacuous"
+        );
     }
 
     /// Every `bindings` entry must name a real action.

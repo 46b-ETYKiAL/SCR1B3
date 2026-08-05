@@ -1233,13 +1233,18 @@ impl ScribeApp {
         // force, so any keymap complaint would be about bindings that aren't live.
         // Grammar problems (blank / unparseable / colliding) come from core;
         // unknown-key problems can only be known once the chord is resolved
-        // against the UI layer's key table, so `keymap` contributes those.
+        // against the UI layer's key table, and a chord the windowing layer eats
+        // as Cut/Copy/Paste is invisible to both — so `keymap` contributes those
+        // two.
         let keybinding_issues: Vec<String> = config
             .keybindings
             .validate()
             .iter()
             .map(|i| i.message())
             .chain(keymap::Keymap::unknown_key_messages(&config.keybindings))
+            .chain(keymap::Keymap::swallowed_chord_messages(
+                &config.keybindings,
+            ))
             .collect();
         for issue in &keybinding_issues {
             tracing::warn!("keybinding problem: {issue}");

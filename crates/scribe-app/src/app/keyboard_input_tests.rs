@@ -361,14 +361,36 @@ fn the_zen_shortcut_toggles_both_ways_and_closes_the_find_bars() {
 
 #[test]
 fn the_markdown_preview_shortcut_toggles_both_ways() {
+    // Driven through `egui_winit_key_down`, NOT `Driver::shortcuts`, and that is
+    // the point of the test rather than a detail of it.
+    //
+    // This shortcut was bound to Ctrl+Shift+V and was DEAD in the shipped app:
+    // `egui_winit::State::on_keyboard_input` turns any `command`+V press into a
+    // Paste and returns before emitting the key event — `is_paste_command` tests
+    // `command && V` and never excludes Shift. The old version of this test
+    // synthesised the press with `Driver::shortcuts` and so passed the entire
+    // time the binding could not fire. Building the events with the delivery
+    // simulator is what makes the test able to tell the difference: put the
+    // binding back on a swallowed chord and this fails.
     let (mut app, d) = driven();
     assert!(!app.md_preview_open, "fixture starts with the pane closed");
 
-    d.shortcuts(&mut app, egui::Key::V, CMD | egui::Modifiers::SHIFT);
-    assert!(app.md_preview_open, "Ctrl+Shift+V opens the preview pane");
+    // Ctrl+E — the chord `keymap.rs` pins for `toggle_md_preview` in
+    // `every_default_binding_resolves_to_the_expected_key`. What is pinned HERE
+    // is that pressing it does something.
+    let (key, mods) = (egui::Key::E, CMD);
+    let press = || super::keymap::egui_winit_key_down(key, mods);
+    assert!(
+        !press().is_empty(),
+        "precondition: the windowing layer must actually deliver this chord — \
+         an empty event list here means the binding is unreachable in production"
+    );
 
-    d.shortcuts(&mut app, egui::Key::V, CMD | egui::Modifiers::SHIFT);
-    assert!(!app.md_preview_open, "and the same key closes it again");
+    d.frame(&mut app, mods, press());
+    assert!(app.md_preview_open, "the preview chord opens the pane");
+
+    d.frame(&mut app, mods, press());
+    assert!(!app.md_preview_open, "and the same chord closes it again");
 }
 
 // ---- font zoom ----
