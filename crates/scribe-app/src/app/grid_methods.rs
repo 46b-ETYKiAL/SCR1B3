@@ -178,6 +178,68 @@ impl ScribeApp {
         let mc_secondaries: Vec<crate::multi_cursor::Caret> =
             self.multi_cursor.secondaries().to_vec();
 
+        // ---- Editor chords + the image-paste hook (single-pane parity) ----
+        //
+        // Both blocks live in the SINGLE-PANE arm of `frame_tick`'s
+        // `if self.grid_tree.is_some() { … } else { … }` fork, so with split
+        // view on the markdown chords did nothing (Ctrl+B / Ctrl+I / Ctrl+` /
+        // Ctrl+Shift+X / Ctrl+Enter all fell through to egui) and Ctrl+V with an
+        // image on the clipboard pasted nothing. The `pending_*` latches the
+        // chords raise are already drained by `apply_pending_caret_ops` below,
+        // so only the interception itself was missing.
+        //
+        // This runs BEFORE `CentralPanel::show`, which is the same position the
+        // single-pane block occupies relative to its editor: the keys must be
+        // consumed before any `TextEdit` sees this frame's events.
+        if !active_read_only && editor_focused {
+            ctx.input_mut(|i| {
+                use egui::{Key, Modifiers};
+                let ctrl = Modifiers::COMMAND;
+                let ctrl_shift = Modifiers::COMMAND | Modifiers::SHIFT;
+                if i.consume_key(ctrl, Key::Enter) {
+                    self.pending_toggle_task = true;
+                }
+                if i.consume_key(ctrl, Key::B) {
+                    self.pending_wrap_marker = Some("**");
+                }
+                if i.consume_key(ctrl, Key::I) {
+                    self.pending_wrap_marker = Some("*");
+                }
+                if i.consume_key(ctrl, Key::Backtick) {
+                    self.pending_wrap_marker = Some("`");
+                }
+                if i.consume_key(ctrl_shift, Key::X) {
+                    self.pending_wrap_marker = Some("~~");
+                }
+            });
+            // Ctrl/Cmd+V with an IMAGE on the clipboard saves it into the
+            // vault's attachments folder and inserts the markdown link. See
+            // `grid_render::image_paste_gesture` for why the hook is the key
+            // RELEASE rather than `consume_key(COMMAND, V)`.
+            if grid_render::image_paste_gesture(ctx) && self.config.notes.vault_dir.is_some() {
+                self.paste_image_attachment();
+            }
+        }
+
+        // ---- Inline LSP diagnostics (single-pane parity) ----
+        //
+        // Resolved against the ACTIVE tab's text, and deliberately AFTER the
+        // focus->active sync above: `self.active` follows the focused pane, so
+        // the squiggle has to follow it too. Computing this before the sync
+        // would underline the previously-active pane. Owned so it can move into
+        // the pane closure, which mutably borrows `self.tabs`. Empty (and free)
+        // when the language server has published nothing — the common case.
+        let diag_spans = self.diagnostic_spans_for_active(active);
+        let diag_colors = grid_render::DiagColors {
+            error: ui_color(&self.theme, "error", Rgba::new(0xe5, 0x3e, 0x3e, 255)),
+            warning: ui_color(&self.theme, "warning", Rgba::new(0xf2, 0xb3, 0x3d, 255)),
+            info: ui_color(&self.theme, "accent", Rgba::new(0, 255, 254, 255)),
+            hint: ui_color(&self.theme, "line_number", Rgba::new(0x5a, 0x58, 0x69, 255)),
+        };
+        // Whether a `[[wiki-link]]` has anywhere to resolve to — the same
+        // precondition `open_or_create_wikilink` enforces.
+        let vault_configured = self.config.notes.vault_dir.is_some();
+
         let line_height = self.config.fonts.clamped_line_height();
         let word_wrap = self.config.editor.word_wrap;
         // #28 — render-whitespace toggle + editor font size captured as locals so
@@ -497,6 +559,32 @@ impl ScribeApp {
                                 prev_newline = row.ends_with_newline;
                             }
                         }
+                    }
+                    // ---- URL + [[wiki-link]] overlay (single-pane parity) ----
+                    // Deliberately NOT `is_active`-gated: the pointer can only
+                    // be inside one pane's editor rect (the helper's own first
+                    // test), and requiring a focus click first would make
+                    // following a link in a side pane a two-gesture operation
+                    // the single-pane editor never asked for.
+                    grid_render::pane_link_overlay(
+                        ui,
+                        &out,
+                        &tabs[idx].text,
+                        detect_links,
+                        vault_configured,
+                    );
+                    // ---- Inline LSP diagnostics (single-pane parity) ----
+                    // `is_active`-gated because `diag_spans` were resolved onto
+                    // the ACTIVE tab's byte offsets; painting them over another
+                    // pane's galley would underline unrelated text.
+                    if is_active {
+                        grid_render::paint_pane_diagnostics(
+                            ui,
+                            &out,
+                            &tabs[idx].text,
+                            &diag_spans,
+                            diag_colors,
+                        );
                     }
                     // P1-3 scroll-past-end: pad blank space below the last line
                     // so it can rest at a comfortable height (VS Code

@@ -476,3 +476,783 @@ fn pane_editor_ids_are_document_scoped_and_distinct() {
         egui::Id::new("scr1b3-central-editor").with(crate::grid::DocId(1))
     );
 }
+
+// ---------------------------------------------------------------------------
+// Defect 3 — the per-pane editor OVERLAYS
+//
+// Three capabilities the single-pane editor has and the grid pane did not,
+// because all three live inside the `else` arm of `frame_tick`'s
+// `if self.grid_tree.is_some() { … } else { … }` fork:
+//
+//   A. the inline LSP diagnostic squiggle + hover (grid_render.rs and
+//      grid_methods.rs did not contain the string "diagnostic" at all, so with
+//      split view on the user was back to the two status-bar integers that do
+//      not say WHICH line is wrong — exactly the problem the overlay exists to
+//      solve);
+//   B. the `[[wiki-link]]` Ctrl+click follow;
+//   C. the Ctrl+V clipboard-image attachment paste;
+//
+// …plus D, found while wiring C: the markdown chords (Ctrl+B / Ctrl+I /
+// Ctrl+` / Ctrl+Shift+X / Ctrl+Enter) are intercepted in that SAME single-pane
+// block, so they did nothing in split view even though the grid already
+// drained the `pending_*` latches they raise.
+//
+// Every test below asserts the OBSERVABLE outcome — the squiggle segments
+// actually painted into the frame, the tooltip text actually painted, the note
+// actually created on disk, the markdown actually in the buffer — never an
+// intermediate latch. Each was verified by cutting its wire and confirming the
+// failure before being committed.
+// ---------------------------------------------------------------------------
+
+/// A raw headless context that hands back the frame's SHAPE LIST.
+///
+/// `e2e::Driver` discards `FullOutput`, and `egui_kittest`'s renderer needs a
+/// GPU these tests deliberately do not require. The overlays pinned here are
+/// PAINT, so the shape list is the observable outcome: a squiggle is a run of
+/// `Shape::LineSegment`s in the severity colour (`render_support::paint_squiggle`
+/// emits nothing else), and a tooltip is a `Shape::Text` carrying the message.
+/// Both are decidable from the shapes alone, with no pixels and no GPU.
+struct Probe {
+    ctx: egui::Context,
+}
+
+impl Probe {
+    fn new() -> Self {
+        Self {
+            ctx: egui::Context::default(),
+        }
+    }
+
+    fn frame(
+        &self,
+        app: &mut ScribeApp,
+        modifiers: egui::Modifiers,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(1100.0, 720.0),
+            )),
+            modifiers,
+            events,
+            ..Default::default()
+        };
+        self.ctx.run(input, |ctx| app.frame_tick(ctx))
+    }
+
+    fn idle(&self, app: &mut ScribeApp) -> egui::FullOutput {
+        self.frame(app, egui::Modifiers::NONE, Vec::new())
+    }
+
+    /// Settle the app: `sync_grid_state` allocates doc ids on the first frame
+    /// and the panes lay out on the second, so nothing is measurable before
+    /// the third.
+    fn settle(&self, app: &mut ScribeApp) {
+        self.idle(app);
+        self.idle(app);
+    }
+
+    fn hover(&self, app: &mut ScribeApp, pos: egui::Pos2) -> egui::FullOutput {
+        self.frame(
+            app,
+            egui::Modifiers::NONE,
+            vec![egui::Event::PointerMoved(pos)],
+        )
+    }
+
+    /// Move + press + release at `pos` in ONE frame — the same shape the
+    /// single-pane link tests use.
+    fn mod_click(
+        &self,
+        app: &mut ScribeApp,
+        pos: egui::Pos2,
+        modifiers: egui::Modifiers,
+    ) -> egui::FullOutput {
+        self.frame(
+            app,
+            modifiers,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers,
+                },
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers,
+                },
+            ],
+        )
+    }
+}
+
+/// egui nests shapes in `Shape::Vec`, so a flat scan of `FullOutput::shapes`
+/// misses everything a panel painted.
+fn walk_shape(shape: &egui::Shape, f: &mut impl FnMut(&egui::Shape)) {
+    if let egui::Shape::Vec(inner) = shape {
+        for s in inner {
+            walk_shape(s, f);
+        }
+    } else {
+        f(shape);
+    }
+}
+
+/// Every `LineSegment` painted this frame whose stroke is EXACTLY `color`.
+///
+/// The squiggle is the only thing that paints 1px line segments in a severity
+/// colour over the editor; the gutter's diagnostic marker is a `rect_filled`
+/// and the secondary-caret painter uses a 1.5px accent stroke, so neither can
+/// be counted here. Every assertion below is additionally differential against
+/// a diagnostics-free control render, so any future same-colour painter would
+/// have to be diagnostics-DEPENDENT to fool it.
+fn squiggle_segments(out: &egui::FullOutput, color: Color32) -> Vec<[egui::Pos2; 2]> {
+    let mut hits = Vec::new();
+    for clipped in &out.shapes {
+        walk_shape(&clipped.shape, &mut |s| {
+            if let egui::Shape::LineSegment { points, stroke } = s {
+                if stroke.color == color {
+                    hits.push(*points);
+                }
+            }
+        });
+    }
+    hits
+}
+
+/// Every string this frame actually painted as text — the tooltip's own body
+/// included, since `show_tooltip_at_pointer` lays its label out into the frame.
+fn painted_text(out: &egui::FullOutput) -> String {
+    let mut acc = String::new();
+    for clipped in &out.shapes {
+        walk_shape(&clipped.shape, &mut |s| {
+            if let egui::Shape::Text(t) = s {
+                acc.push_str(t.galley.text());
+                acc.push('\n');
+            }
+        });
+    }
+    acc
+}
+
+/// Where the pane showing `doc` actually laid out this frame.
+///
+/// Read back from the live tile tree rather than guessed from the window size:
+/// egui_tiles picks its own column count from the container's aspect ratio, so
+/// a hard-coded "the second pane is on the right" would silently pass or fail
+/// on a layout change instead of testing the overlay.
+fn pane_rect(app: &ScribeApp, doc: crate::grid::DocId) -> Option<egui::Rect> {
+    let tree = app.grid_tree.as_ref()?;
+    let id = tree.tiles.iter().find_map(|(id, tile)| match tile {
+        egui_tiles::Tile::Pane(p) if p.doc_id == doc => Some(*id),
+        _ => None,
+    })?;
+    tree.tiles.rect(id)
+}
+
+fn segments_bbox(segs: &[[egui::Pos2; 2]]) -> egui::Rect {
+    assert!(!segs.is_empty(), "no ink to measure");
+    let mut r = egui::Rect::NOTHING;
+    for [a, b] in segs {
+        r.extend_with(*a);
+        r.extend_with(*b);
+    }
+    r
+}
+
+// ---- A: inline LSP diagnostics --------------------------------------------
+
+/// Four lines of EXACTLY 32 characters, so a column index maps to an x offset
+/// by a single multiply and a mis-placed squiggle is arithmetic, not opinion.
+const DIAG_SRC: &str = "0123456789abcdefghijklmnopqrstuv\n\
+                        second line holds the error span\n\
+                        third line holds a warning token\n\
+                        fourth line holds the info notic\n";
+
+fn diag(line: u32, ch: u32, end_line: u32, end_ch: u32, severity: u8, message: &str) -> Diagnostic {
+    Diagnostic {
+        uri: "file:///grid-diag.txt".into(),
+        line,
+        character: ch,
+        end_line,
+        end_character: end_ch,
+        severity,
+        message: message.into(),
+    }
+}
+
+/// A grid config that renders the plain `TextEdit` pane and paints no OTHER
+/// red ink.
+///
+/// Spellcheck is OFF deliberately: its squiggle uses the SAME `#e53e3e` as the
+/// default `error` colour, so leaving it on would put error-coloured segments
+/// in the CONTROL frame and hollow out the zero-ink assertion.
+fn diag_grid_config() -> Config {
+    let mut cfg = grid_config();
+    cfg.editor.rope_editor_auto_threshold_bytes = 0; // never auto-swap to the rope pane
+    cfg.spellcheck.enabled = false;
+    cfg
+}
+
+/// Two panes, both holding [`DIAG_SRC`], with `diags` published. Both panes
+/// carry the SAME text so the only thing that can move the ink between them is
+/// which pane is ACTIVE.
+/// [`DIAG_SRC`] followed by enough filler that the text fills a whole pane.
+///
+/// The diagnostics are all published against lines 0-3, so APPENDING lines
+/// cannot move them — but it does mean a click anywhere in the pane body lands
+/// on the `TextEdit` rather than on the empty space below a four-line buffer.
+/// That mattered: `the_grid_squiggle_follows_the_pane_the_user_clicked_into`
+/// clicks 60% of the way down the pane, which with the bare four lines fell
+/// past the end of the widget, gave the pane editor no focus, and failed its
+/// own `active == 1` precondition — a fixture-geometry bug that looked exactly
+/// like the focus->active sync being broken.
+fn diag_grid_text() -> String {
+    let mut s = DIAG_SRC.to_string();
+    for _ in 0..200 {
+        s.push_str("filler line, no diagnostic published against it\n");
+    }
+    s
+}
+
+fn diag_grid_app(diags: Vec<Diagnostic>) -> ScribeApp {
+    let mut app = ScribeApp::new_test(diag_grid_config());
+    let text = diag_grid_text();
+    app.tabs[0].text.clone_from(&text);
+    app.tabs.push(EditorTab::scratch());
+    app.tabs[1].text = text;
+    app.active = 0;
+    app.diagnostics = diags;
+    app
+}
+
+fn error_color(app: &ScribeApp) -> Color32 {
+    ui_color(&app.theme, "error", Rgba::new(0xe5, 0x3e, 0x3e, 255))
+}
+
+/// The frame's error-coloured ink after settling, for `diags`.
+fn diag_ink(diags: Vec<Diagnostic>) -> Vec<[egui::Pos2; 2]> {
+    let mut app = diag_grid_app(diags);
+    let err = error_color(&app);
+    let p = Probe::new();
+    p.settle(&mut app);
+    let out = p.idle(&mut app);
+    squiggle_segments(&out, err)
+}
+
+/// The overlay must actually PAINT in a grid pane — and the control proves the
+/// ink is the diagnostics' and nothing else's.
+///
+/// Before this wiring the grid path never mentioned `diagnostic` at all: a
+/// rendered probe with `grid_enabled` showed gutter bars and the `1e / 3`
+/// counter and NO squiggle on any line, because the paint block sits in the
+/// single-pane arm of the `grid_tree.is_some()` fork.
+#[test]
+fn a_grid_pane_paints_the_inline_diagnostic_squiggle() {
+    let ink = diag_ink(vec![diag(
+        1,
+        22,
+        1,
+        27,
+        crate::app::diagnostics_overlay::SEVERITY_ERROR,
+        "cannot find value `error` in this scope",
+    )]);
+    assert!(
+        !ink.is_empty(),
+        "a published error diagnostic must paint a squiggle in the active grid \
+         pane; the frame carried no error-coloured line segments at all"
+    );
+
+    let control = diag_ink(Vec::new());
+    assert!(
+        control.is_empty(),
+        "an otherwise identical app with NO diagnostics must paint no \
+         error-coloured ink — {} segments found, so the assertion above is not \
+         measuring the diagnostics",
+        control.len()
+    );
+}
+
+/// …and it lands where the server said, not at a fixed spot.
+///
+/// Differential and constant-free: a diagnostic on a LATER line must ink lower
+/// than one on an earlier line, and one starting at a LATER column must ink to
+/// the right of one at the start of a line. A painter that ignored the span
+/// (or resolved it against the wrong text) passes the presence test above and
+/// fails both of these.
+#[test]
+fn the_grid_squiggle_lands_on_the_line_and_columns_the_server_named() {
+    const ERR: u8 = crate::app::diagnostics_overlay::SEVERITY_ERROR;
+    let first = segments_bbox(&diag_ink(vec![diag(0, 0, 0, 5, ERR, "at the very start")]));
+    let later = segments_bbox(&diag_ink(vec![diag(
+        2,
+        20,
+        2,
+        30,
+        ERR,
+        "further down and right",
+    )]));
+    assert!(
+        later.min.y > first.max.y,
+        "a diagnostic on line 2 must ink BELOW one on line 0 \
+         (line 0 ink {first:?}, line 2 ink {later:?})"
+    );
+    assert!(
+        later.min.x > first.max.x,
+        "a diagnostic starting at column 20 must ink to the RIGHT of one \
+         covering columns 0..5 (line 0 ink {first:?}, line 2 ink {later:?})"
+    );
+}
+
+/// Hovering the squiggle must NAME the problem. Two integers in the status bar
+/// do not tell the user why a line is wrong; the tooltip is the whole payload.
+///
+/// Asserted on the text the frame actually painted, so a tooltip that is built
+/// but never shown fails.
+#[test]
+fn hovering_a_grid_panes_squiggle_names_the_problem() {
+    const ERR: u8 = crate::app::diagnostics_overlay::SEVERITY_ERROR;
+    let mut app = diag_grid_app(vec![diag(1, 22, 1, 27, ERR, "cannot find value `error`")]);
+    let err = error_color(&app);
+    let p = Probe::new();
+    p.settle(&mut app);
+    let ink = segments_bbox(&squiggle_segments(&p.idle(&mut app), err));
+
+    // The hover rect the painter registers spans the whole galley ROW, with the
+    // squiggle along its BOTTOM edge — so aim just above the ink, inside the row.
+    let target = egui::pos2(ink.center().x, ink.max.y - 5.0);
+    p.hover(&mut app, target);
+    let out = p.hover(&mut app, target);
+    let painted = painted_text(&out);
+    assert!(
+        painted.contains("error: cannot find value `error`"),
+        "hovering the squiggle must paint the severity-prefixed message; the \
+         frame painted no such text (hovered {target:?}, ink {ink:?})"
+    );
+
+    // …and hovering off the underline must NOT: a tooltip that follows the
+    // pointer anywhere on the line is the "same line, wrong character" bug the
+    // hover resolver exists to avoid.
+    let away = egui::pos2(ink.min.x, ink.max.y + 220.0);
+    p.hover(&mut app, away);
+    let off = p.hover(&mut app, away);
+    assert!(
+        !painted_text(&off).contains("error: cannot find value"),
+        "the diagnostic tooltip must not show while the pointer is off the \
+         squiggle"
+    );
+}
+
+/// The squiggle is `active`-keyed, so it must follow the pane the user clicked
+/// into.
+///
+/// This is the trap commit `7595dea` named: nothing used to move `self.active`
+/// in grid view, so every `active`-keyed surface described whichever tab was
+/// active when the grid opened. `diag_spans` are resolved from `self.active`,
+/// so resolving them BEFORE the focus->active sync would paint the squiggle in
+/// the pane the user just left. Both panes carry identical text here, so the
+/// span is the same either way and the ONLY thing that can move the ink is
+/// which pane owns it.
+#[test]
+fn the_grid_squiggle_follows_the_pane_the_user_clicked_into() {
+    const ERR: u8 = crate::app::diagnostics_overlay::SEVERITY_ERROR;
+    let mut app = diag_grid_app(vec![diag(1, 22, 1, 27, ERR, "cannot find value `error`")]);
+    let err = error_color(&app);
+    let p = Probe::new();
+    p.settle(&mut app);
+    let before = segments_bbox(&squiggle_segments(&p.idle(&mut app), err));
+    assert_eq!(app.active, 0, "precondition: pane 0 starts active");
+
+    // Into the SECOND pane's body — located from the live tile tree, not from a
+    // guessed half of the window. Below the pane's header chip so the click
+    // lands on the editor rather than on the chip's controls.
+    let other = app.tabs[1].doc_id;
+    let rect = pane_rect(&app, other).expect("the second pane laid out");
+    let body = egui::pos2(rect.center().x, rect.top() + rect.height() * 0.6);
+    p.mod_click(&mut app, body, egui::Modifiers::NONE);
+    p.idle(&mut app);
+    assert_eq!(
+        app.active, 1,
+        "precondition: clicking the second pane's body at {body:?} (pane rect \
+         {rect:?}) must make it active"
+    );
+
+    let after = segments_bbox(&squiggle_segments(&p.idle(&mut app), err));
+    let moved = (after.center() - before.center()).length();
+    assert!(
+        moved > 100.0,
+        "the squiggle must move into the pane the user is now editing; it \
+         stayed put ({before:?} -> {after:?}, moved {moved}px)"
+    );
+}
+
+// ---- B / C / D: link follow, image paste, markdown chords ------------------
+
+struct Vault {
+    _root: tempfile::TempDir,
+    path: std::path::PathBuf,
+}
+
+fn vault() -> Vault {
+    let root = tempfile::tempdir().expect("temp root");
+    let path = root.path().join("vault");
+    std::fs::create_dir_all(&path).expect("vault dir");
+    Vault { _root: root, path }
+}
+
+/// A SINGLE-tab grid app with a vault configured.
+///
+/// One tab on purpose: a one-pane grid fills the window, so the click geometry
+/// below matches the single-pane link tests exactly and the tests measure the
+/// wiring rather than the tiling. The code path is the same either way — what
+/// selects it is `grid_tree.is_some()`, asserted as a precondition in each test.
+fn grid_vault_app(v: &std::path::Path) -> ScribeApp {
+    let mut cfg = grid_config();
+    cfg.editor.rope_editor_auto_threshold_bytes = 0;
+    cfg.notes.vault_dir = Some(v.to_path_buf());
+    ScribeApp::new_test(cfg)
+}
+
+/// A buffer whose every byte sits inside a link span, so the pointer hit-test
+/// cannot land in a gap between links. Taller than the window (any y lands on
+/// text) and each line is ~60 chars — wide enough that [`CLICK`]'s x is mid-row,
+/// narrow enough not to soft-wrap.
+fn wall_of(link: &str) -> String {
+    let line = link.repeat(60_usize.div_ceil(link.len()));
+    assert!(
+        (60..90).contains(&line.chars().count()),
+        "fixture geometry: {line:?}"
+    );
+    (0..200)
+        .map(|_| line.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Well inside the pane body, on both axes (below the pane header chip).
+const CLICK: egui::Pos2 = egui::Pos2::new(150.0, 380.0);
+const CMD: egui::Modifiers = egui::Modifiers::COMMAND;
+
+fn solid_image(w: usize, h: usize) -> crate::app::note_capture::ClipboardImage {
+    crate::app::note_capture::ClipboardImage {
+        width: w,
+        height: h,
+        rgba: vec![0x40u8; w * h * 4],
+    }
+}
+
+/// Focus the one grid pane by clicking into it, and prove the click landed —
+/// every chord/paste hook below is gated on the pane editor owning focus, so a
+/// silently-unfocused pane would make them all vacuously "pass" as no-ops.
+fn focus_the_pane(p: &Probe, app: &mut ScribeApp) {
+    let doc = app.tabs[0].doc_id;
+    p.mod_click(app, CLICK, egui::Modifiers::NONE);
+    p.idle(app);
+    assert!(
+        p.ctx
+            .memory(|m| m.has_focus(grid_methods::pane_editor_id(doc))),
+        "precondition: clicking the pane body must give its editor keyboard focus"
+    );
+}
+
+/// Ctrl+clicking a `[[wiki-link]]` IN A GRID PANE opens the note — creating it
+/// when it does not exist, exactly as the single-pane editor does.
+///
+/// The grid pane has its own editor render path with its own overlay pass, and
+/// the link hit-test was never wired into it. Asserted on the file that appears
+/// and the tab that ends up active, never on the intermediate ctx-data stash —
+/// which is also what proves the pane writes the SAME slot the single-pane
+/// drain reads: a divergent key would leave the note uncreated.
+#[test]
+fn ctrl_clicking_a_wikilink_in_a_grid_pane_opens_the_note() {
+    let v = vault();
+    let mut app = grid_vault_app(&v.path);
+    app.tabs[0].text = wall_of("[[Target]]");
+
+    let p = Probe::new();
+    p.settle(&mut app);
+    assert!(
+        app.grid_tree.is_some(),
+        "precondition: the grid path is the one under test"
+    );
+    assert!(
+        !v.path.join("Target.md").exists(),
+        "precondition: the link target does not exist yet"
+    );
+
+    p.mod_click(&mut app, CLICK, CMD);
+    p.idle(&mut app); // the stashed follow is drained at the top of the frame
+    p.idle(&mut app); // …and the pane the new tab gained lays out
+
+    let target = v.path.join("Target.md");
+    assert!(
+        target.exists(),
+        "the clicked [[Target]] must be created in the vault"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&target).unwrap(),
+        "# Target\n",
+        "created through open_or_create_wikilink, seeded with its heading"
+    );
+    // …and it is OPEN and ON SCREEN. The single-pane test asserts the target is
+    // the ACTIVE tab; in grid view `self.active` deliberately follows KEYBOARD
+    // FOCUS (the fix commit `7595dea` landed), and focus stays in the pane the
+    // user Ctrl+clicked in — so the note arrives as its own pane beside the
+    // source note rather than replacing what the user was reading. Asserting
+    // `active` here would be asserting the single-pane behaviour against the
+    // grid's, so assert what the user actually sees instead: a tab for the
+    // target, with a pane of its own.
+    let opened = app
+        .tabs
+        .iter()
+        .find(|t| t.doc.path() == Some(target.as_path()))
+        .expect("the followed link must be open in a tab");
+    assert!(
+        pane_rect(&app, opened.doc_id).is_some(),
+        "…and that tab must be gridded, i.e. actually visible to the user"
+    );
+}
+
+/// A plain (unmodified) click over a wiki-link must NOT follow it — the
+/// modifier is the whole consent gesture, same as the single-pane URL arm.
+#[test]
+fn a_plain_click_on_a_wikilink_in_a_grid_pane_opens_nothing() {
+    let v = vault();
+    let mut app = grid_vault_app(&v.path);
+    app.tabs[0].text = wall_of("[[Target]]");
+
+    let p = Probe::new();
+    p.settle(&mut app);
+    p.mod_click(&mut app, CLICK, egui::Modifiers::NONE);
+    p.idle(&mut app);
+
+    assert!(
+        !v.path.join("Target.md").exists(),
+        "an unmodified click must not create or open the note"
+    );
+}
+
+/// The traversal gate is the resolver's, not a second copy: a link that escapes
+/// the vault is refused and writes nothing outside it. This is the security
+/// property that would be lost if the grid pane grew its OWN follow path.
+#[test]
+fn a_traversal_wikilink_clicked_in_a_grid_pane_is_refused() {
+    let v = vault();
+    let outside = v.path.parent().unwrap().to_path_buf();
+    let mut app = grid_vault_app(&v.path);
+    app.tabs[0].text = wall_of("[[../escaped]]");
+
+    let p = Probe::new();
+    p.settle(&mut app);
+    p.mod_click(&mut app, CLICK, CMD);
+    p.idle(&mut app);
+
+    assert!(
+        !outside.join("escaped.md").exists(),
+        "nothing may be written outside the vault"
+    );
+    assert!(
+        app.toast
+            .as_deref()
+            .unwrap_or("")
+            .contains("Can't open that link"),
+        "the refusal is surfaced, not silent: {:?}",
+        app.toast
+    );
+}
+
+/// Hovering a wiki-link in a grid pane names the TARGET before the click — an
+/// aliased link must not hide where it goes.
+#[test]
+fn hovering_a_wikilink_in_a_grid_pane_previews_its_target() {
+    let v = vault();
+    let mut app = grid_vault_app(&v.path);
+    app.tabs[0].text = wall_of("[[Target|shown]]");
+
+    let p = Probe::new();
+    p.settle(&mut app);
+    p.hover(&mut app, CLICK);
+    let out = p.hover(&mut app, CLICK);
+    assert!(
+        painted_text(&out).contains("[[Target]]"),
+        "the hover must name the link TARGET, not its display alias"
+    );
+}
+
+/// Ctrl+V with an image on the clipboard pastes the attachment INTO THE GRID
+/// PANE'S buffer. The end of the wire — `pending_insert_text.is_some()` would
+/// still pass with the drain deleted.
+#[test]
+fn ctrl_v_with_a_clipboard_image_pastes_into_a_grid_pane() {
+    let v = vault();
+    let mut app = grid_vault_app(&v.path);
+    app.tabs[0].text = "before\n".repeat(80);
+
+    let p = Probe::new();
+    p.settle(&mut app);
+    assert!(
+        app.grid_tree.is_some(),
+        "precondition: the grid path is live"
+    );
+    focus_the_pane(&p, &mut app);
+
+    crate::app::note_capture::test_hooks::set_next_image(solid_image(2, 2));
+    // The RELEASE alone, which is the ONLY event `egui_winit` emits for an
+    // image-only clipboard: it special-cases the paste chord on key-DOWN and
+    // returns before pushing any `Event::Key`. A press-watching hook is dead
+    // code that a press+release test helper would still pass.
+    p.frame(
+        &mut app,
+        CMD,
+        vec![egui::Event::Key {
+            key: egui::Key::V,
+            physical_key: None,
+            pressed: false,
+            repeat: false,
+            modifiers: CMD,
+        }],
+    );
+    p.idle(&mut app); // deliver the queued insertion
+    p.idle(&mut app); // …and let the pane editor settle it
+
+    let text = app.tabs[0].text.clone();
+    assert!(
+        text.contains("![pasted image](attachments/pasted-"),
+        "Ctrl+V must insert the attachment markdown into the pane, got {text:?}"
+    );
+    let name = text
+        .split_once("](")
+        .and_then(|(_, t)| t.split_once(')'))
+        .map(|(path, _)| path.to_string())
+        .expect("a link target");
+    assert!(
+        v.path.join(&name).exists(),
+        "the link names a PNG that is really there: {name}"
+    );
+}
+
+/// A clipboard carrying TEXT pastes the text: the image branch must not also
+/// fire on the key release and drop an unwanted attachment into the pane.
+#[test]
+fn a_text_paste_in_a_grid_pane_is_not_hijacked_by_the_image_branch() {
+    let v = vault();
+    let mut app = grid_vault_app(&v.path);
+    app.tabs[0].text = "before\n".repeat(80);
+
+    let p = Probe::new();
+    p.settle(&mut app);
+    focus_the_pane(&p, &mut app);
+
+    crate::app::note_capture::test_hooks::set_next_image(solid_image(2, 2));
+    // The real gesture shape: `Event::Paste` on the key-down frame, the `V`
+    // release a frame later.
+    p.frame(&mut app, CMD, vec![egui::Event::Paste("hello".into())]);
+    p.frame(
+        &mut app,
+        CMD,
+        vec![egui::Event::Key {
+            key: egui::Key::V,
+            physical_key: None,
+            pressed: false,
+            repeat: false,
+            modifiers: CMD,
+        }],
+    );
+    p.idle(&mut app);
+    p.idle(&mut app);
+
+    assert!(
+        !v.path.join("attachments").exists(),
+        "a text paste must not write an image attachment"
+    );
+    assert!(
+        !app.tabs[0].text.contains("![pasted image]"),
+        "…nor insert attachment markdown: {:?}",
+        app.tabs[0].text
+    );
+}
+
+/// Ctrl+SHIFT+V is a different binding (markdown preview) — the image branch
+/// must not claim its release in a grid pane either.
+#[test]
+fn ctrl_shift_v_does_not_paste_an_image_in_a_grid_pane() {
+    let v = vault();
+    let mut app = grid_vault_app(&v.path);
+    app.tabs[0].text = "before\n".repeat(80);
+
+    let p = Probe::new();
+    p.settle(&mut app);
+    focus_the_pane(&p, &mut app);
+
+    let shift_cmd = CMD | egui::Modifiers::SHIFT;
+    crate::app::note_capture::test_hooks::set_next_image(solid_image(2, 2));
+    p.frame(
+        &mut app,
+        shift_cmd,
+        vec![egui::Event::Key {
+            key: egui::Key::V,
+            physical_key: None,
+            pressed: false,
+            repeat: false,
+            modifiers: shift_cmd,
+        }],
+    );
+    p.idle(&mut app);
+    p.idle(&mut app);
+
+    assert!(
+        !v.path.join("attachments").exists(),
+        "Ctrl+Shift+V must not paste an image attachment"
+    );
+}
+
+/// D — the markdown chords are intercepted in the same single-pane block as the
+/// paste hook, so Ctrl+B did nothing in split view.
+///
+/// The grid already drained `pending_wrap_marker`; only the interception was
+/// missing, which is exactly the shape of bug a "the latch was set" assertion
+/// cannot see. Asserted on the BUFFER.
+#[test]
+fn ctrl_b_wraps_the_selection_in_a_grid_pane() {
+    let v = vault();
+    let mut app = grid_vault_app(&v.path);
+    app.tabs[0].text = "hello world\n".repeat(80);
+
+    let p = Probe::new();
+    p.settle(&mut app);
+    focus_the_pane(&p, &mut app);
+
+    // Select `hello` through the pane's own (document-scoped) editor state.
+    let doc = app.tabs[0].doc_id;
+    let id = grid_methods::pane_editor_id(doc);
+    let mut st = egui::TextEdit::load_state(&p.ctx, id).unwrap_or_default();
+    st.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+        egui::text::CCursor::new(0),
+        egui::text::CCursor::new(5),
+    )));
+    st.store(&p.ctx, id);
+
+    p.frame(
+        &mut app,
+        CMD,
+        vec![egui::Event::Key {
+            key: egui::Key::B,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: CMD,
+        }],
+    );
+    p.idle(&mut app);
+
+    assert!(
+        app.tabs[0].text.starts_with("**hello**"),
+        "Ctrl+B must bold the pane's selection, got {:?}",
+        &app.tabs[0].text[..app.tabs[0].text.len().min(40)]
+    );
+}
