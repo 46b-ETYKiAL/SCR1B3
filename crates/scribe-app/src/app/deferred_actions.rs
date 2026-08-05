@@ -75,7 +75,12 @@ impl ScribeApp {
         if act.open_folder {
             if let Some(folder) = super::dialogs::pick_folder() {
                 self.status = format!("folder: {}", folder.display());
-                self.file_tree_root = Some(folder);
+                // Through `open_folder_root`, never a raw `file_tree_root`
+                // write: the helper is what records the recent-folders MRU and
+                // persists it. This site assigned the field directly, so a user
+                // who only ever opens folders from the toolbar saw "Open recent
+                // folder" stay permanently empty and read the feature as dead.
+                self.open_folder_root(folder);
             }
         }
         // F-006 wave-1 fixes from docs/audits/overlooked-surfaces-2026-05-29.md.

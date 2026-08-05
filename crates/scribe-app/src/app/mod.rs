@@ -2480,6 +2480,9 @@ mod session_io_tests;
 mod file_ops_tests;
 
 #[cfg(test)]
+mod folder_mru_tests;
+
+#[cfg(test)]
 mod binary_advisory_tests;
 
 #[cfg(test)]
