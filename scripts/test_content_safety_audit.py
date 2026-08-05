@@ -49,6 +49,12 @@ MUST_CATCH: list[tuple[str, str]] = [
     ("personal email, consumer domain", "author = someone@proton" + ".me"),
     ("personal email, second domain", "contact: a.person@pm" + ".me"),
     ("personal email, freemail", "reviewer <who@gmail" + ".com>"),
+    # The opaque-URI exemption is an explicit scheme ALLOWLIST, not a generic
+    # `word:` rule. A generic rule would exempt ordinary prose that happens to
+    # carry a colon and turn a real leak into a pass — strictly worse than the
+    # false positive it fixes. These pin that it stayed narrow.
+    ("colon-prefixed prose is not a uri scheme", "Contact:who@gmail" + ".com"),
+    ("author label is not a uri scheme", "Author:a.person@pm" + ".me"),
     # Home paths must not require a trailing slash.
     ("linux home, no trailing slash", "service runs as " + _HOME + "deploy"),
     ("linux home, real account", "cd " + _HOME + "j.smith/build"),
@@ -88,6 +94,20 @@ MUST_NOT_FIRE: list[tuple[str, str]] = [
     # point of a URL-confinement test, so flagging it would discourage exactly
     # the security tests we want written.
     ("url userinfo in a confinement test", 'assert!(confined("https://api.github.com@evil.example.com/x").is_err());'),
+    # …and the OPAQUE URI form, which has no `//` at all. The exemption used to
+    # require `://`, so every `mailto:` fixture was reported as a personal
+    # mailbox — `md_ops.rs` and `url_scan.rs` both tripped it. Rewriting those
+    # fixtures to a reserved domain only hid it until the next `mailto:` fixture.
+    # NOTE the concatenation is at RUNTIME (outside the quotes), so the sample
+    # actually scanned is a COMPLETE `mailto:user@domain.tld`. Splitting inside
+    # the literal would leave the domain TLD-less, the email pattern would not
+    # match at all, and the case would pass for the wrong reason — a vacuous
+    # test that says nothing about the exemption it claims to cover.
+    # The domains are deliberately NON-reserved, so the ONLY thing that can
+    # exempt them is the opaque-URI rule under test.
+    ("mailto, opaque uri form", "mailto:a@b" + ".com"),
+    ("mailto, inside a rust assert", 'is_clickable_url("mailto:who@gmail' + '.com")'),
+    ("xmpp, opaque uri form", "xmpp:room@conference" + ".chat"),
     # A trailing file extension means a filename, not a domain.
     ("apple iconset member", 'cp "${D}/app-32.png" "${S}/icon_16x16@2x.png"'),
     # A single-character account name identifies nobody.

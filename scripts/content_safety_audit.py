@@ -80,10 +80,28 @@ ALLOWED_EMAIL_RE = re.compile(
 )
 EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.([A-Za-z]{2,})\b")
 
-# `user@host` inside a URL authority is not an email address. This shape is
-# load-bearing in URL-confinement security tests (`https://trusted@evil/`),
-# which are exactly the tests we must not discourage people from writing.
-_URL_USERINFO_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.\-]*://\S*$")
+# `user@host` inside a URI is not a mailbox. This shape is load-bearing in
+# URL-confinement security tests (`https://trusted@evil/`), which are exactly
+# the tests we must not discourage people from writing.
+#
+# Two alternatives, because a URI's authority is not the only place `user@host`
+# legitimately appears:
+#
+#   1. `scheme://` - the hierarchical form, where `user@` is authority userinfo.
+#   2. `scheme:` with NO slashes - the opaque form. `mailto:` is the one that
+#      matters here and it is precisely the one the `://` requirement missed, so
+#      every `mailto:user@host` fixture was reported as a personal email address.
+#      That is not hypothetical: `md_ops.rs` and `url_scan.rs` both tripped it
+#      with `mailto:` fixtures, and rewriting those fixtures to @example.com
+#      only moved the trap for the next person to write one.
+#
+# The opaque form is an explicit scheme allowlist, not a generic
+# `scheme:`-with-optional-slashes pattern. A generic form would exempt any
+# `Word:name@real.example` prose - and quietly turn a real leak into a pass,
+# which is a far worse failure than the false positive being fixed.
+_URL_USERINFO_RE = re.compile(
+    r"(?:[A-Za-z][A-Za-z0-9+.\-]*://|(?:mailto|xmpp|sip|sips|im|tel):)\S*$"
+)
 
 # A trailing label that is a file extension is a filename, not a domain -
 # e.g. an Apple iconset member such as `icon_16x16@2x.png`.
