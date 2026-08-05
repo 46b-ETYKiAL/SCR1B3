@@ -193,7 +193,7 @@ You don't have to take this document at its word:
 
 Any change to a network surface, the storage layout, the reporting posture, or
 the plugin-sandbox boundary is a change to this privacy posture and will be
-called out in the [`CHANGELOG`](https://github.com/46b-ETYKiAL/Itasha.Corp_S4F3-SCR1B3/releases)
+called out in the [`CHANGELOG`](https://github.com/46b-ETYKiAL/SCR1B3/releases)
 under a "Privacy-relevant change" heading.
 
 ## Reporting concerns

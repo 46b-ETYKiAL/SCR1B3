@@ -18,8 +18,15 @@ use std::sync::mpsc::Receiver;
 use scribe_core::update::{self, ReleaseInfo};
 
 /// GitHub repo coordinates for the Releases API. Public values.
+///
+/// These MUST track the repository's current name. GitHub answers a request for
+/// a repo's FORMER name with a `301` to the numeric `/repositories/{id}/…`
+/// form, and the update check forbids redirects (see
+/// [`scribe_core::update::net`]) — so a stale name here silently breaks the
+/// update check for every installed copy. Pinned by
+/// [`tests::the_update_check_targets_the_repos_current_name`].
 pub const UPDATE_OWNER: &str = "46b-ETYKiAL";
-pub const UPDATE_REPO: &str = "Itasha.Corp_S4F3-SCR1B3";
+pub const UPDATE_REPO: &str = "SCR1B3";
 
 /// This build's Rust target triple, baked by `build.rs` (`SCR1B3_TARGET`), used
 /// to pick the matching `scr1b3-<target>.tar.gz` release asset. Falls back to an
@@ -835,6 +842,45 @@ mod tests {
         assert!(
             !staging.exists(),
             "cleanup_after_update must remove the staging directory"
+        );
+    }
+
+    #[test]
+    fn the_update_check_targets_the_repos_current_name() {
+        // THE regression this pins: the GitHub repository was renamed, and the
+        // update check composes its URL from UPDATE_OWNER/UPDATE_REPO. GitHub
+        // answers a FORMER-name request with a 301 to the numeric
+        // `/repositories/{id}/…` form — and `fetch_releases_at` forbids
+        // redirects (a security control: no off-GitHub bounce may serve forged
+        // release JSON). So a stale name here does not degrade the check, it
+        // BREAKS it outright, for every installed copy, while this file still
+        // reads as correct.
+        //
+        // Asserting the whole composed URL (not just the constant) is the
+        // point: it is the exact string that goes on the wire.
+        assert_eq!(
+            update::releases_api_url(UPDATE_OWNER, UPDATE_REPO),
+            "https://api.github.com/repos/46b-ETYKiAL/SCR1B3/releases?per_page=100",
+            "the update check must name the repository's CURRENT name — a former \
+             name 301s, and the redirect ban (correctly) turns that into a failed check"
+        );
+    }
+
+    #[test]
+    fn the_documented_endpoint_and_the_live_query_name_the_same_repo() {
+        // The repo name lives in TWO places: this crate's UPDATE_REPO (which
+        // builds the live request) and scribe-core's RELEASES_ENDPOINT (the
+        // constant ADR-0004 and PRIVACY.md point at so the single outbound host
+        // is auditable in source). That duplication is the root cause of the
+        // rename breakage — one copy can rot while the other looks right, and
+        // nothing noticed. Bind them: a future rename that updates only one
+        // side fails here instead of shipping.
+        let live = update::releases_api_url(UPDATE_OWNER, UPDATE_REPO);
+        assert!(
+            live.starts_with(scribe_core::update::RELEASES_ENDPOINT),
+            "the documented endpoint ({}) must be the prefix of the live query ({live}) — \
+             they name the same repo or the audit trail is a lie",
+            scribe_core::update::RELEASES_ENDPOINT
         );
     }
 

@@ -122,8 +122,7 @@ fn tab_index_after_move(src: usize, target: usize, idx: usize) -> usize {
 /// [`crate::updater`] and `scribe_core::update::net`); it sends no identifiers
 /// and no telemetry. Same host as the installer's `ARPHELPLINK` so it is
 /// auditable against the wix manifest.
-pub(crate) const RELEASES_URL: &str =
-    "https://github.com/46b-ETYKiAL/Itasha.Corp_S4F3-SCR1B3/releases";
+pub(crate) const RELEASES_URL: &str = "https://github.com/46b-ETYKiAL/SCR1B3/releases";
 
 /// Current wall-clock time in unix seconds, saturating to 0 before the epoch
 /// (a backwards-set clock yields 0 rather than panicking).

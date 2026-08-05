@@ -245,15 +245,33 @@ pub fn ensure_upgrade(candidate: &str, running: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Compose the exact Releases-API URL the update check issues, from the app's
+/// `owner`/`repo` coordinates. Pure (no I/O) so the composed target is
+/// assertable in a unit test.
+///
+/// This being testable is load-bearing, not cosmetic. [`fetch_releases_at`]
+/// forbids redirects (see its comment), so the URL must name the repository's
+/// CURRENT name: GitHub answers a request for a repo's FORMER name with a `301`
+/// to the numeric `/repositories/{id}/…` form, and a redirect-forbidden client
+/// turns that `301` into an error — every update check fails. A stale name here
+/// therefore breaks the updater for every installed copy while the code still
+/// looks correct, so the composed URL is pinned by
+/// [`tests::releases_api_url_composes_the_documented_shape`] and, against the
+/// live constants, by `scribe-app`'s `updater` tests. The fix for a rename is
+/// always the NAME — never relaxing the redirect ban, which is what stops an
+/// off-GitHub bounce from serving forged JSON.
+pub fn releases_api_url(owner: &str, repo: &str) -> String {
+    // per_page=100 returns every release in one page for a project this size.
+    format!("https://api.github.com/repos/{owner}/{repo}/releases?per_page=100")
+}
+
 /// Blocking GET of `/repos/{owner}/{repo}/releases` (the FULL list, one page).
 /// Sends `Cache-Control: no-cache` so an intermediary can't serve a stale list
 /// that hides a freshly-published release, and maps a 403/429 to an explicit
 /// rate-limit message (unauthenticated GitHub allows 60 req/hr/IP). Never
 /// panics.
 pub fn fetch_releases(owner: &str, repo: &str) -> Result<Vec<RawRelease>, String> {
-    // per_page=100 returns every release in one page for a project this size.
-    let url = format!("https://api.github.com/repos/{owner}/{repo}/releases?per_page=100");
-    fetch_releases_at(&url)
+    fetch_releases_at(&releases_api_url(owner, repo))
 }
 
 /// The URL-targetable core of [`fetch_releases`]: issue the redirect-forbidden,
@@ -261,7 +279,7 @@ pub fn fetch_releases(owner: &str, repo: &str) -> Result<Vec<RawRelease>, String
 /// list. Split out so the request/parse path can be unit-tested against a local
 /// mock server (no real network).
 fn fetch_releases_at(url: &str) -> Result<Vec<RawRelease>, String> {
-    let releases = ureq::get(url)
+    let mut response = ureq::get(url)
         // The API answers 200 directly, so forbid redirects (no off-GitHub
         // bounce to forged JSON that would steer the asset URLs the updater
         // trusts up to the minisign check) + a timeout (anti-hang).
@@ -275,11 +293,28 @@ fn fetch_releases_at(url: &str) -> Result<Vec<RawRelease>, String> {
         .header("X-GitHub-Api-Version", GITHUB_API_VERSION)
         .header("Cache-Control", "no-cache")
         .call()
-        .map_err(map_github_error)?
+        .map_err(map_github_error)?;
+    // With `max_redirects(0)` the client does NOT follow the 3xx — it hands the
+    // redirect response back verbatim, which is exactly the security posture we
+    // want. But an unhandled 3xx then falls through to `read_json` and surfaces
+    // as "failed to parse releases JSON", masking the real cause behind a
+    // parse error. That masking is not hypothetical: it is what a repository
+    // RENAME looks like from here (GitHub 301s a former name to the numeric
+    // `/repositories/{id}/…` form), and it made a wholly-broken update check
+    // read as a malformed-response blip. Name it instead — the check still
+    // refuses to follow, it just says why.
+    if response.status().is_redirection() {
+        return Err(format!(
+            "update check failed: the releases API answered {} (a redirect, which is \
+             deliberately not followed). The repository may have been renamed or moved — \
+             the update coordinates need updating.",
+            response.status().as_u16()
+        ));
+    }
+    response
         .body_mut()
         .read_json::<Vec<RawRelease>>()
-        .map_err(|e| format!("failed to parse releases JSON: {e}"))?;
-    Ok(releases)
+        .map_err(|e| format!("failed to parse releases JSON: {e}"))
 }
 
 /// Friendly mapping for a GitHub API transport/status error. A 403/429 on the
@@ -1907,6 +1942,66 @@ mod tests {
                 .expect("server thread panicked")
                 .expect("server handled no request")
         }
+    }
+
+    #[test]
+    fn releases_api_url_composes_the_documented_shape() {
+        // The shape ADR-0004 publishes as the single outbound surface. Pinned
+        // so a refactor cannot silently move to `/releases/latest` (mutable,
+        // can skip a newer tag) or drop `per_page=100` (would paginate away
+        // older releases).
+        assert_eq!(
+            releases_api_url("o", "r"),
+            "https://api.github.com/repos/o/r/releases?per_page=100"
+        );
+        // The repo segment is interpolated verbatim — a rename is a one-word
+        // change at the call site, never a URL rewrite here.
+        assert!(releases_api_url("46b-ETYKiAL", "SCR1B3").contains("/repos/46b-ETYKiAL/SCR1B3/"));
+    }
+
+    #[test]
+    fn fetch_releases_at_never_follows_a_redirect_to_another_host() {
+        // The redirect ban is a SECURITY control: following a 3xx would let an
+        // off-GitHub bounce serve forged release JSON, steering the asset URLs
+        // the updater trusts all the way up to the minisign check.
+        //
+        // The decoy is the whole test. It is a REAL server on another port
+        // serving a PERFECTLY VALID release list — the payload an attacker
+        // would want us to accept. If anyone ever relaxes `max_redirects`, this
+        // call starts returning that release list and the assertion below
+        // fires. Asserting "it errored" alone would not catch a follow that
+        // happened to fail for some other reason; asserting the decoy's
+        // contents never come back does.
+        let decoy = one_shot(
+            "200 OK",
+            &[],
+            br#"[{"tag_name":"v99.0.0","prerelease":false,"draft":false,
+                 "html_url":"https://evil.example/releases/tag/v99.0.0","assets":[]}]"#
+                .to_vec(),
+        );
+        let server = one_shot(
+            "301 Moved Permanently",
+            &[&format!("Location: {}/repositories/1/releases", decoy.url)],
+            Vec::new(),
+        );
+        let url = format!("{}/repos/o/former-name/releases?per_page=100", server.url);
+        let err = fetch_releases_at(&url).expect_err("a redirect must never be followed");
+        assert!(
+            !err.contains("v99.0.0"),
+            "the redirect target's payload must never be reached: {err}"
+        );
+
+        // ...and the refusal must NAME itself. A repository RENAME is exactly
+        // this 301, and it used to surface as "failed to parse releases JSON" —
+        // a wholly-broken update check reading as a malformed-response blip.
+        assert!(
+            err.contains("redirect"),
+            "the refusal must say it refused a redirect, not masquerade as a parse error: {err}"
+        );
+        assert!(
+            !err.contains("failed to parse releases JSON"),
+            "a 3xx must be named, never masked by the JSON parse error: {err}"
+        );
     }
 
     #[test]

@@ -24,7 +24,7 @@ pub use crate::config::UpdateMode;
 // descriptor the pure offline [`evaluate`] decision path operates on.
 pub use net::{
     check_for_update, download_verify_extract, download_verify_installer, ensure_upgrade,
-    fetch_releases, InstallerAsset, ReleaseInfo, UpdateOutcome,
+    fetch_releases, releases_api_url, InstallerAsset, ReleaseInfo, UpdateOutcome,
 };
 
 /// Minimal latest-release descriptor for the pure, offline [`evaluate`]
@@ -163,8 +163,7 @@ where
 /// [`crate::update::net`] as `…/repos/{owner}/{repo}/releases?per_page=100`
 /// from the app's `UPDATE_OWNER`/`UPDATE_REPO`; this constant pins the canonical
 /// repo so a reader can confirm the only outbound host.
-pub const RELEASES_ENDPOINT: &str =
-    "https://api.github.com/repos/46b-ETYKiAL/Itasha.Corp_S4F3-SCR1B3/releases";
+pub const RELEASES_ENDPOINT: &str = "https://api.github.com/repos/46b-ETYKiAL/SCR1B3/releases";
 
 #[cfg(test)]
 mod tests {

@@ -73,9 +73,22 @@ MUST_CATCH: list[tuple[str, str]] = [
 
 # (description, sample) - each MUST produce no finding at all.
 MUST_NOT_FIRE: list[tuple[str, str]] = [
-    # The public repo name shares a token with the internal monorepo name.
-    ("public repo url", "https://github.com/46b-ETYKiAL/Itasha.Corp_S4F3-SCR1B3/releases"),
-    ("public repo name in prose", "Itasha.Corp_S4F3-SCR1B3 is the repository"),
+    # A name that shares a leading token-run with the internal monorepo id.
+    # `token_probes` splits on `. _ -` and emits every contiguous run, so this
+    # shape yields `itasha-corp-s4f3` (and `itasha`, `corp`, `itasha-corp`, …) —
+    # the exact prefix of the internal monorepo identifier. These cases prove
+    # the suppression digests stay pinned to the WHOLE identifier: the day
+    # someone suppresses a prefix instead, this fires.
+    #
+    # This was the public repo's own name until it was renamed to `SCR1B3`.
+    # It is deliberately KEPT rather than swapped for the new name: the new
+    # name shares NO probe with the monorepo id, so swapping it in would delete
+    # the collision coverage and leave a case that asserts nothing.
+    ("prefix-collision with the monorepo id, url", "https://github.com/46b-ETYKiAL/Itasha.Corp_S4F3-SCR1B3/releases"),
+    ("prefix-collision with the monorepo id, prose", "Itasha.Corp_S4F3-SCR1B3 is the repository"),
+    # The public repo's current name.
+    ("public repo url", "https://github.com/46b-ETYKiAL/SCR1B3/releases"),
+    ("public repo name in prose", "SCR1B3 is the repository"),
     # The canonical publishing identity is not PII.
     ("canonical noreply identity", "133311911+46b-ETYKiAL@users.noreply.github.com"),
     # Documentation placeholders in test fixtures identify nobody.

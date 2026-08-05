@@ -521,8 +521,8 @@
     </Feature>
 
     <SetProperty Id="ARPINSTALLLOCATION" Value="[APPLICATIONFOLDER]" After="CostFinalize" />
-    <Property Id="ARPHELPLINK" Value="https://github.com/46b-ETYKiAL/Itasha.Corp_S4F3-SCR1B3" />
-    <Property Id="ARPURLINFOABOUT" Value="https://github.com/46b-ETYKiAL/Itasha.Corp_S4F3-SCR1B3" />
+    <Property Id="ARPHELPLINK" Value="https://github.com/46b-ETYKiAL/SCR1B3" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/46b-ETYKiAL/SCR1B3" />
 
     <UIRef Id="WixUI_FeatureTree" />
   </Product>

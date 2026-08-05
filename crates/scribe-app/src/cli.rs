@@ -151,7 +151,7 @@ pub fn help_text() -> String {
              {config_line}\n    \
              (override the directory with the SCR1B3_CONFIG_DIR environment variable)\n\
          \n\
-         More: https://github.com/46b-ETYKiAL/Itasha.Corp_S4F3-SCR1B3\n\
+         More: https://github.com/46b-ETYKiAL/SCR1B3\n\
          "
     )
 }

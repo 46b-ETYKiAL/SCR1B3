@@ -28,8 +28,8 @@ edition = "2021"
 # when a dependency raises the floor.
 rust-version = "1.92"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/46b-ETYKiAL/Itasha.Corp_S4F3-SCR1B3"
-homepage = "https://github.com/46b-ETYKiAL/Itasha.Corp_S4F3-SCR1B3"
+repository = "https://github.com/46b-ETYKiAL/SCR1B3"
+homepage = "https://github.com/46b-ETYKiAL/SCR1B3"
 authors = ["Itasha.Corp"]
 
 [workspace.dependencies]

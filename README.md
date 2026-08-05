@@ -40,7 +40,7 @@ The name is a nod to *Serial Experiments Lain*. Good tools don't call attention 
 ## Installation
 
 Download the build for your platform from the
-[**Releases**](https://github.com/46b-ETYKiAL/Itasha.Corp_S4F3-SCR1B3/releases)
+[**Releases**](https://github.com/46b-ETYKiAL/SCR1B3/releases)
 page — that is the single maintained install channel. Every release ships one
 signed `SHA256SUMS` manifest (plus `SHA256SUMS.minisig`) covering every
 artifact, and a `.minisig` signature next to each artifact; verify before
@@ -69,8 +69,8 @@ tar -xzf scr1b3-aarch64-apple-darwin.tar.gz && ./scr1b3
 Requires a [Rust toolchain](https://rustup.rs/) (the pinned version is in `rust-toolchain.toml`).
 
 ```bash
-git clone https://github.com/46b-ETYKiAL/Itasha.Corp_S4F3-SCR1B3
-cd Itasha.Corp_S4F3-SCR1B3
+git clone https://github.com/46b-ETYKiAL/SCR1B3
+cd SCR1B3
 cargo build --release
 # binary at target/release/scr1b3
 ```
@@ -152,7 +152,7 @@ SCR1B3 supports a user plugin system with a **capability-consent model**: plugin
 
 ## Status
 
-<img src="https://img.shields.io/github/last-commit/46b-ETYKiAL/Itasha.Corp_S4F3-SCR1B3?style=flat-square&color=00fffe" alt="Last commit timestamp for SCR1B3" />
+<img src="https://img.shields.io/github/last-commit/46b-ETYKiAL/SCR1B3?style=flat-square&color=00fffe" alt="Last commit timestamp for SCR1B3" />
 
 > [!TIP]
 > This project is open source under the MIT OR Apache-2.0 license. Contributions welcome.
