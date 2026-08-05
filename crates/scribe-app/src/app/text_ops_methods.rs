@@ -1034,6 +1034,34 @@ mod rope_writeback_tests {
         });
     }
 
+    /// Find & Replace is the caller the `set_text` doc comment NAMES
+    /// ("reload, plugin, find-replace, sort-lines, the line/comment commands")
+    /// and was the one caller that did not use it: it wrote
+    /// `tabs[active].text` directly and bumped `edit_gen` by hand, so the
+    /// persistent rope kept the PRE-replace content and the next keystroke's
+    /// write-back restored it over the replacement. The loss is structural,
+    /// not conditional — nothing gates it but the rope path being active.
+    #[test]
+    fn replace_all_survives_the_rope_writeback() {
+        assert_command_survives_rope_writeback("replace-all", |app| {
+            app.find_query = "fn f".to_string();
+            app.replace_query = "fn g".to_string();
+            app.replace_in_active(true);
+        });
+    }
+
+    /// The single-match ("Replace next") arm takes the same write path, so it
+    /// loses the edit the same way. Covered separately because `all` gates the
+    /// `replace_n` limit, not the write.
+    #[test]
+    fn replace_next_survives_the_rope_writeback() {
+        assert_command_survives_rope_writeback("replace-next", |app| {
+            app.find_query = "fn f0".to_string();
+            app.replace_query = "fn zzzz0".to_string();
+            app.replace_in_active(false);
+        });
+    }
+
     // ---- Defect 2: undo after an external edit on the rope path ----
 
     /// Types through the REAL `scribe_render::apply_event` path (so the undo

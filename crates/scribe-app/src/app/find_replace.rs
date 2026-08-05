@@ -87,15 +87,22 @@ impl ScribeApp {
                     return;
                 }
             };
-        self.tabs[self.active].text = replaced;
+        // Through the `set_text` seam, NEVER `tabs[i].text = ...`. A direct
+        // write leaves the persistent `rope_buf` holding PRE-replace content;
+        // on the rope path `frame_tick` only rebuilds the rope when
+        // `rope_buf.is_none()`, so the stale rope survives the replace and the
+        // next keystroke's `tab.text = rope.to_string()` write-back silently
+        // restores the pre-replace buffer — the user's replacement is gone.
+        // `set_text` clears `rope_buf`, invalidates `rope_state` (so Undo
+        // cannot resurrect a buffer that no longer exists) and bumps
+        // `edit_gen`, which is what invalidates the gen-keyed minimap /
+        // spellcheck / change-bar caches — so no separate bump is needed here.
+        self.tabs[self.active].set_text(replaced);
         self.status = if all {
             format!("replaced {} x '{pat}' -> '{rep}'", matches.len())
         } else {
             format!("replaced '{pat}' -> '{rep}'")
         };
-        // Wave-3: invalidate the gen-keyed minimap/spell caches.
-        let i = self.active;
-        self.tabs[i].edit_gen = self.tabs[i].edit_gen.wrapping_add(1);
         // P2-C: a find/replace splice moves offsets out from under any
         // multi-cursor set — drop the now-stale carets.
         self.mc_clear_carets();
