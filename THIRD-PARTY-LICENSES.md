@@ -10,7 +10,9 @@ index.
 
 - **Source**: https://github.com/JetBrains/JetBrainsMono
 - **License**: SIL Open Font License 1.1 (OFL-1.1)
-- **Text**: [`licenses/OFL-1.1-JetBrainsMono.txt`](licenses/OFL-1.1-JetBrainsMono.txt)
+- **Text**: [`assets/fonts/JetBrainsMono/OFL.txt`](assets/fonts/JetBrainsMono/OFL.txt)
+  (a second copy of the same license is kept at
+  [`licenses/OFL-1.1-JetBrainsMono.txt`](licenses/OFL-1.1-JetBrainsMono.txt))
 - **Copyright**: Copyright 2020 The JetBrains Mono Project Authors
 
 ### Source Code Pro
@@ -178,22 +180,69 @@ index.
 - **Notice**: This is the legal notice required by the Ubuntu Font Licence
   §3 for redistribution as part of a software bundle.
 
+## Word Lists
+
+### en_US spell-check dictionary
+
+- **Source**: https://github.com/first20hours/google-10000-english
+  (the `usa-no-swears` list)
+- **License**: Public domain — no copyright is claimed over the word list.
+- **Text**: no separate license file ships with the list; its provenance is
+  recorded in the header of
+  [`crates/scribe-core/assets/dict/en_US.txt`](crates/scribe-core/assets/dict/en_US.txt):
+  `# Source: google-10000-english (public domain), usa-no-swears list.`
+- **Notice**: This word list is compiled into the shipped binary via
+  `include_str!("../assets/dict/en_US.txt")` in
+  [`crates/scribe-core/src/spell.rs`](crates/scribe-core/src/spell.rs); it is
+  the built-in dictionary the editor's spell-checker starts from. Words the
+  user adds in-app are stored separately and are not part of this list.
+
 ## Rust Dependencies
 
-The full transitive license inventory for Cargo dependencies is generated
-at release time via [`cargo-about`](https://github.com/EmbarkStudios/cargo-about)
-and shipped inside the installer payload:
+The full transitive license inventory for Cargo dependencies is generated at
+release time via [`cargo-about`](https://github.com/EmbarkStudios/cargo-about)
+from the tracked template [`packaging/about.hbs`](packaging/about.hbs), and is
+**published as a release asset** named `THIRD-PARTY-LICENSES-RUST.html` on the
+GitHub Release for each tag.
 
-- **Windows**: `THIRD-PARTY-LICENSES-RUST.html` alongside the `.exe` in
-  the install directory.
-- **macOS**: inside the `.app` bundle's `Contents/Resources/`.
-- **Linux** (DEB / AppImage): under `/usr/share/doc/scr1b3/` or
-  `usr/share/doc/scr1b3/` inside the AppImage.
+> **Delivery, stated precisely.** This HTML inventory is a *release asset*; it
+> is **not** currently copied inside the `.exe` installer, the `.app` bundle, or
+> the `.deb`/AppImage payloads. An earlier version of this document claimed it
+> was placed in all three, which was never true: the generation step referenced
+> an `about.hbs` that had never been committed, redirected its errors to
+> `/dev/null`, and swallowed the failure with `|| echo "skipped"` — so no
+> inventory was produced at all and none was shipped anywhere. The step now
+> fails the release if generation fails.
+>
+> What *does* ship inside every release artifact (`.tar.gz`, `.deb`, AppImage,
+> `.app`/`.dmg`, and the Windows installer payload) is the `licenses/` tree
+> staged by [`packaging/collect-licenses.sh`](packaging/collect-licenses.sh):
+> the full text of every embedded font license plus the bundled word list's
+> provenance, alongside `LICENSE-MIT` and this document. That is the set the
+> OFL-1.1 §2 obligation attaches to, since those assets are compiled into the
+> binary itself.
 
 The allow-list and rejection rules for licenses on the dependency
 graph are enforced in CI via [`deny.toml`](deny.toml) (`cargo deny check`).
 Each commit blocks any dependency whose license is outside the
 allow-list.
+
+## Where the license texts are delivered
+
+Every release artifact — the portable `.tar.gz`, the `.deb`, the AppImage, the
+`.app`/`.dmg`, and the Windows installer payload — carries a `licenses/` tree
+staged by [`packaging/collect-licenses.sh`](packaging/collect-licenses.sh),
+containing the full text of every embedded font license and the bundled word
+list's provenance, alongside `LICENSE-MIT` and this document.
+
+This matters because the typefaces and the word list above are embedded into the
+executable itself (`include_bytes!` / `include_str!`), and OFL-1.1 §2 requires
+the license text to accompany every copy of the Font Software. Before this was
+wired, **no release artifact carried any font license text** — the primary
+`.tar.gz` contained only the binary, not even `LICENSE-MIT`, and the `.deb`,
+AppImage and `.dmg` carried none either. A release-blocking gate
+([`packaging/verify_license_delivery.py`](packaging/verify_license_delivery.py))
+now fails the build if any artifact path stops staging these texts.
 
 ## License Compatibility
 

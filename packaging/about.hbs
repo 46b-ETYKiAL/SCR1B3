@@ -1,0 +1,86 @@
+{{!
+  cargo-about output template for SCR1B3.
+
+  This file is TRACKED deliberately. The release workflow previously ran
+  `cargo about init --no-handlebars` and then `cargo about generate about.hbs`
+  with stderr redirected to /dev/null and a `|| echo "... skipped"` fallback --
+  `about.hbs` was never committed, so the command always failed, the error was
+  swallowed, and the release published no Rust dependency license inventory at
+  all while THIRD-PARTY-LICENSES.md claimed one was generated.
+
+  With this template committed, `cargo about generate` succeeds and the step
+  fails loudly if it ever stops succeeding.
+}}<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>SCR1B3 — Third-Party Rust Dependency Licenses</title>
+    <style>
+      body {
+        font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+        max-width: 60rem;
+        margin: 2rem auto;
+        padding: 0 1rem;
+        line-height: 1.5;
+      }
+      h1 { border-bottom: 2px solid currentColor; padding-bottom: 0.3rem; }
+      .license { margin: 2rem 0; border-top: 1px solid #8888; padding-top: 1rem; }
+      .used-by { font-size: 0.9rem; }
+      pre {
+        background: #8881;
+        padding: 1rem;
+        overflow-x: auto;
+        white-space: pre-wrap;
+        word-wrap: break-word;
+      }
+      @media (prefers-color-scheme: dark) {
+        body { background: #121212; color: #e8e8e8; }
+        a { color: #34e0d0; }
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Third-Party Rust Dependency Licenses</h1>
+    <p>
+      This document lists every third-party Rust crate compiled into SCR1B3 and
+      reproduces its license text, satisfying the Apache-2.0 &sect;4(d) NOTICE
+      convention and the redistribution clauses of the permissive licenses
+      involved.
+    </p>
+    <p>
+      <strong>This is not the whole picture.</strong> SCR1B3 also embeds
+      third-party <em>fonts</em> and a <em>word list</em> directly into the
+      binary; those are indexed in <code>THIRD-PARTY-LICENSES.md</code> and their
+      full texts ship inside every release artifact under
+      <code>licenses/</code>.
+    </p>
+
+    <h2>Overview</h2>
+    <ul>
+      {{#each overview}}
+      <li><a href="#{{id}}">{{name}}</a> &mdash; {{count}} crate(s)</li>
+      {{/each}}
+    </ul>
+
+    <h2>License texts</h2>
+    {{#each licenses}}
+    <div class="license">
+      <h3 id="{{id}}">{{name}}</h3>
+      <p class="used-by">Used by:</p>
+      <ul class="used-by">
+        {{#each used_by}}
+        <li>
+          {{#if crate.repository}}
+          <a href="{{crate.repository}}">{{crate.name}} {{crate.version}}</a>
+          {{else}}
+          {{crate.name}} {{crate.version}}
+          {{/if}}
+        </li>
+        {{/each}}
+      </ul>
+      <pre>{{text}}</pre>
+    </div>
+    {{/each}}
+  </body>
+</html>

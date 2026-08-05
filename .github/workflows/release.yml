@@ -19,7 +19,44 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # --------------------------------------------------------------------------
+  # License-delivery gate. Runs BEFORE anything is built so a release can never
+  # publish an artifact that omits the license texts it is legally required to
+  # carry. The shipped binary embeds 22 OFL-1.1 / Apache-2.0 typefaces plus a
+  # third-party word list; OFL-1.1 s2 requires the license to accompany every
+  # copy, and until this gate existed the primary .tar.gz held only the binary.
+  #
+  # This asserts over the packaging manifest (this workflow) and the repo tree
+  # -- it builds nothing, so it is seconds, not minutes. Every build job gates
+  # on it via `needs:`.
+  # --------------------------------------------------------------------------
+  license-delivery:
+    name: License delivery (fonts must ship their licenses)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install PyYAML
+        run: python3 -m pip install --user --disable-pip-version-check pyyaml
+      - name: Verify every artifact path stages its license texts
+        run: python3 packaging/verify_license_delivery.py
+      - name: Verify the collector itself produces a complete license set
+        run: |
+          set -euo pipefail
+          sh packaging/collect-licenses.sh "${PWD}" /tmp/license-probe
+          echo "--- staged tree ---"
+          find /tmp/license-probe -type f | sort
+          n=$(find /tmp/license-probe/licenses/fonts -type f | wc -l)
+          [ "$n" -gt 0 ] || { echo "::error::no font licenses staged"; exit 1; }
+          test -s /tmp/license-probe/licenses/dictionaries/en_US-PROVENANCE.txt
+          echo "font license files staged: $n"
+
   build:
+    needs: license-delivery
     name: build ${{ matrix.target }}
     permissions:
       contents: read
@@ -113,35 +150,69 @@ jobs:
           # NOTICE-file convention and the OFL/UFL §3 redistribution clause for
           # the bundled fonts. Generated only on Linux because output is
           # platform-independent (avoids 3× redundant runs).
-          cargo install cargo-about --locked --version "^0.6" || true
-          cargo about init --no-handlebars 2>/dev/null || true
-          cargo about generate about.hbs --output-file THIRD-PARTY-LICENSES-RUST.html 2>/dev/null \
-            || cargo about generate --format json --output-file THIRD-PARTY-LICENSES-RUST.json \
-            || echo "cargo-about generate skipped (config not yet committed)"
+          set -euo pipefail
+          # No error swallowing. This step previously ran
+          #   cargo about init --no-handlebars 2>/dev/null || true
+          #   cargo about generate about.hbs ... 2>/dev/null || ... || echo "skipped"
+          # with `about.hbs` never committed, so it ALWAYS failed, the failure
+          # was hidden, and no inventory was ever published -- while
+          # THIRD-PARTY-LICENSES.md told readers one was generated at release
+          # time. The template now lives at packaging/about.hbs (tracked) and
+          # any failure here fails the release, which is the correct behaviour
+          # for a legal-compliance artifact.
+          cargo install cargo-about --locked --version "^0.6"
+          cargo about generate packaging/about.hbs \
+            --output-file THIRD-PARTY-LICENSES-RUST.html
+          # A zero-byte file would upload "successfully" and satisfy nobody.
+          [ -s THIRD-PARTY-LICENSES-RUST.html ] \
+            || { echo "::error::cargo-about produced an empty inventory"; exit 1; }
+          echo "generated THIRD-PARTY-LICENSES-RUST.html ($(wc -c < THIRD-PARTY-LICENSES-RUST.html) bytes)"
       - name: Upload third-party license inventory
         if: runner.os == 'Linux'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: third-party-licenses-rust
-          path: |
-            THIRD-PARTY-LICENSES-RUST.html
-            THIRD-PARTY-LICENSES-RUST.json
-          if-no-files-found: warn
+          path: THIRD-PARTY-LICENSES-RUST.html
+          # `warn` would let a missing inventory pass silently -- the exact
+          # failure mode this change exists to remove. The `release` job
+          # publishes every downloaded artifact, so this file becomes a release
+          # asset; if it is absent, the release is incomplete and must fail.
+          if-no-files-found: error
       - name: Package + checksum
         shell: bash
         run: |
+          set -euo pipefail
           mkdir -p dist
           bin="scr1b3"
           [ "${{ runner.os }}" = "Windows" ] && bin="scr1b3.exe"
-          cp "target/${{ matrix.target }}/release/$bin" "dist/" 2>/dev/null || true
+
+          # Assemble the archive contents in a staging dir OUTSIDE `dist/`.
+          # `dist/*` is uploaded verbatim as the job's artifact, so staging in
+          # place would publish loose LICENSE/licenses/ files as stray release
+          # assets. The staging dir keeps `dist/` to exactly the two intended
+          # assets: the tarball and its .sha256 sidecar.
+          stage=pkg-stage
+          rm -rf "$stage"; mkdir -p "$stage"
+          cp "target/${{ matrix.target }}/release/$bin" "$stage/"
+
+          # License delivery is MANDATORY. The binary embeds 22 OFL-1.1 /
+          # Apache-2.0 typefaces plus a third-party word list; OFL-1.1 s2
+          # requires the license text to accompany every copy. This tarball
+          # previously contained ONLY the binary -- not even LICENSE-MIT.
+          # The collector exits non-zero (failing the job) if any license is
+          # missing, so an unlicensed archive can never be produced.
+          sh packaging/collect-licenses.sh "${PWD}" "$stage"
+
+          # Explicit member list: the binary stays at the archive root (the
+          # .deb / AppImage / .app jobs extract it by bare name), and the
+          # license tree rides alongside it. Naming members explicitly means a
+          # future edit cannot silently drop the licenses.
+          tar -czf "dist/scr1b3-${{ matrix.target }}.tar.gz" -C "$stage" \
+            "$bin" LICENSE-MIT THIRD-PARTY-LICENSES.md licenses
+          echo "--- archive contents ---"
+          tar -tzf "dist/scr1b3-${{ matrix.target }}.tar.gz"
+
           cd dist
-          tar -czf "scr1b3-${{ matrix.target }}.tar.gz" "$bin" 2>/dev/null || true
-          # Drop the raw binary now that it's archived: it is NOT a release asset
-          # and, being named just `scr1b3`/`scr1b3.exe`, the linux + macOS copies
-          # would collide as same-named assets and fail the upload. Only the
-          # target-prefixed `scr1b3-<target>.{tar.gz,sha256}` ship from this job;
-          # the Windows installer .exe is built by the `windows-installer` job.
-          rm -f "$bin"
           # The checksum sidecar MUST be named `<asset>.sha256` —
           # `scr1b3-<target>.tar.gz.sha256` — to match the in-app updater
           # (`build_release_info` looks for `{asset}.sha256`) and the signature
@@ -213,10 +284,14 @@ jobs:
           tar -xzf "$tgz" -C payload
           [ -f payload/scr1b3.exe ] || { echo "::error::scr1b3.exe not found in tarball"; exit 1; }
           if [ -d app/assets ]; then cp -r app/assets payload/assets; fi
-          for f in LICENSE-MIT LICENSE-APACHE README.md; do
-            [ -f "app/$f" ] && cp "app/$f" payload/ || true
-          done
+          # License delivery is MANDATORY, not the previous best-effort
+          # `[ -f … ] && cp … || true` (which silently shipped nothing when a
+          # file was absent, and never carried a single font license text).
+          # The collector fails the job if any bundled font's license is
+          # missing — OFL-1.1 s2 requires it to accompany every copy.
+          sh app/packaging/collect-licenses.sh app payload
           find payload -maxdepth 2 | head -40
+          echo "font license files in payload: $(find payload/licenses/fonts -type f | wc -l)"
       - name: Build native installer (.exe)
         shell: bash
         env:
@@ -298,9 +373,16 @@ jobs:
           rm -rf "$deb"
           mkdir -p "$deb/usr/bin" "$deb/usr/share/applications" \
                    "$deb/usr/share/icons/hicolor" "$deb/DEBIAN"
-          tar -xzf "$tgz" -C "$deb/usr/bin"
+          # Extract ONLY the binary: the tarball also carries the license tree,
+          # which belongs in /usr/share/doc, not /usr/bin.
+          tar -xzf "$tgz" -C "$deb/usr/bin" scr1b3
           [ -f "$deb/usr/bin/scr1b3" ] || { echo "::error::scr1b3 not in tarball"; exit 1; }
           chmod 0755 "$deb/usr/bin/scr1b3"
+          # License texts at the Debian-standard location. Mandatory: the
+          # collector fails the job if any bundled font's license is missing
+          # (OFL-1.1 s2 — the license must accompany every copy).
+          mkdir -p "$deb/usr/share/doc/scr1b3"
+          sh app/packaging/collect-licenses.sh app "$deb/usr/share/doc/scr1b3"
           install -m0644 app/packaging/linux/scr1b3.desktop "$deb/usr/share/applications/scr1b3.desktop"
           cp -r app/assets/icons/hicolor/. "$deb/usr/share/icons/hicolor/"
           # Control file: reuse the committed template, substitute the real
@@ -321,8 +403,12 @@ jobs:
           appdir=AppDir
           rm -rf "$appdir"
           mkdir -p "$appdir/usr/bin" "$appdir/usr/share/applications" "$appdir/usr/share/icons/hicolor"
-          tar -xzf "$tgz" -C "$appdir/usr/bin"
+          # Extract ONLY the binary (see the .deb note above).
+          tar -xzf "$tgz" -C "$appdir/usr/bin" scr1b3
           chmod 0755 "$appdir/usr/bin/scr1b3"
+          # License texts inside the AppImage (OFL-1.1 s2). Mandatory.
+          mkdir -p "$appdir/usr/share/doc/scr1b3"
+          sh app/packaging/collect-licenses.sh app "$appdir/usr/share/doc/scr1b3"
           install -m0644 app/packaging/linux/scr1b3.desktop "$appdir/usr/share/applications/scr1b3.desktop"
           install -m0644 app/packaging/linux/scr1b3.desktop "$appdir/scr1b3.desktop"            # top-level (required)
           cp -r app/assets/icons/hicolor/. "$appdir/usr/share/icons/hicolor/"
@@ -393,8 +479,13 @@ jobs:
           appbundle="SCR1B3.app"
           rm -rf "$appbundle"
           mkdir -p "$appbundle/Contents/MacOS" "$appbundle/Contents/Resources"
-          tar -xzf "$tgz" -C "$appbundle/Contents/MacOS"
+          # Extract ONLY the binary; licenses go in Contents/Resources, which is
+          # where a .app bundle is expected to carry them.
+          tar -xzf "$tgz" -C "$appbundle/Contents/MacOS" scr1b3
           chmod 0755 "$appbundle/Contents/MacOS/scr1b3"
+          # License texts inside the bundle (OFL-1.1 s2). Mandatory: the
+          # collector fails the job rather than shipping a breach.
+          sh app/packaging/collect-licenses.sh app "$appbundle/Contents/Resources/licenses"
           # Info.plist: reuse the committed template, substitute the real version
           # into the two 0.1.0 placeholders (CFBundleVersion + ShortVersionString).
           sed -E "s|<string>0\.1\.0</string>|<string>${VER}</string>|g" \
