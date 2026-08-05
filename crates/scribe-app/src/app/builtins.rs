@@ -135,6 +135,31 @@ impl ScribeApp {
                     let idx = names.iter().position(|n| *n == cur.as_str()).unwrap_or(0);
                     let next = names[(idx + 1) % names.len()].to_string();
                     self.config.appearance.theme = next.clone();
+                    // An explicit cycle TAKES OWNERSHIP of the theme, so the
+                    // automatic mode has to yield.
+                    //
+                    // With `follow_os_theme` on — which is the SHIPPED DEFAULT —
+                    // `appearance.theme` is not authoritative: on a light OS
+                    // `effective_theme_name` returns `ghost-paper`
+                    // unconditionally, and on a dark OS it substitutes
+                    // `wired-noir` whenever the cycled name is a light theme. So
+                    // cycling advanced the config, persisted it, repainted the
+                    // IDENTICAL theme, and the status bar named a theme the
+                    // window was not showing — a bound command that lies.
+                    //
+                    // The alternative (leave the toggle on and report that the OS
+                    // is driving) keeps the automatic mode but leaves the command
+                    // permanently inert on a light desktop, which is worse: the
+                    // user invoked a direct manipulation and got nothing. Here
+                    // the choice is explicit, announced in the status line, and
+                    // reversible from Settings → "Follow OS dark/light".
+                    //
+                    // Only the COMMAND surfaces do this. The Settings theme
+                    // picker deliberately does not: the "Follow OS dark/light"
+                    // checkbox sits directly beneath it, so a user choosing there
+                    // can see why the picked theme may not paint. A keyboard
+                    // shortcut and a palette entry carry no such context.
+                    let was_following = std::mem::take(&mut self.config.appearance.follow_os_theme);
                     self.save_config();
                     // Writing the config name is only half of a theme change:
                     // `self.theme` (what the window actually paints from) is
@@ -143,7 +168,11 @@ impl ScribeApp {
                     // this flag the palette entry persisted the new theme and
                     // the window kept rendering the old one until restart.
                     self.pending_theme_reapply = true;
-                    self.status = format!("theme: {next}");
+                    self.status = if was_following {
+                        format!("theme: {next} (stopped following the OS light/dark setting)")
+                    } else {
+                        format!("theme: {next}")
+                    };
                 }
             }
             BuiltinCommand::StartLsp => self.start_lsp_for_active(),

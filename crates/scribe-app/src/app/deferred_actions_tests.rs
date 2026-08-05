@@ -408,6 +408,66 @@ fn cycle_theme_advances_to_the_next_builtin_and_persists_it() {
     assert!(app.status.contains("theme:"));
 }
 
+// ---- CycleTheme under the SHIPPED DEFAULT config ----
+//
+// `AppearanceConfig::default()` ships `follow_os_theme = true`. With it on and
+// a light OS, `effective_theme_name` returns "ghost-paper" UNCONDITIONALLY, so
+// Cycle Theme advanced `config.appearance.theme`, persisted it, repainted the
+// IDENTICAL theme, and the status bar named a theme the window was not
+// showing. Every test above pins `follow_os_theme = false` (see
+// `painted_theme_app`) — which is exactly why they could not see this.
+//
+// The fix: an explicit cycle takes ownership of the theme and turns the
+// automatic mode off, so the command the user invoked is the one that paints.
+
+#[test]
+fn cycle_theme_is_honest_under_the_default_config_on_a_light_os() {
+    let mut cfg = Config::default();
+    cfg.editor.first_run_completed = true;
+    assert!(
+        cfg.appearance.follow_os_theme,
+        "precondition — the SHIPPED default follows the OS theme; if this flips, \
+         this test is guarding nothing"
+    );
+    let mut app = ScribeApp::new_test(cfg);
+    let ctx = egui::Context::default();
+    ctx.set_theme(egui::Theme::Light);
+    // Paint once so `self.theme` holds the OS-resolved theme, as it does at
+    // startup on a light desktop.
+    app.reapply_theme(&ctx);
+    let before = app.theme.name.clone();
+    assert_eq!(
+        before, "ghost-paper",
+        "precondition — a light OS resolves to the bundled light theme"
+    );
+
+    apply(
+        &mut app,
+        &ctx,
+        &mut Pending {
+            cycle_theme: true,
+            ..Default::default()
+        },
+    );
+
+    assert_ne!(
+        app.theme.name, before,
+        "Cycle Theme repainted the IDENTICAL theme: the OS-follow branch \
+         substituted `ghost-paper` for whatever was cycled to"
+    );
+    assert_eq!(
+        app.theme.name, app.config.appearance.theme,
+        "the painted theme must be the one that was persisted"
+    );
+    assert!(
+        app.status.contains(&app.theme.name),
+        "the status bar must name the theme that is actually painted, got {:?} \
+         while painting {:?}",
+        app.status,
+        app.theme.name
+    );
+}
+
 #[test]
 fn cycle_theme_wraps_from_the_last_builtin_back_to_the_first() {
     let (mut app, ctx) = app();
