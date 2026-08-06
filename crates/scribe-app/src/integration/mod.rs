@@ -572,6 +572,154 @@ mod packaging_consistency_tests {
         );
     }
 
+    /// A POSIX shell to run `packaging/*.sh` with: `sh` on PATH (Linux/macOS),
+    /// else the Git-for-Windows one — the same interpreter every `shell: bash`
+    /// workflow step runs under, and the one `sh packaging/…` resolves to on the
+    /// windows runner.
+    ///
+    /// A host with NO shell is a hard failure, never a skip. The whole point of
+    /// the tests below is that the signing gate can be shown to FAIL; a test
+    /// that quietly does not run would re-create, in the test layer, the exact
+    /// defect it exists to catch.
+    fn posix_shell() -> std::process::Command {
+        const CANDIDATES: [&str; 6] = [
+            "sh",
+            "bash",
+            r"C:\Program Files\Git\usr\bin\sh.exe",
+            r"C:\Program Files\Git\bin\sh.exe",
+            r"C:\Program Files\Git\bin\bash.exe",
+            r"C:\Program Files (x86)\Git\bin\sh.exe",
+        ];
+        for c in CANDIDATES {
+            if std::process::Command::new(c)
+                .args(["-c", "exit 0"])
+                .output()
+                .is_ok_and(|o| o.status.success())
+            {
+                return std::process::Command::new(c);
+            }
+        }
+        panic!(
+            "no POSIX shell found (tried {CANDIDATES:?}) — cannot execute \
+             packaging/require-signing-key.sh, so the release signing gate is \
+             UNVERIFIED on this host. Install a shell rather than skipping: an \
+             unfalsifiable gate is the defect this test exists to prevent."
+        );
+    }
+
+    /// Run `packaging/require-signing-key.sh` for one ref, as the release
+    /// workflow does when `MINISIGN_SECRET_KEY` is empty. Returns its exit code
+    /// and everything it printed.
+    fn run_signing_guard(ref_type: &str, ref_name: &str) -> (Option<i32>, String) {
+        // Forward slashes: CARGO_MANIFEST_DIR is backslashed on Windows and the
+        // MSYS argument translation mangles a mixed-separator path.
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../packaging/require-signing-key.sh")
+            .to_string_lossy()
+            .replace('\\', "/");
+        let out = posix_shell()
+            .arg(&script)
+            .env("GITHUB_REF_TYPE", ref_type)
+            .env("GITHUB_REF_NAME", ref_name)
+            // The workflow only reaches the guard when the secret is empty; make
+            // that precondition explicit rather than inherited from the host.
+            .env_remove("MINISIGN_SECRET_KEY")
+            .output()
+            .unwrap_or_else(|e| panic!("could not run {script}: {e}"));
+        let log = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        (out.status.code(), log)
+    }
+
+    /// THE falsification this gate was missing. Release publishing verifies its
+    /// own signatures — but the whole block sat behind an early `exit 0` taken
+    /// whenever `MINISIGN_SECRET_KEY` was empty, so the signing AND its
+    /// self-verify were skipped together and the release still went green,
+    /// publishing artifacts the fail-closed in-app updater REJECTS. A gate that
+    /// cannot fail is not a gate; this test proves this one can.
+    #[test]
+    fn the_signing_gate_fails_on_a_stable_tag_with_no_key() {
+        let (code, log) = run_signing_guard("tag", "v0.4.63");
+        assert_eq!(
+            code,
+            Some(1),
+            "an unsigned STABLE tag must FAIL the release — every deployed \
+             client would reject the artifacts and auto-update would silently \
+             stop working. Guard output:\n{log}"
+        );
+        assert!(
+            log.contains("::error::"),
+            "the failure must annotate the run as an error so it is visible in \
+             the GitHub UI, not just a non-zero exit. Guard output:\n{log}"
+        );
+    }
+
+    /// The other half: the gate must fail ONLY where it should. A guard that
+    /// failed everything would be "shown red" while making every dispatch run
+    /// and every rc tag unshippable — and the non-tag path is an open owner
+    /// decision that this change deliberately does not pre-empt.
+    #[test]
+    fn the_signing_gate_still_tolerates_a_prerelease_tag_and_a_non_tag_ref() {
+        for (ref_type, ref_name) in [
+            ("tag", "v0.4.63-rc.1"),
+            ("tag", "v0.4.63-pre"),
+            ("branch", "master"),
+            ("", ""),
+        ] {
+            let (code, log) = run_signing_guard(ref_type, ref_name);
+            assert_eq!(
+                code,
+                Some(0),
+                "{ref_type}/{ref_name} must still be allowed to ship unsigned \
+                 (rc/pre builds are opt-in downloads, and the non-tag path is \
+                 unchanged by design). Guard output:\n{log}"
+            );
+            assert!(
+                log.contains("::warning::"),
+                "shipping unsigned must still be WARNED about, never silent — \
+                 the updater will reject these artifacts. Guard output:\n{log}"
+            );
+        }
+    }
+
+    /// The guard is only worth anything if the workflow actually calls it. This
+    /// pins the wiring: inside the empty-secret branch, `require-signing-key.sh`
+    /// must run BEFORE the `exit 0` that skips signing + self-verify.
+    #[test]
+    fn the_release_signing_step_calls_the_key_guard_before_returning_early() {
+        const RELEASE: &str = include_str!("../../../../.github/workflows/release.yml");
+        let marker = "if [ -z \"${MINISIGN_SECRET_KEY:-}\" ]; then";
+        let start = RELEASE
+            .find(marker)
+            .expect("release.yml must still branch on an empty MINISIGN_SECRET_KEY");
+        let branch = &RELEASE[start..];
+        let end = branch
+            .find("\n          fi")
+            .expect("the empty-secret branch must be closed");
+        let branch = &branch[..end];
+
+        let guard = branch
+            .find("packaging/require-signing-key.sh")
+            .unwrap_or_else(|| {
+                panic!(
+                    "the empty-secret branch of release.yml no longer calls \
+                     packaging/require-signing-key.sh, so an unsigned STABLE tag \
+                     publishes green again:\n{branch}"
+                )
+            });
+        let early_exit = branch
+            .find("exit 0")
+            .expect("the branch must still skip signing when the key is absent");
+        assert!(
+            guard < early_exit,
+            "the guard must run BEFORE the `exit 0`; after it, it is \
+             unreachable and the gate is decorative:\n{branch}"
+        );
+    }
+
     /// Slice one job body out of a workflow, from its `  <name>:` header to the
     /// header of the job that follows it. Both bounds are named explicitly (the
     /// same shape `the_mutation_in_diff_shard_count_agrees_in_all_three_places`

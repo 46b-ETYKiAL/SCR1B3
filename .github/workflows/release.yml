@@ -1002,7 +1002,16 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "${MINISIGN_SECRET_KEY:-}" ]; then
-            echo "::warning::MINISIGN_SECRET_KEY not set — shipping checksummed but UNSIGNED artifacts (auto-update will reject them). See packaging/signing.md."
+            # This early return skips the signing AND the fail-closed self-verify
+            # gate below it, in one move — so with the secret unprovisioned the
+            # whole gate was unreachable and the release published artifacts the
+            # in-app updater is built to REJECT, green. It is now ref-sensitive:
+            # `require-signing-key.sh` EXITS 1 on a stable tag (hard failure), and
+            # 0 for a prerelease tag or a non-tag ref (warning + unsigned, the
+            # pre-existing behaviour, deliberately unchanged for non-tags).
+            # It lives in a script so the gate can be executed — and therefore
+            # shown to fail — by a test; an unfalsifiable gate is the defect.
+            sh packaging/require-signing-key.sh
             exit 0
           fi
           cargo install rsign2 --locked --version "^0.6"
