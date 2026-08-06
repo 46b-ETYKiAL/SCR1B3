@@ -1368,4 +1368,118 @@ mod tests {
         // Clean EOF -> Ok(None), never an error.
         assert!(protocol::read_message(&mut reader).unwrap().is_none());
     }
+
+    /// `open_uri` is the guard the editor uses to make sure a change is only
+    /// ever sent for the buffer the server is actually tracking
+    /// (`frame_tick.rs` compares it against the active tab's path). Nothing
+    /// asserted its VALUE, so all three of its mutants survived: `-> None`
+    /// (the editor concludes no document is open and syncs nothing, freezing
+    /// diagnostics), `-> Some("")` and `-> Some("xyzzy")` (the comparison never
+    /// matches any real tab, same freeze — or, worse, matches the WRONG tab if
+    /// the constant ever collided).
+    ///
+    /// Three assertions, each discriminating: `None` before `did_open` kills
+    /// both constant-`Some` mutants; the exact URI after `did_open` kills
+    /// `-> None`; and re-opening a second document proves the value TRACKS the
+    /// document rather than being any fixed string.
+    #[test]
+    fn open_uri_names_the_document_the_server_is_actually_tracking() {
+        // `.expect`, not `else { return }`: `cat` (unix) / `cmd` (windows) is
+        // always present, so a None is a broken harness — and a test that
+        // silently returns is a mutant's best friend.
+        let mut client = live_client().expect(
+            "`cat` / `cmd /c pause` must be spawnable — a None here is a broken \
+             harness, not an absent dependency",
+        );
+
+        assert_eq!(
+            client.open_uri(),
+            None,
+            "before did_open the client tracks NO document — reporting some \
+             constant uri here would make the editor sync an unopened buffer"
+        );
+
+        client
+            .did_open("file:///proj/main.rs", "rust", "fn main() {}\n")
+            .expect("did_open enqueues while the writer is live");
+        assert_eq!(
+            client.open_uri(),
+            Some("file:///proj/main.rs"),
+            "open_uri must report the uri that was actually opened"
+        );
+
+        client
+            .did_open("file:///proj/other.rs", "rust", "fn other() {}\n")
+            .expect("did_open enqueues while the writer is live");
+        assert_eq!(
+            client.open_uri(),
+            Some("file:///proj/other.rs"),
+            "re-opening must RETARGET: a value that stays on the first uri (or \
+             on any constant) is what lets a tab switch send one file's text \
+             against another file's uri"
+        );
+    }
+
+    /// `has_pending_change` is the "an edit is noted but the quiet window has
+    /// not elapsed" signal. `-> false` survived: a client that always claims
+    /// nothing is queued makes a caller believe the edit already went out, so
+    /// the server keeps serving diagnostics for stale text with nothing to
+    /// indicate it. The complementary `-> true` mutant was already caught, so
+    /// this pins the direction that was not.
+    ///
+    /// The clock is passed in, never slept on — the debouncer takes `now`
+    /// explicitly, so the window is asserted with two instants and the test
+    /// stays deterministic.
+    #[test]
+    fn has_pending_change_is_true_exactly_while_an_edit_is_waiting_out_the_window() {
+        let mut client = live_client().expect(
+            "`cat` / `cmd /c pause` must be spawnable — a None here is a broken \
+             harness, not an absent dependency",
+        );
+        let t0 = Instant::now();
+
+        assert!(
+            !client.has_pending_change(),
+            "a client with no document open has nothing queued"
+        );
+        client
+            .did_open("file:///x.rs", "rust", "fn mai() {}\n")
+            .expect("did_open enqueues while the writer is live");
+        assert!(
+            !client.has_pending_change(),
+            "OPENING a file is not an edit — didOpen already carried the text"
+        );
+
+        client.note_change("fn main() {}\n", t0);
+        assert!(
+            client.has_pending_change(),
+            "an edit inside the quiet window IS pending: reporting false here \
+             tells the caller the server already has this text when it has not \
+             been sent at all"
+        );
+        // Still pending part-way through the window: the flag tracks the queue,
+        // not merely the instant of the keystroke.
+        assert!(
+            !client
+                .flush_pending_change(t0 + sync::DEBOUNCE / 2)
+                .expect("the writer is live"),
+            "a flush before the quiet window elapses must send nothing"
+        );
+        assert!(
+            client.has_pending_change(),
+            "and it must leave the edit QUEUED — the flag tracks the queue, not \
+             merely the instant of the keystroke"
+        );
+
+        assert!(
+            client
+                .flush_pending_change(t0 + sync::DEBOUNCE + Duration::from_millis(1))
+                .expect("the writer is live"),
+            "once the window has elapsed the change must actually be sent"
+        );
+        assert!(
+            !client.has_pending_change(),
+            "and the queue is empty again afterwards"
+        );
+    }
 }
