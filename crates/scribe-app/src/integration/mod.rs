@@ -571,4 +571,129 @@ mod packaging_consistency_tests {
              drops that shard's mutants and a duplicate wastes a runner"
         );
     }
+
+    /// Slice one job body out of a workflow, from its `  <name>:` header to the
+    /// header of the job that follows it. Both bounds are named explicitly (the
+    /// same shape `the_mutation_in_diff_shard_count_agrees_in_all_three_places`
+    /// uses) so a rename cannot silently shrink the window to nothing and make
+    /// every `contains` assertion below vacuously... fail — which is the safe
+    /// direction, and why `expect` is used rather than a default.
+    fn job_body<'a>(workflow: &'a str, job: &str, next_job: &str) -> &'a str {
+        let start = workflow
+            .find(&format!("\n  {job}:"))
+            .unwrap_or_else(|| panic!("the `{job}` job must exist"));
+        let end = start
+            + workflow[start + 1..]
+                .find(&format!("\n  {next_job}:"))
+                .unwrap_or_else(|| panic!("`{job}` must be followed by `{next_job}`"));
+        &workflow[start..end]
+    }
+
+    /// `light` links a package only if EVERY `<ComponentGroupRef>` in the .wxs
+    /// resolves to a group some fragment DEFINES. `main.wxs` references
+    /// `LicenseComponents`, and nothing in this repo authors that group by hand:
+    /// it exists solely as the output of a `heat` harvest over the staged license
+    /// tree (a hand-written list of 22 font directories would rot the moment a
+    /// font is added or dropped).
+    ///
+    /// A workflow that runs candle+light but NOT the harvest therefore cannot
+    /// link at all — it dies with
+    ///   `main.wxs(520) : error LGHT0094 : Unresolved reference to symbol
+    ///    'WixComponentGroup:LicenseComponents' in section 'Product:*'`
+    /// — which is exactly how ci.yml's `msi-build` job stood: deterministically
+    /// red on every single push, because the harvest step lived only in
+    /// release.yml. This test is what makes that impossible to reintroduce.
+    ///
+    /// Asserted over BOTH msi jobs and over every referenced group, and it covers
+    /// the two adjacent ways to fail identically: generating the fragment and
+    /// then not LINKING it, and harvesting with `-var var.X` while candle is
+    /// never given the matching `-dX=` (CNDL0150).
+    #[test]
+    fn both_msi_jobs_resolve_every_component_group_main_wxs_references() {
+        const CI: &str = include_str!("../../../../.github/workflows/ci.yml");
+        const RELEASE: &str = include_str!("../../../../.github/workflows/release.yml");
+
+        // Every `<ComponentGroupRef Id="…">` in main.wxs.
+        let refs: Vec<String> = WXS
+            .split("<ComponentGroupRef")
+            .skip(1)
+            .map(|tail| {
+                let after = tail
+                    .split("Id=\"")
+                    .nth(1)
+                    .expect("a ComponentGroupRef must carry an Id");
+                after[..after.find('"').expect("the Id must be quoted")].to_string()
+            })
+            .collect();
+        // Non-vacuity: with no refs collected every loop below is skipped and the
+        // test passes no matter what the workflows do.
+        assert!(
+            !refs.is_empty(),
+            "main.wxs declares no <ComponentGroupRef> at all — either the license \
+             components were dropped from the package, or this test's parser no \
+             longer matches the source and is now asserting nothing"
+        );
+
+        for (workflow, job_name, next_job) in [
+            (CI, "msi-build", "gate"),
+            (RELEASE, "windows-msi", "linux-installers"),
+        ] {
+            let job = job_body(workflow, job_name, next_job);
+            for id in &refs {
+                let cg = format!("-cg {id} ");
+                let generated = job.contains(&cg);
+                let authored = WXS.contains(&format!("<ComponentGroup Id=\"{id}\""));
+                assert!(
+                    generated || authored,
+                    "the `{job_name}` job never defines the component group \
+                     `{id}` that main.wxs references: it neither harvests it \
+                     (`heat … -cg {id}`) nor is it authored in the .wxs. `light` \
+                     cannot resolve the reference, so the job fails with LGHT0094 \
+                     on EVERY run. Add the heat harvest (mirror the other msi \
+                     job) — do NOT drop the ComponentGroupRef: the license texts \
+                     are a shipping obligation, not decoration."
+                );
+                if !generated {
+                    continue;
+                }
+
+                // The harvested fragment must be compiled AND handed to `light`.
+                // Generating `licenses.wxs` and never linking `licenses.wixobj`
+                // fails with the very same LGHT0094.
+                let after = &job[job.find(&cg).expect("just matched")..];
+                let frag = after
+                    .split("-out ")
+                    .nth(1)
+                    .expect("the heat harvest must name an -out fragment")
+                    .split_whitespace()
+                    .next()
+                    .expect("the -out fragment must be a filename");
+                let obj = frag.replace(".wxs", ".wixobj");
+                let light = &job[job.find("light.exe").expect("the job must run light")..];
+                assert!(
+                    light.contains(&obj),
+                    "the `{job_name}` job harvests `{id}` into {frag} but never \
+                     passes {obj} to light — the fragment is generated and then \
+                     dropped, which fails with LGHT0094 exactly as if it had \
+                     never been harvested at all"
+                );
+
+                // `heat -var var.X` emits `$(var.X)` into the fragment, so candle
+                // must be given `-dX=…` for both the fragment AND main.wxs.
+                if let Some(tail) = after.split("-var var.").nth(1) {
+                    let var: String = tail
+                        .chars()
+                        .take_while(|c| c.is_alphanumeric() || *c == '_')
+                        .collect();
+                    assert!(
+                        job.matches(&format!("-d{var}=")).count() >= 2,
+                        "the `{job_name}` job harvests with `-var var.{var}` but \
+                         does not pass `-d{var}=` to BOTH candle invocations \
+                         (main.wxs and the fragment) — the one that misses it \
+                         fails with CNDL0150 (undefined preprocessor variable)"
+                    );
+                }
+            }
+        }
+    }
 }

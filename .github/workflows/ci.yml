@@ -785,6 +785,25 @@ jobs:
         # than stubbing a placeholder file) keeps the compiled MSI the same
         # artifact a release would produce.
         run: cargo build --locked --release --package scribe-app
+      - name: Stage the license tree the installer packages
+        shell: bash
+        # main.wxs references `<ComponentGroupRef Id="LicenseComponents" />`, a
+        # group NOTHING in the repo authors by hand -- release.yml generates it
+        # with `heat` from this staged tree. Without this step (and the harvest
+        # below) `light` cannot resolve the reference and the job dies with
+        # LGHT0094, which is exactly how this job stood before: it ran candle and
+        # light but never the harvest, so it was deterministically red.
+        #
+        # Staged into its OWN directory rather than target/release/ so `heat` can
+        # harvest the license tree without also re-harvesting scr1b3.exe, which
+        # main.wxs already declares. Mirrors release.yml's msi job exactly, so CI
+        # compiles the same package shape a release publishes.
+        run: |
+          set -euo pipefail
+          sh packaging/collect-licenses.sh "${PWD}" licstage
+          n=$(find licstage/licenses/fonts -type f | wc -l)
+          echo "font license files staged: $n"
+          [ "$n" -gt 0 ] || { echo "::error::no font licenses staged"; exit 1; }
       - name: Install WiX 3.14 (pinned + checksum-verified)
         shell: bash
         run: |
@@ -804,7 +823,10 @@ jobs:
             echo "::error::no archive extractor available (tried unzip, 7z)"
             exit 1
           fi
-          for t in candle.exe light.exe dark.exe; do
+          # heat.exe is as load-bearing as candle/light here: main.wxs carries a
+          # `<ComponentGroupRef Id="LicenseComponents" />` that ONLY the harvest
+          # below defines, so a WiX archive without heat cannot link at all.
+          for t in candle.exe light.exe dark.exe heat.exe; do
             [ -f "$RUNNER_TEMP/wix/$t" ] || { echo "::error::WiX archive did not contain $t"; exit 1; }
           done
           "$RUNNER_TEMP/wix/candle.exe" -? | head -2
@@ -824,11 +846,37 @@ jobs:
           echo "installer version = $VER"
           # Windows-style dir for the $(var.CargoTargetBinDir)\scr1b3.exe join.
           BIN_DIR="$(pwd -W)/target/release"
+          LIC_DIR="$(pwd -W)/licstage"
           [ -f "target/release/scr1b3.exe" ] || { echo "::error::target/release/scr1b3.exe missing"; exit 1; }
+          # Harvest the staged license tree into a WiX fragment -- this is what
+          # DEFINES the `LicenseComponents` group main.wxs references. Generated,
+          # not hand-authored: a hand-written list of 22 font directories rots the
+          # moment a font is added or dropped, and the whole point of the
+          # collector is that the set is dynamic. The XSL adds the RemoveFolder
+          # rows heat never emits -- without them `light` fails with one
+          # LGHT0204/ICE64 per harvested directory, because SCR1B3 installs into
+          # the user profile. Authoring the rows keeps ICE64 ENFORCED instead of
+          # suppressed -- the same trade main.wxs already documents for
+          # APPLICATIONFOLDER / ProgramsFolder.
+          "$RUNNER_TEMP/wix/heat.exe" dir "$LIC_DIR" -nologo \
+            -cg LicenseComponents -dr APPLICATIONFOLDER \
+            -ag -srd -sfrag -var var.LicenseStageDir \
+            -t crates/scribe-app/wix/license-harvest.xsl \
+            -out licenses.wxs
+          # Non-vacuity: a harvest that produced nothing would compile and link
+          # perfectly and ship an MSI with no license texts at all -- the exact
+          # silent under-delivery this step exists to prevent.
+          harvested=$(grep -c '<File ' licenses.wxs || true)
+          echo "harvested license files: $harvested"
+          [ "$harvested" -ge 25 ] || { echo "::error::heat harvested only $harvested license file(s); expected >= 25 (22 fonts + top-level docs)"; exit 1; }
           "$RUNNER_TEMP/wix/candle.exe" -nologo -arch x64 \
-            -dVersion="$VER" -dCargoTargetBinDir="$BIN_DIR" \
+            -dVersion="$VER" -dCargoTargetBinDir="$BIN_DIR" -dLicenseStageDir="$LIC_DIR" \
             -out main.wixobj crates/scribe-app/wix/main.wxs
           [ -s main.wixobj ] || { echo "::error::candle reported success but produced no .wixobj"; exit 1; }
+          "$RUNNER_TEMP/wix/candle.exe" -nologo -arch x64 \
+            -dLicenseStageDir="$LIC_DIR" \
+            -out licenses.wixobj licenses.wxs
+          [ -s licenses.wixobj ] || { echo "::error::candle produced no .wixobj for the license fragment"; exit 1; }
       - name: Link the installer (light, with ICE validation)
         shell: bash
         # ICE validation stays ON. Exactly two ICEs are suppressed, and only
@@ -862,7 +910,7 @@ jobs:
           "$RUNNER_TEMP/wix/light.exe" -nologo \
             -ext WixUIExtension -ext WixUtilExtension \
             -sice:ICE38 -sice:ICE91 \
-            -out scr1b3-installer.msi main.wixobj
+            -out scr1b3-installer.msi main.wixobj licenses.wixobj
           [ -f scr1b3-installer.msi ] || { echo "::error::light reported success but produced no .msi"; exit 1; }
           # light writes the .msi BEFORE ICE validation runs, so "the file
           # exists" is not by itself proof the link succeeded -- `set -e` on
@@ -893,6 +941,17 @@ jobs:
             echo "::error::registry rows differ between source ($src) and compiled MSI ($built) -- rows were dropped or merged during the build."
             exit 1
           fi
+          # License delivery, asserted against the BUILT package rather than the
+          # staging directory -- the same assertion release.yml makes, kept here
+          # so a license regression is caught on the PR that causes it instead of
+          # at tag time. A staged tree only proves the collector ran; the File
+          # table is what proves the texts actually SHIP.
+          licfiles=$(grep -cE '<File [^>]*Name="(OFL|LICENSE|UFL)[^"]*"' decompiled.wxs || true)
+          echo "license files in the compiled MSI: $licfiles"
+          [ "$licfiles" -ge 22 ] || { echo "::error::the compiled MSI carries only $licfiles font license file(s) (expected >= 22) -- OFL-1.1 s2 requires the text to accompany every copy."; exit 1; }
+          for doc in LICENSE-MIT THIRD-PARTY-LICENSES.md; do
+            grep -q "Name=\"$doc\"" decompiled.wxs || { echo "::error::the compiled MSI does not carry $doc"; exit 1; }
+          done
       - name: Upload the compiled MSI
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
