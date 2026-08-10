@@ -165,6 +165,56 @@ def test_guard_actually_fails_on_a_real_bad_commit() -> None:
     assert rc == 1, "the guard passed a commit carrying a non-allowlisted identity"
 
 
+def test_guard_catches_a_committer_only_violation() -> None:
+    """A clean author must not launder a dirty committer.
+
+    `git rebase` and `git commit --amend --reset-author` each rewrite ONE of
+    the two identities, so the realistic leak is a commit whose author is a
+    proper noreply address while the committer is the machine's personal git
+    identity. A suite whose only end-to-end case has BOTH fields dirty cannot
+    tell the difference: deleting the committer check leaves it green. This
+    case is the one that pins the committer half.
+    """
+    import os
+    import tempfile
+
+    bad = "rebaser" + _AT + "not-allowlisted" + ".test"
+    good = "133311911+46b-ETYKiAL@users.noreply.github.com"
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        env = {**os.environ, "GIT_COMMITTER_NAME": "Rebaser",
+               "GIT_COMMITTER_EMAIL": bad}
+
+        def g(*a: str) -> None:
+            subprocess.run(["git", *a], cwd=tmp, check=True,
+                           capture_output=True, text=True, env=env)
+
+        g("init", "-q", "-b", "main")
+        g("config", "user.name", "Contributor")
+        g("config", "user.email", good)
+        g("commit", "-q", "--allow-empty", "-m", "base")
+        base = subprocess.run(["git", "rev-parse", "HEAD"], cwd=tmp, check=True,
+                              capture_output=True, text=True, env=env).stdout.strip()
+        g("commit", "-q", "--allow-empty", "-m", "clean author, dirty committer")
+
+        # Guard the fixture itself: if git ignored the committer override the
+        # case would be vacuous - it would pass while testing nothing.
+        ae, ce = subprocess.run(
+            ["git", "show", "--no-patch", "--format=%ae%n%ce", "HEAD"],
+            cwd=tmp, check=True, capture_output=True, text=True, env=env,
+        ).stdout.split()
+        assert aig.identity_is_allowed(ae) is not None, "fixture author is not clean"
+        assert aig.identity_is_allowed(ce) is None, "fixture committer is not dirty"
+
+        real_root = aig.ROOT
+        try:
+            aig.ROOT = tmp
+            rc = aig.main(["--base", base, "--head", "HEAD"])
+        finally:
+            aig.ROOT = real_root
+    assert rc == 1, "a dirty committer passed behind a clean author"
+
+
 def _main() -> int:
     failures = 0
     for name, ident in MUST_REJECT:
@@ -180,6 +230,7 @@ def _main() -> int:
         test_this_suite_carries_no_literal_leak,
         test_empty_range_can_be_made_a_failure,
         test_guard_actually_fails_on_a_real_bad_commit,
+        test_guard_catches_a_committer_only_violation,
     ):
         try:
             fn()

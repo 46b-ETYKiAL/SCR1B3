@@ -50,9 +50,17 @@ def token_digest(token: str) -> str:
 INTERNAL_TOKEN_DIGESTS: dict[str, str] = {
     "c8ae9fddee570432385c33928b50b265": "internal tooling directory reference",
     "faf63005bf32b8fc0b4466622ba0612c": "internal tooling directory reference",
+    "7ccc78c856566b5b74057ab772c8f4ed": "internal tooling directory reference",
+    "466fc9500022d781f5cc2775d5a54ef8": "internal tooling directory reference",
     "e0cf04edcbf5e4ab5c2fab05b82f2725": "internal monorepo identifier",
     "0a9795434b627753e2f6987dad607f2f": "internal monorepo identifier",
+    "33558db327f794545cdcc796bd457ed8": "internal monorepo identifier",
     "dbb10d47bc0663fbc78909b1561ea73f": "internal work-tracking token",
+    # The workstation account name, as a BARE token. A home path containing it
+    # is already caught structurally; this covers the form that carries no path
+    # around it (a config value, a log line, a serialised profile field), which
+    # no path pattern can see.
+    "9cb7059967aebce6b943a6910bc5139a": "operating-system account name",
 }
 
 # ---------------------------------------------------------------------------
@@ -135,7 +143,32 @@ _HOME_LABELS = {
     "absolute Windows user path",
     "absolute macOS home path",
     "absolute Linux home path",
+    "absolute Windows user path (mounted)",
+    "absolute Linux home path (mounted)",
 }
+
+# A home path reached through a cross-OS mount. These need their own patterns
+# rather than a relaxation of the ones above, and the reason is worth stating
+# because it looks like duplication:
+#
+#   The plain `/home/` and `/Users/` patterns carry a `(?<![A-Za-z0-9])`
+#   lookbehind so that an ordinary relative path (`docs/home/index.md`,
+#   `crates/x/Users/...`) does not fire. Every mount prefix ends in an
+#   alphanumeric -- `/mnt/c`, `/cygdrive/c`, `\\wsl$\Ubuntu` -- so that
+#   lookbehind silently made a REAL home path under a mount invisible:
+#   `/mnt/c/Users/<account>` identifies its owner exactly as well as
+#   `C:\Users\<account>` does, and was matched by nothing.
+#
+#   Relaxing the lookbehind would have reintroduced the relative-path false
+#   positives it exists to prevent. Enumerating the mount prefixes instead
+#   leaves the existing patterns untouched and adds no new FP surface: each
+#   alternative below is anchored to a specific, unambiguous mount syntax.
+_MOUNT_PREFIX = (
+    r"(?:/mnt/[A-Za-z]\b"                                   # WSL:      /mnt/c
+    r"|/cygdrive/[A-Za-z]\b"                                # Cygwin:   /cygdrive/c
+    r"|[\\/]{2,4}wsl(?:\$|\.localhost)[\\/]{1,4}[A-Za-z0-9._\-]+"  # \\wsl$\Distro
+    r")"
+)
 
 STRUCTURAL_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     # Windows user profile. BOTH separator conventions: a forward-slash form is
@@ -143,8 +176,23 @@ STRUCTURAL_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     # Rust string literals, YAML, and shell snippets.
     # Capture ONLY the account segment, so the placeholder allowlist applies
     # here exactly as it does to the POSIX home patterns.
-    ("absolute Windows user path", re.compile(r"[A-Za-z]:[\\/]{1,2}Users[\\/]{1,2}([^\s\"'<>|,)\]\\/]+)")),
+    # `{1,4}` on the separators, not `{1,2}`: a path written into a source
+    # literal is escaped once (`C:\\Users\\x` in Rust/JSON) and a path written
+    # into a literal that is itself embedded in another literal is escaped
+    # twice (`C:\\\\Users\\\\x`). The doubly-escaped form is the one that
+    # appears in generated fixtures and config blobs, and `{1,2}` could not
+    # see it at all.
+    ("absolute Windows user path", re.compile(r"[A-Za-z]:[\\/]{1,4}Users[\\/]{1,4}([^\s\"'`<>|,)\]\\/]+)")),
     ("absolute macOS home path", re.compile(r"(?<![A-Za-z0-9])/Users/([A-Za-z0-9._\-]+)")),
+    # The same two shapes reached through a cross-OS mount (see _MOUNT_PREFIX).
+    (
+        "absolute Windows user path (mounted)",
+        re.compile(_MOUNT_PREFIX + r"[\\/]{1,4}Users[\\/]{1,4}([^\s\"'`<>|,)\]\\/]+)", re.IGNORECASE),
+    ),
+    (
+        "absolute Linux home path (mounted)",
+        re.compile(_MOUNT_PREFIX + r"[\\/]{1,4}home[\\/]{1,4}([A-Za-z0-9._\-]+)", re.IGNORECASE),
+    ),
     # No trailing slash required: a home path that ends at the account name
     # identifies that account just as well as one with a trailing slash does.
     ("absolute Linux home path", re.compile(r"(?<![A-Za-z0-9])/home/([A-Za-z0-9._\-]+)")),
@@ -213,7 +261,7 @@ def scan_text(text: str, origin: str, *, third_party: bool = False) -> list[str]
     for label, pat in STRUCTURAL_PATTERNS:
         for m in pat.finditer(text):
             if label in _HOME_LABELS:
-                who = (m.group(1) or "").strip("<>'\"").lower()
+                who = (m.group(1) or "").strip("<>'\"`").lower()
                 # A single-character account name identifies nobody.
                 if len(who) <= 1 or who in PLACEHOLDER_HOME_USERS:
                     continue
@@ -368,7 +416,25 @@ def main() -> int:
     args = ap.parse_args()
 
     if args.hash:
-        print(token_digest(args.hash))
+        # Print the digest of every PROBE form, not of the raw token.
+        #
+        # `scan_text` never hashes a token as typed: it hashes the normalised
+        # probe forms `token_probes` derives from it (case-folded, stripped of
+        # surrounding `._-`, split into contiguous segment runs). Registering
+        # `token_digest(raw)` therefore produces an entry that can never match
+        # whenever the raw form differs from its probe form -- a trailing
+        # underscore or a mixed-case spelling is enough. That entry is not a
+        # loose suppression; it is a DEAD one, and it looks identical in the
+        # table to a working entry.
+        #
+        # Emitting the probe digests makes the registration path honest: copy
+        # the line for the form you actually mean to suppress.
+        probes = sorted(token_probes(args.hash))
+        if not probes:
+            print("no probe form derives from that token; nothing to register")
+            return 1
+        for p in probes:
+            print(f'    "{token_digest(p)}": "<label>",  # probe form: {p}')
         return 0
 
     violations: list[str] = []

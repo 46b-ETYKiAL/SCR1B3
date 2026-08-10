@@ -37,6 +37,15 @@ _WIN_BS = "C:\\Users" + "\\"
 _HOME = "/home" + "/"
 _MAC = "/Users" + "/"
 _DOT = "."
+_BS = chr(92)
+# A path written into a source literal that is ITSELF inside another literal
+# is escaped twice; this is that form, assembled so it is not a leak here.
+_WIN_BS4 = "C:" + (_BS * 4) + "Users" + (_BS * 4)
+# Cross-OS mount prefixes. A home path under one of these identifies its owner
+# exactly as well as the unmounted form does.
+_MNT = "/mnt/c"
+_CYG = "/cygdrive/c"
+_WSL_UNC = (_BS * 2) + "wsl$" + _BS + "Ubuntu"
 
 
 # (description, sample) - each MUST produce at least one finding.
@@ -59,10 +68,32 @@ MUST_CATCH: list[tuple[str, str]] = [
     ("linux home, no trailing slash", "service runs as " + _HOME + "deploy"),
     ("linux home, real account", "cd " + _HOME + "j.smith/build"),
     ("macos home", "open " + _MAC + "jbloggs/dev/x"),
+    # Doubly-escaped separators. The `{1,2}` quantifier this replaced could not
+    # see this form at all, so a path embedded in a nested string literal was
+    # invisible to a rule that claimed to cover Windows user paths.
+    ("windows path, doubly-escaped separators", 'cfg = "' + _WIN_BS4 + 'a.dev_"'),
+    # Home paths reached through a cross-OS mount. Every mount prefix ends in
+    # an alphanumeric, so the `(?<![A-Za-z0-9])` lookbehind on the plain
+    # patterns silently made all three of these invisible.
+    ("wsl mount to a windows profile", "cd " + _MNT + "/Users/" + "a.dev_/src"),
+    ("cygwin mount to a windows profile", _CYG + "/Users/" + "jsmith/build"),
+    ("wsl unc to a linux home", "explorer " + _WSL_UNC + "/home/" + "jsmith"),
+    # Internal tooling directories that were not previously registered.
+    ("tooling dir, plans", "see " + _DOT + "plans/active/x.md"),
+    ("tooling dir, codex", "path: " + _DOT + "codex/config.toml"),
+    # A bare fragment of the internal monorepo identifier, with no surrounding
+    # path or sibling segment to give it away.
+    ("bare monorepo id fragment", "the R0" + "UT3 arbiter module"),
+    # The workstation account name as a BARE token, with no path around it -
+    # the form no path pattern can see.
+    ("os account name, bare token", "profile = " + _DOT + "46b" + "_"),
     # Internal tooling / monorepo / work-item tokens (hash-matched).
     ("tooling dir", "see " + _DOT + "s4f3-data/notes.md"),
     ("tooling dir, second", "path: " + _DOT + "claude/agents"),
-    ("monorepo id embedded in a longer path", "C:/x/Itasha.Corp_S4F3-" + "R0UT3-4RB" + "1T3R/y"),
+    # NOTE the split points: a bare fragment of the identifier is now a
+    # suppressed token in its own right, so the previous 3-way split left a
+    # detectable token in THIS file's bytes. The runtime value is unchanged.
+    ("monorepo id embedded in a longer path", "C:/x/Itasha.Corp_S4F3-" + "R0U" + "T3-4RB" + "1T3R/y"),
     ("work-item token", "<!-- bespoke instrument (plan-" + "611). -->"),
     # Secret shapes.
     ("private key block", "-----BEGIN OPENSSH PRIVATE " + "KEY-----"),
@@ -125,6 +156,27 @@ MUST_NOT_FIRE: list[tuple[str, str]] = [
     ("apple iconset member", 'cp "${D}/app-32.png" "${S}/icon_16x16@2x.png"'),
     # A single-character account name identifies nobody.
     ("single-letter account in a prompt fixture", r't.advance(b"line\r\nC:\Users\x>");'),
+    # The placeholder allowlist must reach the MOUNTED patterns too. If it did
+    # not, adding mount coverage would have turned every documentation example
+    # written against a WSL path into a false positive.
+    ("placeholder account under a wsl mount", "cd " + _MNT + "/Users/" + "user/proj"),
+    ("placeholder account under a cygwin mount", _CYG + "/Users/" + "runner/work"),
+    ("placeholder account under a wsl unc", _WSL_UNC + "/home/" + "alice"),
+    # A mount path that is not a home path at all.
+    ("mount path, not a home dir", "mount " + _MNT + "/ProgramData/cache"),
+    ("mount path, data volume", "/mnt/data" + "/backups/2026"),
+    # The relative-path false positives the `(?<![A-Za-z0-9])` lookbehind
+    # exists to prevent. The mounted patterns are additive and must not have
+    # reintroduced them.
+    ("relative docs path containing 'home'", "see docs/home/index.md for setup"),
+    ("relative path containing 'Users'", "crates/core/Users/mod.rs"),
+    ("word 'home' in prose", "return to the home screen"),
+    # Tokens that share digits with the account name but are not it. The
+    # account probe carries a LEADING DOT; these do not, so registering it must
+    # not have caught them.
+    ("version-like token", "bumped to 0.46b in the changelog"),
+    ("public handle, no leading dot", "https://github.com/46b-ETYKiAL/SCR1B3"),
+    ("public handle in prose", "46b-ETYKiAL maintains this repository"),
 ]
 
 
