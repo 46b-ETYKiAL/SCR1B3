@@ -1158,19 +1158,48 @@ jobs:
             echo "::error::No artifacts found under dist/ — refusing to publish an empty release."
             exit 1
           fi
+          # Is this ref a stable release, or a prerelease / dispatch build?
+          #
+          # This step used to have NO notion of a prerelease: it forced
+          # `--draft=false --latest` on every ref. packaging/require-signing-key.sh
+          # deliberately TOLERATES an unsigned prerelease (rc builds are opt-in
+          # downloads, not auto-update targets) — so cutting `v0.5.0-rc.1` with
+          # no signing key provisioned published UNSIGNED artifacts as the
+          # repo's CURRENT release, served by every download link and offered to
+          # the updater, which is built to reject exactly those bytes. Neither
+          # behaviour was wrong alone; the hole was that the two disagreed.
+          #
+          # The predicate is therefore READ FROM THE SAME FILE the signing guard
+          # reads, not restated here — two copies could drift back apart, and a
+          # drift is the bug in its general form (an artifact both "unsigned
+          # because prerelease" and "published because stable"). `src/` prefix
+          # for the same reason the signing step uses it: this job checks out
+          # with `path: src`.
+          class=$(sh src/packaging/semver-tag-class.sh)
+          echo "ref $tag classified: $class"
           # Idempotent: create the release if absent, else upload/clobber into it
           # (so a re-run after a partial failure recovers instead of erroring).
           if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$tag" --repo "$GITHUB_REPOSITORY" --clobber "${assets[@]}"
           else
+            create_flags=()
+            [ "$class" = "stable" ] || create_flags+=(--prerelease)
             gh release create "$tag" \
               --repo "$GITHUB_REPOSITORY" \
               --title "$tag" \
               --generate-notes \
+              "${create_flags[@]}" \
               "${assets[@]}"
           fi
-          # Always finish PUBLISHED + marked latest. GitHub auto-demotes a
-          # release to a draft when its tag is deleted, so a delete+re-push tag
-          # (re-cut) would otherwise leave an invisible draft after the upload
-          # path. This makes the release reliably public + installable.
-          gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+          # Always finish PUBLISHED. GitHub auto-demotes a release to a draft
+          # when its tag is deleted, so a delete+re-push tag (re-cut) would
+          # otherwise leave an invisible draft after the upload path.
+          #
+          # Only a STABLE tag is promoted to Latest. Both flags are passed
+          # explicitly in BOTH directions so a re-cut that changes a tag's class
+          # is corrected rather than inheriting the previous run's marking.
+          if [ "$class" = "stable" ]; then
+            gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --draft=false --prerelease=false --latest
+          else
+            gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --draft=false --prerelease --latest=false
+          fi

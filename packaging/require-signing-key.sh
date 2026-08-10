@@ -48,31 +48,28 @@ set -eu
 REF_TYPE="${GITHUB_REF_TYPE:-}"
 REF_NAME="${GITHUB_REF_NAME:-}"
 
-if [ "${REF_TYPE}" != "tag" ]; then
+# The stable/prerelease/non-tag predicate lives in ONE file, shared with
+# release.yml's publish step. It used to be inline here, which left the publish
+# step free to have no notion of a prerelease at all — it forced
+# `gh release edit --draft=false --latest` on every ref. Combined with THIS
+# script's (correct, deliberate) tolerance of an unsigned prerelease, cutting
+# `v0.5.0-rc.1` with no key published UNSIGNED artifacts as the current
+# release. Two copies of the predicate are two things that can drift; the drift
+# IS the bug, so there is now only one copy. See packaging/semver-tag-class.sh
+# for the regex and the reasoning behind it.
+#
+# Pinned in BOTH directions by `a_hyphenated_non_semver_tag_is_stable_and_must_
+# fail_unsigned` and `a_wellformed_semver_prerelease_is_still_tolerated`, and
+# the agreement with the publish step by
+# `the_signing_guard_and_the_publish_step_agree_on_what_a_prerelease_is`.
+CLASS=$(sh "$(dirname "$0")/semver-tag-class.sh")
+
+if [ "${CLASS}" = "non-tag" ]; then
 	echo "::warning::MINISIGN_SECRET_KEY not set on a non-tag ref (${REF_TYPE:-?}/${REF_NAME:-?}) — shipping checksummed but UNSIGNED artifacts (auto-update will reject them). See packaging/signing.md."
 	exit 0
 fi
 
-# A tag is a PRERELEASE only when it carries a real SemVer prerelease segment:
-# an optional leading `v`, then MAJOR.MINOR.PATCH, then `-<identifiers>` (and
-# optionally `+<build metadata>`).
-#
-# This was `case "${REF_NAME}" in *-*)` — "contains a hyphen ANYWHERE". The
-# workflow triggers on `v*`, so that handed the unsigned-is-fine path to every
-# stable tag that merely happened to contain a hyphen: `v1.0-final`,
-# `v0.5-hotfix` and a date tag like `v2026-08-10` would each have PUBLISHED
-# UNSIGNED and green, and every deployed client would reject the release. None
-# of those is a SemVer prerelease — `1.0-final` has no PATCH field, and
-# `2026-08-10` is not a version triple at all — so they now fail closed with the
-# rest of the stable tags.
-#
-# `v0.5.0-hotfix` DOES stay a prerelease: `0.5.0-hotfix` is a well-formed SemVer
-# prerelease of 0.5.0, so treating it as one is the correct reading of the tag,
-# not a hole. Cut `v0.5.1` (or provision the key) to ship it signed.
-#
-# Pinned in BOTH directions by `a_hyphenated_non_semver_tag_is_stable_and_must_
-# fail_unsigned` and `a_wellformed_semver_prerelease_is_still_tolerated`.
-if printf '%s' "${REF_NAME}" | grep -qE '^v?[0-9]+\.[0-9]+\.[0-9]+-[0-9A-Za-z.-]+(\+[0-9A-Za-z.-]+)?$'; then
+if [ "${CLASS}" = "prerelease" ]; then
 	echo "::warning::MINISIGN_SECRET_KEY not set — shipping checksummed but UNSIGNED prerelease artifacts (auto-update will reject them; acceptable for an rc/pre tag ${REF_NAME})."
 	exit 0
 fi

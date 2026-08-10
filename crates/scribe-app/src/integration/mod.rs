@@ -807,6 +807,153 @@ mod packaging_consistency_tests {
         }
     }
 
+    /// Run `packaging/semver-tag-class.sh` for one ref, exactly as both the
+    /// signing guard and release.yml's publish step do. Returns its verdict.
+    fn run_tag_class(ref_type: &str, ref_name: &str) -> String {
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../packaging/semver-tag-class.sh")
+            .to_string_lossy()
+            .replace('\\', "/");
+        let out = posix_shell()
+            .arg(&script)
+            .env("GITHUB_REF_TYPE", ref_type)
+            .env("GITHUB_REF_NAME", ref_name)
+            .output()
+            .unwrap_or_else(|e| panic!("could not run {script}: {e}"));
+        assert!(
+            out.status.success(),
+            "the classifier must always answer, never fail: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// THE invariant that closes the unsigned-published-as-latest hole.
+    ///
+    /// Two independently-defensible behaviours combined into it: the signing
+    /// guard deliberately TOLERATES an unsigned prerelease (rc builds are
+    /// opt-in downloads, not auto-update targets), while the publish step had
+    /// no notion of a prerelease at all and forced `--latest` on every ref. So
+    /// `v0.5.0-rc.1` with no signing key published UNSIGNED artifacts as the
+    /// repo's CURRENT release — served by every download link and offered to
+    /// the updater, which is built to reject exactly those bytes.
+    ///
+    /// The general form of the bug is a DISAGREEMENT: an artifact
+    /// simultaneously "unsigned because prerelease" and "published because
+    /// stable". So the property asserted here is the agreement itself:
+    ///
+    ///     class == "stable"  <=>  an unsigned build is FORBIDDEN (guard exits 1)
+    ///
+    /// Both sides now read the same file, so they cannot drift — but that is an
+    /// implementation detail. This pins the RELATIONSHIP, so it still holds if
+    /// either side is ever reimplemented.
+    #[test]
+    fn the_signing_guard_and_the_publish_step_agree_on_what_a_prerelease_is() {
+        // Deliberately spans both sides of the predicate, including the shapes
+        // a naive "contains a hyphen" test gets wrong.
+        for (ref_type, tag) in [
+            ("tag", "v0.4.63"),               // stable
+            ("tag", "v1.2.3"),                // stable
+            ("tag", "v0.4.63-rc.1"),          // prerelease
+            ("tag", "v0.5.0-hotfix"),         // well-formed SemVer prerelease
+            ("tag", "v1.2.3-alpha.2+build.5"), // prerelease w/ build metadata
+            ("tag", "v1.0-final"),            // NOT SemVer -> stable
+            ("tag", "v0.5-hotfix"),           // NOT SemVer -> stable
+            ("tag", "v2026-08-10"),           // date tag -> stable
+            ("branch", "master"),             // dispatch build
+        ] {
+            let class = run_tag_class(ref_type, tag);
+            let (code, log) = run_signing_guard(ref_type, tag);
+            let unsigned_forbidden = code == Some(1);
+            assert_eq!(
+                class == "stable",
+                unsigned_forbidden,
+                "{ref_type}/{tag}: the classifier says `{class}` but the signing \
+                 guard {} an unsigned build (exit {code:?}). These two MUST \
+                 agree: if they disagree, an artifact can be both `unsigned \
+                 because prerelease` and `published as latest because stable`, \
+                 which is exactly the hole this pair of checks exists to close. \
+                 Guard output:\n{log}",
+                if unsigned_forbidden { "FORBIDS" } else { "ALLOWS" }
+            );
+        }
+    }
+
+    /// The agreement above is only worth anything if the publish step actually
+    /// consults the shared classifier and acts on it. This pins that wiring.
+    ///
+    /// The step previously ended in an unconditional
+    /// `gh release edit … --draft=false --latest`, so a prerelease was promoted
+    /// to Latest regardless. A `contains("--latest")` cannot tell that apart
+    /// from the correct version, so the two branches are read out and checked
+    /// for OPPOSITE markings.
+    #[test]
+    fn the_publish_step_marks_a_prerelease_and_withholds_latest() {
+        const RELEASE: &str = include_str!("../../../../.github/workflows/release.yml");
+        const SCRIPT: &str = "packaging/semver-tag-class.sh";
+
+        let job_start = RELEASE
+            .find("\n  release:")
+            .expect("release.yml must declare a `release` job");
+        let job = &RELEASE[job_start..];
+
+        // Same checkout-path reasoning as the signing-guard wiring test: the
+        // job checks out with `path: src`, so a bare path would not resolve.
+        let checkout_path = job.split("\n          path: ").nth(1).map(|tail| {
+            tail.lines()
+                .next()
+                .expect("a `path:` value must be on its line")
+                .trim()
+                .to_string()
+        });
+        let expected = match checkout_path.as_deref() {
+            Some(p) if p != "dist" => format!("{p}/{SCRIPT}"),
+            _ => SCRIPT.to_string(),
+        };
+
+        let step_start = job
+            .find("- name: Create GitHub Release")
+            .expect("release.yml must still have a `Create GitHub Release` step");
+        let step = &job[step_start..];
+
+        assert!(
+            step.contains(&format!("sh {expected}")),
+            "the publish step must derive the release class from `{expected}`, \
+             the SAME file the signing guard reads. Restating the predicate \
+             inline lets the two drift apart, and the drift is the bug.\n{step}"
+        );
+
+        let branch_start = step
+            .find("if [ \"$class\" = \"stable\" ]; then")
+            .expect(
+                "the publish step must branch on the release class; without a \
+                 branch it marks every ref the same way, which is the defect",
+            );
+        let branch = &step[branch_start..];
+        let else_at = branch
+            .find("\n          else")
+            .expect("the class branch must have an else");
+        let stable = &branch[..else_at];
+        let prerelease = &branch[else_at..];
+
+        assert!(
+            stable.contains("--latest") && !stable.contains("--latest=false"),
+            "a STABLE tag must still be promoted to Latest — withholding it \
+             from everything would 'fix' the hole by making no release ever \
+             current:\n{stable}"
+        );
+        assert!(
+            prerelease.contains("--latest=false"),
+            "a PRERELEASE must NOT be promoted to Latest, or unsigned rc \
+             artifacts are served as the current release:\n{prerelease}"
+        );
+        assert!(
+            prerelease.contains("--prerelease") && !prerelease.contains("--prerelease=false"),
+            "a PRERELEASE must be MARKED as one, so the GitHub UI and the API \
+             both report it correctly:\n{prerelease}"
+        );
+    }
+
     /// Both msi jobs must resolve the installer version by the SAME mechanism.
     ///
     /// ci.yml's `msi-build` exists so that CI green predicts release green. It
