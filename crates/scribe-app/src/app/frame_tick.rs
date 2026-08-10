@@ -2569,7 +2569,36 @@ impl ScribeApp {
         // (`line_gutter`). The read-only RopeEditor draws its OWN gutter, so
         // skip this one there (and avoid the O(n) `lines().count()` on a
         // 256 MiB+ buffer).
-        if show_line_numbers && !self.fold_view && !read_only && !chrome_hidden {
+        //
+        // The EDITABLE rope arm draws its own gutter for exactly the same
+        // reason (`.with_line_numbers(show_line_numbers)` below), and it never
+        // writes `line_gutter` — the only writers are the two TextEdit arms, at
+        // the end of this function and in `grid_methods`. Rendering the external
+        // strip beside it therefore painted a SECOND gutter out of whatever the
+        // last TextEdit frame left behind: numbers, bookmark dots, change-bar
+        // stripes and diagnostic marks frozen at the PREVIOUS buffer's row Ys,
+        // next to the rope editor's own correct gutter. With no TextEdit frame
+        // ever run (a >= threshold file opened first) the vector is empty, the
+        // loop paints nothing, and `exact_width` still reserves and fills a dead
+        // strip.
+        let rope_arm = use_rope_editor(
+            self.config.editor.experimental_rope_editor,
+            self.tabs[active].text.len(),
+            self.config.editor.rope_editor_auto_threshold_bytes,
+        );
+        // Clearing is not just cosmetic. `line_gutter` is ALSO the preferred
+        // scroll source for `goto_line` and `scroll_to_offset` (find_nav.rs): a
+        // stale entry sends go-to-line, find-navigate and bookmark jumps to the
+        // previous buffer's Y instead of falling through to the
+        // `editor_size * line_height` estimate. That estimate is EXACTLY right
+        // on a rope surface — it equals `gutter_row_h`, the row pitch
+        // `RopeEditor::show_rows` lays out with — so an empty vector is the
+        // correct state here, not merely a safe one. Hiding the panel without
+        // clearing would fix the paint and leave navigation wrong.
+        if (rope_arm || read_only) && !self.line_gutter.is_empty() {
+            self.line_gutter.clear();
+        }
+        if show_line_numbers && !self.fold_view && !read_only && !rope_arm && !chrome_hidden {
             // Change-bar: refresh the per-line state cache before borrowing it.
             self.ensure_change_states(active);
             // PA-05: reuse the PA-04 (edit_gen, doc_id) memo for the gutter

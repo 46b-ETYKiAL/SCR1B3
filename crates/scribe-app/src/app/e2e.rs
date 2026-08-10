@@ -1292,6 +1292,115 @@ fn line_gutter_empty_when_line_numbers_off() {
     assert!(app.line_gutter.is_empty());
 }
 
+/// A `line_gutter` populated by a TextEdit frame must be CLEARED the moment the
+/// editable rope arm takes over the surface.
+///
+/// This is the root cause of the stale external gutter. `line_gutter` is written
+/// only by the two TextEdit arms and cleared by nothing, so switching to the
+/// rope path left the previous galley's per-line screen Ys in place — which the
+/// external gutter panel then painted numbers, bookmark dots and change bars at,
+/// beside the rope editor's own correct gutter.
+///
+/// It is not only a paint bug: `goto_line` and `scroll_to_offset`
+/// (`find_nav.rs`) PREFER `line_gutter` over their line-height estimate, so a
+/// stale entry scrolls to the previous buffer's Y. On a rope surface the
+/// estimate is exactly right (`editor_size * line_height` IS `gutter_row_h`, the
+/// pitch `RopeEditor::show_rows` lays out with), so an empty vector is the
+/// correct state, not merely a safe one.
+#[test]
+fn line_gutter_is_cleared_when_the_rope_arm_takes_over() {
+    let mut cfg = Config::default();
+    cfg.editor.first_run_completed = true;
+    cfg.editor.show_line_numbers = true;
+    cfg.editor.experimental_rope_editor = false; // start on the TextEdit arm
+    let mut app = ScribeApp::new_test(cfg);
+    app.tabs[0].text = (0..200)
+        .map(|i| format!("line {i:04}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    run_frames(&mut app, 3);
+    assert!(
+        !app.line_gutter.is_empty(),
+        "precondition: the TextEdit arm must have populated the gutter (got {} \
+         rows) — without this the assertion below passes for the wrong reason",
+        app.line_gutter.len()
+    );
+
+    // The user flips the experimental toggle (or, equivalently, opens a buffer
+    // past `rope_editor_auto_threshold_bytes`). Same tab, same text.
+    app.config.editor.experimental_rope_editor = true;
+    run_frames(&mut app, 3);
+
+    assert!(
+        app.tabs[0].rope_state.is_some(),
+        "precondition: the rope arm must be the one rendering — `rope_state` is \
+         created by `show_editable`'s caller and by nothing else this test does"
+    );
+    assert!(
+        app.line_gutter.is_empty(),
+        "the rope arm draws its own gutter and never writes `line_gutter`; \
+         leaving {} stale row Ys in it paints a second, frozen gutter beside \
+         the real one AND sends go-to-line to the previous buffer's Y",
+        app.line_gutter.len()
+    );
+}
+
+/// …and the external gutter SidePanel must not render at all on the rope path.
+///
+/// `SidePanel::show` stores a `PanelState` under the panel's own id, so
+/// `PanelState::load` is `Some` only if the panel actually rendered in that
+/// context. One fresh `egui::Context` per probe is what makes that decidable.
+///
+/// The CONTROL half is load-bearing: the identical app on the TextEdit arm must
+/// yield `Some(..)`. Without it this test would pass if the probe simply never
+/// worked.
+#[test]
+fn the_external_gutter_panel_does_not_render_on_the_rope_path() {
+    fn gutter_panel_rendered(experimental_rope: bool) -> bool {
+        let mut cfg = Config::default();
+        cfg.editor.first_run_completed = true;
+        cfg.editor.show_line_numbers = true;
+        cfg.editor.experimental_rope_editor = experimental_rope;
+        let mut app = ScribeApp::new_test(cfg);
+        app.tabs[0].text = "alpha\nbeta\ngamma\ndelta\n".to_string();
+
+        // One context for the whole probe, so a panel shown on any frame is
+        // observable on the last.
+        let ctx = egui::Context::default();
+        for _ in 0..3 {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(1100.0, 720.0),
+                )),
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| app.frame_tick(ctx));
+        }
+        if experimental_rope {
+            assert!(
+                app.tabs[0].rope_state.is_some(),
+                "precondition: the rope arm must be the one rendering"
+            );
+        }
+        egui::PanelState::load(&ctx, egui::Id::new("line-gutter")).is_some()
+    }
+
+    assert!(
+        gutter_panel_rendered(false),
+        "CONTROL: the TextEdit arm must still show the external gutter panel — \
+         if this fails the probe is broken, not the app"
+    );
+    assert!(
+        !gutter_panel_rendered(true),
+        "the editable rope editor draws its OWN gutter; the external \
+         `line-gutter` SidePanel rendering beside it is a second gutter painted \
+         from a `line_gutter` no rope arm writes (stale numbers/bookmarks/change \
+         bars), or — with no TextEdit frame ever run — a dead filled strip"
+    );
+}
+
 #[test]
 fn word_wrap_toggle_renders_without_panic() {
     let mut app = ScribeApp::new_test(Config::default());
