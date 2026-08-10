@@ -37,6 +37,53 @@ The **core / render / app** seam is deliberate: `scribe-core` is the replaceable
   cargo install cargo-deny      # license + advisory gate
   ```
 
+## Before your first push: install the git hooks
+
+```bash
+sh scripts/install-git-hooks.sh
+```
+
+This repository is public, so anything you push is published immediately.
+Commit **metadata** is the part that cannot be taken back: the author and
+committer addresses on a pushed commit are visible the moment the push lands,
+and clearing them afterwards requires rewriting history for everyone. The
+pre-push hook is what prevents that; the CI job is the backstop for a push made
+without it.
+
+The hook refuses a push when:
+
+- either guard fails its own falsification suite (checked **first**, so a guard
+  that has silently stopped detecting anything cannot let the rest report a
+  clean pass);
+- a tracked file carries an absolute home path, a personal mailbox, an internal
+  tooling reference, or a secret-shaped string;
+- any commit in the range being pushed carries an identity that is not on the
+  allowlist.
+
+Set a publishing identity before you commit:
+
+```bash
+git config user.email '<id>+<handle>@users.noreply.github.com'
+```
+
+GitHub issues that address under **Settings → Emails → Keep my email address
+private**. Your **name** is welcome in commits and in the contributor list —
+it is only the mailbox that must stay out. Contributions from a bot or forge
+noreply address are equally fine.
+
+Run the checks yourself at any time:
+
+```bash
+python3 scripts/test_content_safety_audit.py   # falsify the audit
+python3 scripts/test_author_identity_guard.py  # falsify the identity guard
+python3 scripts/content_safety_audit.py        # audit tracked files
+python3 scripts/content_safety_audit.py --history   # + commit metadata (reporting)
+```
+
+`--no-verify` bypasses the hook. Use it only when you have confirmed by other
+means that the push carries nothing personal — not to skip a finding you have
+not read, since the audit prints the file and line for every one.
+
 ## Build
 
 ```bash
