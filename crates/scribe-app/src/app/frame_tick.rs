@@ -574,86 +574,29 @@ impl ScribeApp {
         if spans.is_empty() {
             return;
         }
-        let err_c = ui_color(&self.theme, "error", Rgba::new(0xe5, 0x3e, 0x3e, 255));
-        let warn_c = ui_color(&self.theme, "warning", Rgba::new(0xf2, 0xb3, 0x3d, 255));
-        let color_of = |sev: u8| match sev {
-            super::diagnostics_overlay::SEVERITY_ERROR => err_c,
-            super::diagnostics_overlay::SEVERITY_WARNING => warn_c,
-            super::diagnostics_overlay::SEVERITY_INFO => accent,
-            _ => muted,
-        };
-        // Clip to the editor viewport: a row scrolled half out of the top of the
-        // scroll area is clipped by the widget, and an overlay that ignored that
-        // would paint a squiggle across the toolbar.
-        let painter = ui.painter().with_clip_rect(viewport);
-        let visible = resp.visible_line_range.clone();
-
-        // Squiggles, one segment per (span × source line) in view.
-        let mut painted: Vec<(usize, egui::Rect)> = Vec::new();
-        for seg in super::diagnostics_overlay::row_segments(&tab.text, &spans, visible.clone()) {
-            let Some(geom) = resp.rows.get(&seg.line) else {
-                continue;
-            };
-            let x0 = geom.col_x(seg.start_col);
-            let x1 = geom.col_x(seg.end_col);
-            if x1 <= x0 {
-                continue;
-            }
-            paint_squiggle(&painter, x0, x1, geom.bottom, color_of(seg.severity));
-            painted.push((
-                seg.line,
-                egui::Rect::from_min_max(egui::pos2(x0, geom.top), egui::pos2(x1, geom.bottom)),
-            ));
-        }
-
-        // Gutter bar on each diagnosed line's START line, at the left edge of
-        // the rope editor's own gutter — the same shape and lane as the
-        // `TextEdit` path's bar in the external gutter panel.
-        for (line, sev) in super::diagnostics_overlay::gutter_marks(&self.diagnostics) {
-            let line = line as usize;
-            if !visible.contains(&line) {
-                continue;
-            }
-            let Some(geom) = resp.rows.get(&line) else {
-                continue;
-            };
-            let h = geom.bottom - geom.top;
-            painter.rect_filled(
-                egui::Rect::from_min_max(
-                    egui::pos2(geom.row_left, h.mul_add(0.2, geom.top)),
-                    egui::pos2(geom.row_left + 2.5, h.mul_add(-0.2, geom.bottom)),
-                ),
-                1.0,
-                color_of(sev),
-            );
-        }
-
-        // Hover: resolved through the hovered ROW's galley, so the message
-        // belongs to the character under the pointer rather than to the line.
-        let Some(p) = ui.ctx().pointer_hover_pos() else {
-            return;
-        };
-        if !viewport.contains(p) {
-            return;
-        }
-        let Some((line, _)) = painted.iter().find(|(_, r)| r.contains(p)) else {
-            return;
-        };
-        let Some(geom) = resp.rows.get(line) else {
-            return;
-        };
-        let byte =
-            super::diagnostics_overlay::byte_of_line_col(&tab.text, *line, geom.col_at_x(p.x));
-        if let Some(text) = super::diagnostics_overlay::hover_text(&spans, byte) {
-            egui::show_tooltip_at_pointer(
-                ui.ctx(),
-                ui.layer_id(),
-                egui::Id::new("scr1b3-diagnostic-tooltip"),
-                |ui| {
-                    ui.label(text);
-                },
-            );
-        }
+        // Delegates to the free function the grid rope arm also calls, so the
+        // two rope surfaces cannot drift: the arithmetic that used to live here
+        // now exists once, in `grid_render::paint_rope_pane_diagnostics`.
+        //
+        // The colours are the ones THIS path ALREADY resolved — `accent` and
+        // `muted` arrive from the caller and the two `ui_color` lookups below
+        // are the pre-existing ones, unchanged. No third theme lookup is
+        // introduced: swapping these caller-supplied colours for fresh
+        // `from_theme` lookups would be a behaviour change, not a refactor.
+        super::grid_render::paint_rope_pane_diagnostics(
+            ui,
+            resp,
+            &tab.text,
+            &spans,
+            &super::diagnostics_overlay::gutter_marks(&self.diagnostics),
+            super::grid_render::DiagColors {
+                error: ui_color(&self.theme, "error", Rgba::new(0xe5, 0x3e, 0x3e, 255)),
+                warning: ui_color(&self.theme, "warning", Rgba::new(0xf2, 0xb3, 0x3d, 255)),
+                info: accent,
+                hint: muted,
+            },
+            viewport,
+        );
     }
 
     /// Titles of the tabs holding unsaved edits, for the close prompt. Listing

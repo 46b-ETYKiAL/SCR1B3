@@ -230,6 +230,13 @@ impl ScribeApp {
         // the pane closure, which mutably borrows `self.tabs`. Empty (and free)
         // when the language server has published nothing — the common case.
         let diag_spans = self.diagnostic_spans_for_active(active);
+        // Worst severity per source line, for the ROPE pane's gutter bar. The
+        // `TextEdit` pane gets its bar from the external gutter panel; the rope
+        // pane draws its own gutter, so its bar is part of the overlay. Owned
+        // for the same reason `diag_spans` is — `&self.diagnostics` is a
+        // disjoint field from `&mut self.tabs`, but the closure takes the
+        // whole borrow.
+        let diag_gutter_marks = super::diagnostics_overlay::gutter_marks(&self.diagnostics);
         let diag_colors = grid_render::DiagColors {
             error: ui_color(&self.theme, "error", Rgba::new(0xe5, 0x3e, 0x3e, 255)),
             warning: ui_color(&self.theme, "warning", Rgba::new(0xf2, 0xb3, 0x3d, 255)),
@@ -415,6 +422,31 @@ impl ScribeApp {
                         .as_ref()
                         .and_then(scribe_core::buffer::Buffer::as_rope)
                         .map_or(1.0, |r| r.len_lines() as f32 * gutter_row_h);
+                    // ---- Inline LSP diagnostics (single-pane rope parity) ----
+                    // This arm painted NOTHING: no squiggle, no gutter bar, no
+                    // hover. It is the arm a buffer is AUTO-PROMOTED into past
+                    // `rope_editor_auto_threshold_bytes` (16 MiB by default) —
+                    // i.e. exactly the files where a language server earns its
+                    // keep — so a large note in a pane showed the two status-bar
+                    // integers and nothing that says WHICH line is wrong. The
+                    // Rope entry-notice tells the user "inline diagnostics still
+                    // work"; on this surface that was false until now.
+                    //
+                    // `is_active`-gated for the same reason the `TextEdit` arm
+                    // is: `diag_spans` are resolved onto the ACTIVE tab's byte
+                    // offsets, so painting them over another pane's rows would
+                    // underline unrelated text.
+                    if is_active {
+                        grid_render::paint_rope_pane_diagnostics(
+                            ui,
+                            &resp,
+                            &tabs[idx].text,
+                            &diag_spans,
+                            &diag_gutter_marks,
+                            diag_colors,
+                            viewport,
+                        );
+                    }
                     if let Some(text) = clipboard {
                         *seen.clipboard.borrow_mut() = Some(text);
                     }
