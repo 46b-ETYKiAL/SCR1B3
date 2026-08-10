@@ -530,10 +530,18 @@ jobs:
             echo "::error::the compiled MSI carries only $built RegistryValue rows (floor $REGISTRY_ROW_FLOOR) -- the registry table did not make it into the package."
             exit 1
           fi
-          if [ "$built" -ne "$src" ]; then
-            echo "::error::registry rows differ between source ($src) and compiled MSI ($built) -- rows were dropped or merged during the build."
+          # Written as `[ good ] || { fail; }`, matching the licfiles check
+          # below, NOT as `if [ bad ]; then fail; fi`. `src` comes from a
+          # `grep -c ... || true` over a path this step never asserts exists,
+          # so it can be empty. `[ 350 -ne "" ]` exits 2 ("integer expression
+          # expected"), `if` reads 2 as false, and `set -e` does not fire on a
+          # failing `if` CONDITION -- so the bad-condition form silently
+          # skipped its own then-branch and the check no-opped. The `||` form
+          # treats 2 as "not true" and fails closed on the same input.
+          [ "$built" -eq "$src" ] || {
+            echo "::error::registry rows differ between source ($src) and compiled MSI ($built) -- rows were dropped or merged during the build, or main.wxs could not be read."
             exit 1
-          fi
+          }
           # License delivery, asserted against the BUILT package rather than
           # the staging directory. A staged tree only proves the collector
           # ran; the File table is what proves the texts actually SHIP. The
