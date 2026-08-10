@@ -2551,6 +2551,9 @@ mod build_plugins_tests;
 mod deferred_actions_tests;
 
 #[cfg(test)]
+mod textedit_undo_invalidation_tests;
+
+#[cfg(test)]
 mod keyboard_input_tests;
 
 #[cfg(test)]

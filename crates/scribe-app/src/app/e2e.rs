@@ -1380,6 +1380,14 @@ impl Driver {
         }
     }
 
+    /// The persistent `Context` these frames run against, so a sibling test
+    /// module can read the egui-side widget state (`TextEditState`: caret,
+    /// selection, undo history) that lives in egui memory rather than on
+    /// `EditorTab`.
+    pub(super) fn ctx(&self) -> &egui::Context {
+        &self.ctx
+    }
+
     pub(super) fn frame(
         &self,
         app: &mut ScribeApp,
