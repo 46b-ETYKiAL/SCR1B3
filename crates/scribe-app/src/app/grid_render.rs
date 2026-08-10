@@ -315,6 +315,116 @@ pub(super) fn paint_pane_diagnostics(
     }
 }
 
+/// Paint the inline diagnostic overlay over a ROPE editor's painted rows.
+///
+/// [`paint_pane_diagnostics`] above positions against a `TextEdit`'s single
+/// galley. The rope editor has none: it reports
+/// [`scribe_render::RopeEditorResponse::rows`] — the per-row rects and galleys
+/// for the rows it actually painted this frame, keyed by ABSOLUTE line — so this
+/// walks those instead. Everything else (severity colours, the gutter bar, the
+/// hover tooltip) is deliberately the SAME: a user who crosses the size
+/// threshold should not have to learn a second visual language for the same
+/// information.
+///
+/// Free-standing rather than a `ScribeApp` method because the grid pane closure
+/// holds `&mut self.tabs` and cannot re-borrow `&self`; the single-pane rope
+/// path (`ScribeApp::paint_rope_diagnostics`) delegates here so the two surfaces
+/// cannot drift. The arithmetic is that method's, moved unchanged.
+///
+/// Silent when the widget reports no rows — the read-only browse path and a
+/// still-memory-mapped buffer lay no per-row galley out, so there is nothing to
+/// position against.
+pub(super) fn paint_rope_pane_diagnostics(
+    ui: &egui::Ui,
+    resp: &scribe_render::RopeEditorResponse,
+    text: &str,
+    spans: &[DiagSpan],
+    gutter_marks: &[(u32, u8)],
+    colors: DiagColors,
+    viewport: egui::Rect,
+) {
+    if spans.is_empty() || resp.rows.is_empty() {
+        return;
+    }
+    let color_of = |sev: u8| match sev {
+        diagnostics_overlay::SEVERITY_ERROR => colors.error,
+        diagnostics_overlay::SEVERITY_WARNING => colors.warning,
+        diagnostics_overlay::SEVERITY_INFO => colors.info,
+        _ => colors.hint,
+    };
+    // Clip to the editor viewport: a row scrolled half out of the top of the
+    // scroll area is clipped by the widget, and an overlay that ignored that
+    // would paint a squiggle across the pane header.
+    let painter = ui.painter().with_clip_rect(viewport);
+    let visible = resp.visible_line_range.clone();
+
+    // Squiggles, one segment per (span x source line) in view.
+    let mut painted: Vec<(usize, egui::Rect)> = Vec::new();
+    for seg in diagnostics_overlay::row_segments(text, spans, visible.clone()) {
+        let Some(geom) = resp.rows.get(&seg.line) else {
+            continue;
+        };
+        let x0 = geom.col_x(seg.start_col);
+        let x1 = geom.col_x(seg.end_col);
+        if x1 <= x0 {
+            continue;
+        }
+        paint_squiggle(&painter, x0, x1, geom.bottom, color_of(seg.severity));
+        painted.push((
+            seg.line,
+            egui::Rect::from_min_max(egui::pos2(x0, geom.top), egui::pos2(x1, geom.bottom)),
+        ));
+    }
+
+    // Gutter bar on each diagnosed line's START line, at the left edge of the
+    // rope editor's own gutter — the same shape and lane as the `TextEdit`
+    // path's bar in the external gutter panel.
+    for (line, sev) in gutter_marks {
+        let line = *line as usize;
+        if !visible.contains(&line) {
+            continue;
+        }
+        let Some(geom) = resp.rows.get(&line) else {
+            continue;
+        };
+        let h = geom.bottom - geom.top;
+        painter.rect_filled(
+            egui::Rect::from_min_max(
+                egui::pos2(geom.row_left, h.mul_add(0.2, geom.top)),
+                egui::pos2(geom.row_left + 2.5, h.mul_add(-0.2, geom.bottom)),
+            ),
+            1.0,
+            color_of(*sev),
+        );
+    }
+
+    // Hover: resolved through the hovered ROW's galley, so the message belongs
+    // to the character under the pointer rather than to the line.
+    let Some(p) = ui.ctx().pointer_hover_pos() else {
+        return;
+    };
+    if !viewport.contains(p) {
+        return;
+    }
+    let Some((line, _)) = painted.iter().find(|(_, r)| r.contains(p)) else {
+        return;
+    };
+    let Some(geom) = resp.rows.get(line) else {
+        return;
+    };
+    let byte = diagnostics_overlay::byte_of_line_col(text, *line, geom.col_at_x(p.x));
+    if let Some(msg) = diagnostics_overlay::hover_text(spans, byte) {
+        egui::show_tooltip_at_pointer(
+            ui.ctx(),
+            ui.layer_id(),
+            egui::Id::new("scr1b3-diagnostic-tooltip"),
+            |ui| {
+                ui.label(msg);
+            },
+        );
+    }
+}
+
 /// Hover affordance + Ctrl/Cmd-click follow for the `http(s)` URLs and
 /// `[[wiki-link]]`s under the pointer in a grid pane.
 ///

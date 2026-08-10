@@ -809,6 +809,197 @@ fn the_grid_squiggle_lands_on_the_line_and_columns_the_server_named() {
     );
 }
 
+/// A grid config whose panes render through the OWNED ROPE editor.
+///
+/// The sibling [`diag_grid_config`] sets `rope_editor_auto_threshold_bytes = 0`
+/// precisely to keep the rope arm OUT of the way; this is its mirror.
+/// `experimental_rope_editor` rather than a 16 MiB fixture on purpose: the
+/// threshold selects the SAME `show_editable` path, and a real 16 MiB buffer
+/// would make the test minutes long for no extra coverage.
+fn diag_grid_rope_config() -> Config {
+    let mut cfg = grid_config();
+    cfg.editor.experimental_rope_editor = true;
+    cfg.spellcheck.enabled = false; // its squiggle is the SAME #e53e3e
+    cfg
+}
+
+fn diag_grid_rope_app(diags: Vec<Diagnostic>) -> ScribeApp {
+    let mut app = ScribeApp::new_test(diag_grid_rope_config());
+    let text = diag_grid_text();
+    app.tabs[0].text.clone_from(&text);
+    app.tabs.push(EditorTab::scratch());
+    app.tabs[1].text = text;
+    app.active = 0;
+    app.diagnostics = diags;
+    app
+}
+
+/// The frame's error-coloured ink after settling, for `diags` — with the
+/// grid-rope preconditions asserted, so an empty result can only mean "no ink",
+/// never "no pane".
+fn rope_pane_diag_ink(diags: Vec<Diagnostic>) -> Vec<[egui::Pos2; 2]> {
+    let mut app = diag_grid_rope_app(diags);
+    let err = error_color(&app);
+    let p = Probe::new();
+    p.settle(&mut app);
+    let out = p.idle(&mut app);
+    assert!(
+        app.grid_tree.is_some(),
+        "precondition: the grid owns the central surface, so the single-pane \
+         arm (which does paint) is not what produced this frame"
+    );
+    let active = app.active;
+    assert!(
+        app.tabs[active].rope_state.is_some(),
+        "precondition: the active pane rendered through the OWNED ROPE arm — \
+         `rope_state` is created by that arm and by nothing else here. Without \
+         this, a blank or missing pane would look exactly like a passing \
+         zero-ink control."
+    );
+    squiggle_segments(&out, err)
+}
+
+/// The grid's owned-rope arm must paint the inline diagnostic squiggle.
+///
+/// It painted nothing: the arm built the rope, called `show_editable`, recorded
+/// scroll metrics and returned. That is the arm a buffer is AUTO-PROMOTED into
+/// past `rope_editor_auto_threshold_bytes` (16 MiB by default) — i.e. exactly
+/// the large files where a language server earns its keep — so a big note in a
+/// pane silently lost every squiggle, every gutter mark and the hover, leaving
+/// the two status-bar integers that do not say WHICH line is wrong. The Rope
+/// entry-notice tells the user "inline diagnostics still work"; on this surface
+/// that claim was false.
+#[test]
+fn a_grid_rope_pane_paints_the_inline_diagnostic_squiggle() {
+    let ink = rope_pane_diag_ink(vec![diag(
+        1,
+        22,
+        1,
+        27,
+        crate::app::diagnostics_overlay::SEVERITY_ERROR,
+        "cannot find value `error` in this scope",
+    )]);
+    assert!(
+        !ink.is_empty(),
+        "a published error diagnostic must paint a squiggle in the active grid \
+         ROPE pane; the frame carried no error-coloured line segments at all"
+    );
+
+    let control = rope_pane_diag_ink(Vec::new());
+    assert!(
+        control.is_empty(),
+        "an otherwise identical rope-pane app with NO diagnostics must paint no \
+         error-coloured ink — {} segments found, so the assertion above is not \
+         measuring the diagnostics",
+        control.len()
+    );
+}
+
+/// …and it lands where the server said, not at a fixed spot.
+///
+/// Differential and constant-free, mirroring
+/// `the_grid_squiggle_lands_on_the_line_and_columns_the_server_named`: a
+/// diagnostic on a LATER line must ink lower, and one starting at a LATER column
+/// must ink further right. A painter that ignored the span — or resolved it
+/// against the wrong text, which is the specific failure mode of reusing the
+/// ACTIVE tab's spans in a multi-pane surface — passes the presence test above
+/// and fails both of these.
+#[test]
+fn the_grid_rope_squiggle_lands_on_the_line_and_columns_the_server_named() {
+    const ERR: u8 = crate::app::diagnostics_overlay::SEVERITY_ERROR;
+    let first = segments_bbox(&rope_pane_diag_ink(vec![diag(
+        0,
+        0,
+        0,
+        5,
+        ERR,
+        "at the very start",
+    )]));
+    let later = segments_bbox(&rope_pane_diag_ink(vec![diag(
+        2,
+        20,
+        2,
+        30,
+        ERR,
+        "further down and right",
+    )]));
+    assert!(
+        later.min.y > first.max.y,
+        "a diagnostic on line 2 must ink BELOW one on line 0 (first {first:?}, \
+         later {later:?})"
+    );
+    assert!(
+        later.min.x > first.max.x,
+        "a diagnostic starting at column 20 must ink RIGHT of one starting at \
+         column 0 (first {first:?}, later {later:?})"
+    );
+}
+
+/// The SINGLE-PANE rope path must still paint its overlay after the extraction.
+///
+/// `ScribeApp::paint_rope_diagnostics` now delegates to the same free function
+/// the grid rope arm calls, so the two surfaces cannot drift. That refactor had
+/// no running guard: the only tests covering the single-pane rope overlay
+/// (`visual_qa::rope_path_paints_the_inline_diagnostic_overlay` and its control)
+/// are `#[ignore]`d GPU renders, and a test category nothing runs offers zero
+/// protection. This is the headless shape-list equivalent, so a delegation that
+/// silently stopped painting turns the suite RED on any host.
+///
+/// `grid_tree.is_none()` is asserted as a PRECONDITION: it is what distinguishes
+/// this from the grid-pane tests above — without it, a fixture that quietly took
+/// the grid path would be measuring the arm it is not supposed to cover.
+#[test]
+fn the_single_pane_rope_path_still_paints_the_inline_diagnostic_squiggle() {
+    fn single_pane_rope_ink(diags: Vec<Diagnostic>) -> Vec<[egui::Pos2; 2]> {
+        let mut cfg = grid_config();
+        cfg.editor.grid_enabled = false; // the single-pane arm, not the grid
+        cfg.editor.experimental_rope_editor = true;
+        cfg.spellcheck.enabled = false; // its squiggle is the SAME #e53e3e
+        let mut app = ScribeApp::new_test(cfg);
+        app.tabs[0].text = diag_grid_text();
+        app.diagnostics = diags;
+
+        let err = error_color(&app);
+        let p = Probe::new();
+        p.settle(&mut app);
+        let out = p.idle(&mut app);
+        assert!(
+            app.grid_tree.is_none(),
+            "precondition: the SINGLE-PANE arm must own the surface — with a \
+             grid tree this would be measuring the pane path instead"
+        );
+        assert!(
+            app.tabs[0].rope_state.is_some(),
+            "precondition: the rope arm must be the one rendering — `rope_state` \
+             is created by that arm and by nothing else here"
+        );
+        squiggle_segments(&out, err)
+    }
+
+    let ink = single_pane_rope_ink(vec![diag(
+        1,
+        22,
+        1,
+        27,
+        crate::app::diagnostics_overlay::SEVERITY_ERROR,
+        "cannot find value `error` in this scope",
+    )]);
+    assert!(
+        !ink.is_empty(),
+        "the single-pane rope path must still paint a squiggle after \
+         `paint_rope_diagnostics` was reduced to a delegate"
+    );
+
+    let control = single_pane_rope_ink(Vec::new());
+    assert!(
+        control.is_empty(),
+        "an otherwise identical single-pane rope app with NO diagnostics must \
+         paint no error-coloured ink — {} segments found, so the assertion \
+         above is not measuring the diagnostics",
+        control.len()
+    );
+}
+
 /// Hovering the squiggle must NAME the problem. Two integers in the status bar
 /// do not tell the user why a line is wrong; the tooltip is the whole payload.
 ///
