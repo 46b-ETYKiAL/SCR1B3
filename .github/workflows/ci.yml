@@ -208,7 +208,29 @@ jobs:
             libxkbcommon-dev libssl-dev mesa-vulkan-drivers vulkan-tools
       - name: Prove an adapter actually resolves before trusting the run
         # Fail here with a readable message rather than 41 confusing test panics.
-        run: vulkaninfo --summary | head -40
+        #
+        # This step used to be `vulkaninfo --summary | head -40`. With no
+        # `shell:` key and no `defaults:`, GitHub runs it as `bash -e {0}` --
+        # -e WITHOUT -o pipefail -- so the step's exit status was `head`'s,
+        # which is 0 no matter how the probe fared. The step could not fail,
+        # and "no adapter" fell through to the GPU lane as ~41 silent no-ops.
+        #
+        # `set -o pipefail` alone is NOT the fix: `head -40` closes the pipe
+        # early, so a probe whose output exceeds the pipe buffer dies of
+        # SIGPIPE and pipefail reports 141 for a SUCCESSFUL probe. Drop the
+        # pipe instead and test the probe's own exit status.
+        shell: bash
+        run: |
+          set -euo pipefail
+          out=$(mktemp)
+          if ! vulkaninfo --summary > "$out" 2>&1; then
+            echo "::error::no Vulkan adapter resolved -- the GPU lane below would run 0 real tests. Check that mesa-vulkan-drivers (lavapipe) installed."
+            head -40 "$out"
+            rm -f "$out"
+            exit 1
+          fi
+          head -40 "$out"
+          rm -f "$out"
       - name: Run the ignored GPU + heavy lane
         env:
           # Turn "no adapter" into a hard failure instead of a silent green.
