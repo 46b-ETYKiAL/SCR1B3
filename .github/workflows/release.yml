@@ -1077,6 +1077,12 @@ jobs:
             fi
             verified=$((verified + 1))
           done < <(find dist -type f ! -name '*.minisig')
+          # (0) non-vacuity. EVERY check above lives inside that loop, and the
+          # parity check below reduces to `[ 0 -eq 0 ]`, so an empty `dist/`
+          # skipped all of them and printed "release gate GREEN: 0 verified" —
+          # a staging/download-artifact failure was indistinguishable from a
+          # fully verified release. A gate that cannot fail is not a gate.
+          [ "$assets" -gt 0 ] || { echo "::error::self-verify found ZERO assets under dist/ — nothing was checked. Refusing to report a pass."; exit 1; }
           nminisig=$(find dist -name '*.minisig' | wc -l | tr -d ' ')                                                          # (B) parity
           [ "$verified" -eq "$nminisig" ] || { echo "::error::sig parity $verified != $nminisig"; exit 1; }
           orig=$(find dist -type f ! -name '*.minisig' | head -1)                                                              # (G) tamper
@@ -1086,6 +1092,12 @@ jobs:
               echo "::error::tamper test passed — gate broken"; exit 1
             fi
             rm -f "$tf"
+          else
+            # Unreachable while (0) holds, and deliberately kept as a second
+            # latch: the tamper probe is the only check that proves the
+            # verifier still REJECTS anything. Silently skipping it would let
+            # a broken verifier ship a green release.
+            echo "::error::no asset available for the tamper probe — cannot prove the verifier rejects modified bytes"; exit 1
           fi
           rm -f rsign.pub
           echo "release gate GREEN: $assets verified vs embedded key (crypto+identity+digest+parity+tamper)."
