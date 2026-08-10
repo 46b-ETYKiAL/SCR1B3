@@ -104,11 +104,38 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
+          # The identity guard walks a commit RANGE, so the shallow default
+          # clone is not enough: `git rev-list base..head` cannot resolve a
+          # base that was never fetched.
+          fetch-depth: 0
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
+      - name: Falsify the audit (it must catch every known leak class)
+        # Runs FIRST on purpose. The audit's own output is "PASS - no
+        # violations", which is indistinguishable from the output of an audit
+        # whose patterns have silently stopped matching anything. Without this
+        # step a regression that disarms the guard reports a clean tree and
+        # looks exactly like success. This step feeds every known leak class to
+        # the scanner and fails if any is no longer caught, so the PASS below
+        # can only be produced by a guard that still works.
+        run: python3 scripts/test_content_safety_audit.py
+
+      - name: Falsify the author-identity guard
+        run: python3 scripts/test_author_identity_guard.py
+
       - name: Audit for internal references / secrets
         run: python3 scripts/content_safety_audit.py
+
+      - name: Reject non-allowlisted commit identities in the push range
+        # Scoped to the push/PR range: historical commits carry mailboxes that
+        # only a history rewrite can clear, and a gate that is permanently red
+        # for something no PR can fix trains people to ignore it.
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: python3 scripts/author_identity_guard.py --base "$BASE" --head "$HEAD"
 
   forge-wire-manifest:
     name: F0RG3-W1R3 install-manifest audit (Phase 22 T22.3)

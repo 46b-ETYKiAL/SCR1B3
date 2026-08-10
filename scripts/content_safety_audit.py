@@ -74,6 +74,12 @@ PLACEHOLDER_HOME_USERS = {
 # Everything else is treated as a real mailbox, i.e. as PII.
 ALLOWED_EMAIL_RE = re.compile(
     r"^(?:[^@\s]+@users\.noreply\.github\.com"
+    # The bare forge address a web-UI commit carries. `audit_identities`
+    # already classifies this as non-PII drift rather than a leak; omitting it
+    # here made the two halves of this file disagree, so a file that merely
+    # DOCUMENTS the forge's own noreply address was reported as carrying a
+    # personal mailbox.
+    r"|noreply@github\.com"
     r"|[^@\s]+@(?:[A-Za-z0-9.\-]+\.)?(?:example|test|invalid|localhost)"
     r"|[^@\s]+@example\.(?:com|org|net))$",
     re.IGNORECASE,
