@@ -87,7 +87,7 @@ impl ScribeApp {
             hi,
             self.config.editor.tab_width,
         );
-        self.tabs[active].set_text(new_text);
+        self.tabs[active].set_text_keep_undo(new_text);
         state
             .cursor
             .set_char_range(Some(egui::text::CCursorRange::one(
@@ -124,7 +124,7 @@ impl ScribeApp {
         // pressed at the end of a list line.
         if self.config.editor.smart_lists && self.note_file_active(active) {
             if let Some((new_text, new_idx)) = self.smart_list_newline(active, cursor) {
-                self.tabs[active].set_text(new_text);
+                self.tabs[active].set_text_keep_undo(new_text);
                 state
                     .cursor
                     .set_char_range(Some(egui::text::CCursorRange::one(
@@ -141,7 +141,7 @@ impl ScribeApp {
         if new_idx == cursor + 1 {
             return false;
         }
-        self.tabs[active].set_text(new_text);
+        self.tabs[active].set_text_keep_undo(new_text);
         state
             .cursor
             .set_char_range(Some(egui::text::CCursorRange::one(
@@ -247,7 +247,7 @@ impl ScribeApp {
         new_text.push_str(&text[..lo_b]);
         new_text.push_str(&ts);
         new_text.push_str(&text[hi_b..]);
-        self.tabs[active].set_text(new_text);
+        self.tabs[active].set_text_keep_undo(new_text);
         let new_caret = lo + ts.chars().count();
         state
             .cursor
@@ -296,7 +296,7 @@ impl ScribeApp {
         new_text.push_str(&text[..insert_at_b]);
         new_text.push_str(&copy);
         new_text.push_str(&text[insert_at_b..]);
-        self.tabs[active].set_text(new_text);
+        self.tabs[active].set_text_keep_undo(new_text);
         state
             .cursor
             .set_char_range(Some(egui::text::CCursorRange::one(
@@ -372,7 +372,7 @@ impl ScribeApp {
         // edit writes that stale rope back over `text`, destroying this edit.
         // `set_text` also bumps `edit_gen` (no manual bump here).
         let i = self.active;
-        self.tabs[i].set_text(new_text);
+        self.tabs[i].set_text_keep_undo(new_text);
     }
 
     /// F-017 — Swap the cursor line with the neighbour `dir` rows away (-1 =
@@ -423,7 +423,7 @@ impl ScribeApp {
         }
         // MUST go through `set_text` — see `toggle_comment_active`.
         let i = self.active;
-        self.tabs[i].set_text(new_text);
+        self.tabs[i].set_text_keep_undo(new_text);
     }
 
     /// F-017 — Duplicate the cursor line in-place: the new copy lands on the
@@ -458,7 +458,7 @@ impl ScribeApp {
         }
         // MUST go through `set_text` — see `toggle_comment_active`.
         let i = self.active;
-        self.tabs[i].set_text(new_text);
+        self.tabs[i].set_text_keep_undo(new_text);
     }
 
     // -------------------------------------------------------------------
@@ -579,7 +579,7 @@ impl ScribeApp {
             return false;
         };
         let new_len = new_text.chars().count();
-        self.tabs[active].set_text(new_text);
+        self.tabs[active].set_text_keep_undo(new_text);
         self.store_caret(ctx, id, caret.min(new_len));
         true
     }
@@ -598,7 +598,7 @@ impl ScribeApp {
         match scribe_core::md_ops::toggle_task_on_lines(&self.tabs[active].text, lo, hi) {
             Some(new_text) => {
                 let new_len = new_text.chars().count();
-                self.tabs[active].set_text(new_text);
+                self.tabs[active].set_text_keep_undo(new_text);
                 self.tabs[active].doc.mark_dirty();
                 self.store_caret(ctx, id, caret.min(new_len));
             }
@@ -628,7 +628,7 @@ impl ScribeApp {
         );
         let (new_text, new_lo, new_hi) =
             scribe_core::md_ops::toggle_wrap(&self.tabs[active].text, lo, hi, marker);
-        self.tabs[active].set_text(new_text);
+        self.tabs[active].set_text_keep_undo(new_text);
         state
             .cursor
             .set_char_range(Some(egui::text::CCursorRange::two(
@@ -674,7 +674,7 @@ impl ScribeApp {
         new_text.push_str(&converted);
         new_text.push_str(&text[hi_b..]);
         let new_hi = lo + converted.chars().count();
-        self.tabs[active].set_text(new_text);
+        self.tabs[active].set_text_keep_undo(new_text);
         state
             .cursor
             .set_char_range(Some(egui::text::CCursorRange::two(
@@ -704,7 +704,7 @@ impl ScribeApp {
         new_lines.splice(lo..=hi, formatted.split('\n').map(str::to_string));
         let new_text = new_lines.join("\n");
         let new_len = new_text.chars().count();
-        self.tabs[active].set_text(new_text);
+        self.tabs[active].set_text_keep_undo(new_text);
         self.tabs[active].doc.mark_dirty();
         self.store_caret(ctx, id, caret.min(new_len));
         self.status = "formatted table".to_string();
@@ -797,7 +797,7 @@ impl ScribeApp {
             }
             A::Passthrough => return,
         };
-        self.tabs[active].set_text(new_text);
+        self.tabs[active].set_text_keep_undo(new_text);
         state
             .cursor
             .set_char_range(Some(egui::text::CCursorRange::two(
@@ -853,7 +853,7 @@ impl ScribeApp {
         }
         // MUST go through `set_text` — see `toggle_comment_active`.
         let i = self.active;
-        self.tabs[i].set_text(new_text);
+        self.tabs[i].set_text_keep_undo(new_text);
     }
 }
 
@@ -1600,6 +1600,7 @@ mod rope_writeback_tests {
             disk_text: _,
             rope_state,
             rope_buf,
+            textedit_undo_stale,
             bookmarks: _,
             edit_gen,
             external_change: _,
@@ -1621,6 +1622,14 @@ mod rope_writeback_tests {
                 .is_some_and(|s| s.history.retained_bytes() == 0),
             "`rope_state.history` holds snapshots of the OLD content — it must \
              be dropped or undo restores a buffer the user never had"
+        );
+        assert!(
+            *textedit_undo_stale,
+            "the egui TextEdit path's undo history lives in EGUI MEMORY, not on \
+             this struct, so this destructure can never see it directly — which \
+             is exactly why it went uninvalidated for so long. `set_text` must \
+             flag it for the render loop to clear, or Ctrl+Z resurrects the \
+             pre-replacement document over the new content."
         );
         assert_ne!(
             *edit_gen, gen_before,

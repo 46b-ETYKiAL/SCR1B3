@@ -436,6 +436,17 @@ impl ScribeApp {
                 }
 
                 // ---- Default egui `TextEdit` pane ----
+                // Same duty as the single-pane path in `frame_tick`: this
+                // pane's undo history lives in egui memory under `pane_id`,
+                // out of `set_text`'s reach. Drop it before the widget renders
+                // so a Ctrl+Z after an EXTERNAL replacement cannot
+                // `replace_with` the previous document over the new content.
+                if std::mem::take(&mut tabs[idx].textedit_undo_stale) {
+                    if let Some(mut st) = egui::TextEdit::load_state(ui.ctx(), pane_id) {
+                        st.clear_undoer();
+                        st.store(ui.ctx(), pane_id);
+                    }
+                }
                 let mut layouter = make_layouter(
                     hl,
                     hl_cache,

@@ -207,7 +207,7 @@ impl ScribeApp {
                 if active < self.tabs.len() && !self.tabs[active].doc.is_read_only_large() {
                     let sorted = scribe_core::text_ops::sort_lines(&self.tabs[active].text);
                     if sorted != self.tabs[active].text {
-                        self.tabs[active].set_text(sorted);
+                        self.tabs[active].set_text_keep_undo(sorted);
                         self.tabs[active].doc.mark_dirty();
                         self.status = "sorted lines (A-Z)".to_string();
                         // P2-C: reordering lines invalidates every caret offset.

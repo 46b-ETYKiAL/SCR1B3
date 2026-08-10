@@ -57,7 +57,7 @@ impl ScribeApp {
         if active < self.tabs.len() && !self.tabs[active].doc.is_read_only_large() {
             let new = f(&self.tabs[active].text);
             if new != self.tabs[active].text {
-                self.tabs[active].set_text(new);
+                self.tabs[active].set_text_keep_undo(new);
                 self.tabs[active].doc.mark_dirty();
                 self.status = status.to_string();
                 // P2-C: a whole-buffer transform rewrites offsets out from under
