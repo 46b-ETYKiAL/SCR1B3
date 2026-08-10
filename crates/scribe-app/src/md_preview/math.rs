@@ -627,4 +627,304 @@ mod tests {
         assert_eq!(math_to_unicode("日本語 + α"), "日本語 + α");
         assert_eq!(math_to_unicode("ℝ^2"), "ℝ²");
     }
+
+    /// Every arm of the `superscript` table, exhaustively.
+    ///
+    /// cargo-mutants plants a `delete match arm 'X'` mutant on each arm; a
+    /// deleted arm falls through to the `_ => return None` catch-all, so
+    /// asserting the whole table kills that family in one test. The negative
+    /// cases pin the catch-all itself, so widening the table is also a failure.
+    #[test]
+    fn superscript_table_maps_every_arm() {
+        const TABLE: &[(char, char)] = &[
+            ('0', '⁰'),
+            ('1', '¹'),
+            ('2', '²'),
+            ('3', '³'),
+            ('4', '⁴'),
+            ('5', '⁵'),
+            ('6', '⁶'),
+            ('7', '⁷'),
+            ('8', '⁸'),
+            ('9', '⁹'),
+            ('+', '⁺'),
+            ('-', '⁻'),
+            ('−', '⁻'),
+            ('=', '⁼'),
+            ('(', '⁽'),
+            (')', '⁾'),
+            ('a', 'ᵃ'),
+            ('b', 'ᵇ'),
+            ('c', 'ᶜ'),
+            ('d', 'ᵈ'),
+            ('e', 'ᵉ'),
+            ('f', 'ᶠ'),
+            ('g', 'ᵍ'),
+            ('h', 'ʰ'),
+            ('i', 'ⁱ'),
+            ('j', 'ʲ'),
+            ('k', 'ᵏ'),
+            ('l', 'ˡ'),
+            ('m', 'ᵐ'),
+            ('n', 'ⁿ'),
+            ('o', 'ᵒ'),
+            ('p', 'ᵖ'),
+            ('r', 'ʳ'),
+            ('s', 'ˢ'),
+            ('t', 'ᵗ'),
+            ('u', 'ᵘ'),
+            ('v', 'ᵛ'),
+            ('w', 'ʷ'),
+            ('x', 'ˣ'),
+            ('y', 'ʸ'),
+            ('z', 'ᶻ'),
+            ('A', 'ᴬ'),
+            ('B', 'ᴮ'),
+            ('D', 'ᴰ'),
+            ('E', 'ᴱ'),
+            ('G', 'ᴳ'),
+            ('H', 'ᴴ'),
+            ('I', 'ᴵ'),
+            ('J', 'ᴶ'),
+            ('K', 'ᴷ'),
+            ('L', 'ᴸ'),
+            ('M', 'ᴹ'),
+            ('N', 'ᴺ'),
+            ('O', 'ᴼ'),
+            ('P', 'ᴾ'),
+            ('R', 'ᴿ'),
+            ('T', 'ᵀ'),
+            ('U', 'ᵁ'),
+            ('V', 'ⱽ'),
+            ('W', 'ᵂ'),
+        ];
+        for &(input, expected) in TABLE {
+            assert_eq!(
+                superscript(input),
+                Some(expected),
+                "superscript({input:?}) must map to {expected:?}"
+            );
+        }
+        for input in ['q', 'C', 'F', 'Q', 'S', 'X', 'Y', 'Z', '*', '/', '%'] {
+            assert_eq!(
+                superscript(input),
+                None,
+                "superscript({input:?}) has no Unicode form and must return None"
+            );
+        }
+    }
+
+    /// Every arm of the `subscript` table, exhaustively (see the superscript
+    /// twin above for why this is table-driven rather than per-arm).
+    #[test]
+    fn subscript_table_maps_every_arm() {
+        const TABLE: &[(char, char)] = &[
+            ('0', '₀'),
+            ('1', '₁'),
+            ('2', '₂'),
+            ('3', '₃'),
+            ('4', '₄'),
+            ('5', '₅'),
+            ('6', '₆'),
+            ('7', '₇'),
+            ('8', '₈'),
+            ('9', '₉'),
+            ('+', '₊'),
+            ('-', '₋'),
+            ('−', '₋'),
+            ('=', '₌'),
+            ('(', '₍'),
+            (')', '₎'),
+            ('a', 'ₐ'),
+            ('e', 'ₑ'),
+            ('h', 'ₕ'),
+            ('i', 'ᵢ'),
+            ('j', 'ⱼ'),
+            ('k', 'ₖ'),
+            ('l', 'ₗ'),
+            ('m', 'ₘ'),
+            ('n', 'ₙ'),
+            ('o', 'ₒ'),
+            ('p', 'ₚ'),
+            ('r', 'ᵣ'),
+            ('s', 'ₛ'),
+            ('t', 'ₜ'),
+            ('u', 'ᵤ'),
+            ('v', 'ᵥ'),
+            ('x', 'ₓ'),
+        ];
+        for &(input, expected) in TABLE {
+            assert_eq!(
+                subscript(input),
+                Some(expected),
+                "subscript({input:?}) must map to {expected:?}"
+            );
+        }
+        for input in [
+            'b', 'c', 'd', 'f', 'g', 'q', 'w', 'y', 'z', 'A', 'Z', '*', '/',
+        ] {
+            assert_eq!(
+                subscript(input),
+                None,
+                "subscript({input:?}) has no Unicode form and must return None"
+            );
+        }
+    }
+
+    /// Every arm of the `symbol` command table, exhaustively — including both
+    /// names of every aliased arm (`\leq`/`\le`, `\to`/`\rightarrow`, …), so
+    /// deleting a whole multi-pattern arm cannot hide behind its twin.
+    #[test]
+    fn symbol_table_maps_every_arm() {
+        const TABLE: &[(&str, &str)] = &[
+            ("alpha", "α"),
+            ("beta", "β"),
+            ("gamma", "γ"),
+            ("delta", "δ"),
+            ("epsilon", "ε"),
+            ("varepsilon", "ε"),
+            ("zeta", "ζ"),
+            ("eta", "η"),
+            ("theta", "θ"),
+            ("vartheta", "ϑ"),
+            ("iota", "ι"),
+            ("kappa", "κ"),
+            ("lambda", "λ"),
+            ("mu", "μ"),
+            ("nu", "ν"),
+            ("xi", "ξ"),
+            ("pi", "π"),
+            ("rho", "ρ"),
+            ("sigma", "σ"),
+            ("tau", "τ"),
+            ("upsilon", "υ"),
+            ("phi", "φ"),
+            ("varphi", "ϕ"),
+            ("chi", "χ"),
+            ("psi", "ψ"),
+            ("omega", "ω"),
+            ("Gamma", "Γ"),
+            ("Delta", "Δ"),
+            ("Theta", "Θ"),
+            ("Lambda", "Λ"),
+            ("Xi", "Ξ"),
+            ("Pi", "Π"),
+            ("Sigma", "Σ"),
+            ("Upsilon", "Υ"),
+            ("Phi", "Φ"),
+            ("Psi", "Ψ"),
+            ("Omega", "Ω"),
+            ("leq", "≤"),
+            ("le", "≤"),
+            ("geq", "≥"),
+            ("ge", "≥"),
+            ("neq", "≠"),
+            ("ne", "≠"),
+            ("approx", "≈"),
+            ("equiv", "≡"),
+            ("sim", "∼"),
+            ("simeq", "≃"),
+            ("cong", "≅"),
+            ("propto", "∝"),
+            ("ll", "≪"),
+            ("gg", "≫"),
+            ("times", "×"),
+            ("div", "÷"),
+            ("pm", "±"),
+            ("mp", "∓"),
+            ("cdot", "·"),
+            ("ast", "∗"),
+            ("star", "⋆"),
+            ("circ", "∘"),
+            ("bullet", "∙"),
+            ("oplus", "⊕"),
+            ("otimes", "⊗"),
+            ("sum", "∑"),
+            ("prod", "∏"),
+            ("coprod", "∐"),
+            ("int", "∫"),
+            ("iint", "∬"),
+            ("oint", "∮"),
+            ("bigcup", "⋃"),
+            ("bigcap", "⋂"),
+            ("in", "∈"),
+            ("notin", "∉"),
+            ("ni", "∋"),
+            ("subset", "⊂"),
+            ("subseteq", "⊆"),
+            ("supset", "⊃"),
+            ("supseteq", "⊇"),
+            ("cup", "∪"),
+            ("cap", "∩"),
+            ("setminus", "∖"),
+            ("emptyset", "∅"),
+            ("varnothing", "∅"),
+            ("forall", "∀"),
+            ("exists", "∃"),
+            ("nexists", "∄"),
+            ("neg", "¬"),
+            ("lnot", "¬"),
+            ("land", "∧"),
+            ("wedge", "∧"),
+            ("lor", "∨"),
+            ("vee", "∨"),
+            ("therefore", "∴"),
+            ("because", "∵"),
+            ("to", "→"),
+            ("rightarrow", "→"),
+            ("leftarrow", "←"),
+            ("gets", "←"),
+            ("leftrightarrow", "↔"),
+            ("Rightarrow", "⇒"),
+            ("implies", "⇒"),
+            ("Leftarrow", "⇐"),
+            ("Leftrightarrow", "⇔"),
+            ("iff", "⇔"),
+            ("mapsto", "↦"),
+            ("uparrow", "↑"),
+            ("downarrow", "↓"),
+            ("infty", "∞"),
+            ("partial", "∂"),
+            ("nabla", "∇"),
+            ("angle", "∠"),
+            ("perp", "⊥"),
+            ("parallel", "∥"),
+            ("degree", "°"),
+            ("prime", "′"),
+            ("hbar", "ℏ"),
+            ("ell", "ℓ"),
+            ("Re", "ℜ"),
+            ("Im", "ℑ"),
+            ("aleph", "ℵ"),
+            ("ldots", "…"),
+            ("dots", "…"),
+            ("cdots", "⋯"),
+            ("vdots", "⋮"),
+            ("ddots", "⋱"),
+            ("checkmark", "✓"),
+            ("sin", "sin"),
+            ("cos", "cos"),
+            ("tan", "tan"),
+            ("log", "log"),
+            ("ln", "ln"),
+            ("exp", "exp"),
+            ("min", "min"),
+            ("max", "max"),
+            ("lim", "lim"),
+        ];
+        for &(input, expected) in TABLE {
+            assert_eq!(
+                symbol(input),
+                Some(expected),
+                "symbol({input:?}) must map to {expected:?}"
+            );
+        }
+        for input in ["", "notacommand", "alpha_", "Alpha", "LEQ"] {
+            assert_eq!(
+                symbol(input),
+                None,
+                "symbol({input:?}) is not a known command and must return None"
+            );
+        }
+    }
 }
