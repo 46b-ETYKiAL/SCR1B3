@@ -1283,6 +1283,30 @@ mod rope_writeback_tests {
         );
     }
 
+    /// The body of the FIRST `out.response.changed()` arm in `src`, with
+    /// comments and string literals stripped.
+    ///
+    /// Stripping is the whole point. This guard used to match the RAW text, so
+    /// a bare `// note_text_mutated` left in an otherwise-empty arm satisfied
+    /// it — a comment naming the call it had just lost. That is the same defeat
+    /// the config-dir lock guard admitted, so it reuses the SAME code-only
+    /// matcher (`test_config_env::code_only`) rather than growing a second one.
+    ///
+    /// Stripping also hardens the extraction itself: an `if
+    /// out.response.changed()` written in a comment can no longer shift which
+    /// arm is picked, and a `"}"` inside a string literal can no longer truncate
+    /// the body early.
+    fn first_changed_arm_body(src: &str) -> String {
+        let code = crate::test_config_env::code_only(src);
+        let arm = code
+            .split("if out.response.changed()")
+            .nth(1)
+            .expect("the grid pane writer must still have a `.changed()` arm")
+            .to_string();
+        let end = arm.find('}').expect("the arm must have a body");
+        arm[..end].to_string()
+    }
+
     /// The same defect at the grid/split-pane writer, which has its own
     /// `out.response.changed()` arm and had the identical bare `edit_gen` bump.
     ///
@@ -1293,20 +1317,47 @@ mod rope_writeback_tests {
     /// writer. That passes whatever `grid_methods` does, which is worse than no
     /// test. This instead reads the writer and requires the invalidating call
     /// to be present in the arm, which is the property that was missing.
+    ///
+    /// This is the ONLY police on that arm, so a matcher a comment can satisfy
+    /// leaves it unguarded outright — hence the code-only extraction above.
     #[test]
     fn the_grid_pane_changed_arm_invalidates_the_rope() {
-        let src = include_str!("grid_methods.rs");
-        let arm = src
-            .split("if out.response.changed()")
-            .nth(1)
-            .expect("the grid pane writer must still have a `.changed()` arm");
-        let body = &arm[..arm.find('}').expect("the arm must have a body")];
+        let body = first_changed_arm_body(include_str!("grid_methods.rs"));
         assert!(
             body.contains("note_text_mutated"),
             "the grid pane's `.changed()` arm mutates `text` but does not call \
              `note_text_mutated`, so it leaves the pre-edit `rope_buf` alive — \
              the same silent write-back data loss the single-pane writer had. \
              Arm body was: {body:?}"
+        );
+    }
+
+    /// The guard above must not be satisfiable by PROSE. Deleting the call and
+    /// leaving a comment that names it is the exact evasion the raw-text
+    /// matcher admitted.
+    #[test]
+    fn the_grid_pane_guard_is_not_satisfied_by_a_comment() {
+        let evasive = "fn f() {\n    if out.response.changed() {\n        \
+                       // invalidation handled by note_text_mutated\n    }\n}\n";
+        assert!(
+            !first_changed_arm_body(evasive).contains("note_text_mutated"),
+            "a comment must NOT count as the invalidating call — if it does, the \
+             only police on the grid pane's `.changed()` arm is defeated by \
+             exactly the kind of comment it exists to disbelieve"
+        );
+    }
+
+    /// The POSITIVE control: without it the decoy test above would also pass
+    /// against an extractor that returned an empty body for everything, and a
+    /// guard that rejects every arm is not a guard.
+    #[test]
+    fn the_grid_pane_guard_accepts_a_real_call() {
+        let honest = "fn f() {\n    if out.response.changed() {\n        \
+                      tabs[idx].note_text_mutated();\n    }\n}\n";
+        assert!(
+            first_changed_arm_body(honest).contains("note_text_mutated"),
+            "a real call must satisfy the guard, or the decoy test is passing \
+             against an extractor that sees nothing at all"
         );
     }
 

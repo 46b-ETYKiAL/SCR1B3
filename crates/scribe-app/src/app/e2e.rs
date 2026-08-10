@@ -837,6 +837,119 @@ fn follow_os_theme_switches_with_os() {
     );
 }
 
+/// The Settings theme picker carries the SAME defect Cycle Theme was already
+/// fixed for. With `follow_os_theme` on — the SHIPPED DEFAULT — a picked theme
+/// is not authoritative: on a light OS `effective_theme_name` returns
+/// `ghost-paper` unconditionally. So picking a theme in Settings advanced the
+/// config, persisted it, repainted the IDENTICAL theme, and left the picker
+/// displaying a theme the window was not showing.
+///
+/// An explicit pick TAKES OWNERSHIP — the same rule the command surfaces
+/// already follow. The "Follow OS dark/light" checkbox that turns back off sits
+/// on the same page, directly below, so the change is visible and reversible
+/// where it happened.
+#[test]
+fn picking_a_theme_in_settings_takes_ownership_from_follow_os() {
+    let mut cfg = Config::default();
+    cfg.editor.first_run_completed = true;
+    cfg.appearance.frameless = false;
+    assert!(
+        cfg.appearance.follow_os_theme,
+        "precondition — the SHIPPED default follows the OS theme; if this flips, \
+         this test is guarding nothing"
+    );
+    assert_eq!(
+        cfg.appearance.theme, "itasha-corp",
+        "precondition — the combo's selected text (and so the label clicked \
+         below) is the default theme name"
+    );
+    let mut h = egui_kittest::Harness::builder()
+        .with_size(egui::Vec2::new(1280.0, 940.0))
+        .build_state(
+            |ctx, app: &mut ScribeApp| app.frame_tick(ctx),
+            ScribeApp::new_test(cfg),
+        );
+    h.ctx.set_theme(egui::Theme::Light);
+    h.state_mut().settings_open = true;
+    h.run();
+    h.run();
+    assert_eq!(
+        h.state().theme.name,
+        "ghost-paper",
+        "precondition — a light OS resolves to the bundled light theme, so a \
+         picked dark theme has something to override"
+    );
+
+    // The real user path: open the theme dropdown and pick a DARK theme. The
+    // picker is the only ComboBox on the page, so the role identifies it
+    // without depending on the currently-selected name.
+    h.get_by_role(egui::accesskit::Role::ComboBox).click();
+    h.run();
+    h.get_by_label("wired-noir").click();
+    h.run();
+
+    let app = h.state();
+    assert_eq!(
+        app.config.appearance.theme, "wired-noir",
+        "the pick must be recorded in the config"
+    );
+    assert!(
+        !app.config.appearance.follow_os_theme,
+        "an explicit pick in Settings must TAKE OWNERSHIP of the theme — with \
+         the automatic mode still on, the OS keeps overriding the pick and the \
+         picker shows a theme the window is not painting"
+    );
+    assert_eq!(
+        app.theme.name, "wired-noir",
+        "and the window must actually PAINT what was picked, not the OS-resolved \
+         substitute"
+    );
+}
+
+/// The ▶ arrow beside the dropdown is the SAME explicit pick by another
+/// control, so it must take ownership too — otherwise the row's two halves
+/// disagree about whether the user's choice counts.
+#[test]
+fn stepping_the_theme_arrow_in_settings_takes_ownership_from_follow_os() {
+    let mut cfg = Config::default();
+    cfg.editor.first_run_completed = true;
+    cfg.appearance.frameless = false;
+    assert!(
+        cfg.appearance.follow_os_theme,
+        "precondition — the SHIPPED default follows the OS theme"
+    );
+    let mut h = egui_kittest::Harness::builder()
+        .with_size(egui::Vec2::new(1280.0, 940.0))
+        .build_state(
+            |ctx, app: &mut ScribeApp| app.frame_tick(ctx),
+            ScribeApp::new_test(cfg),
+        );
+    h.ctx.set_theme(egui::Theme::Light);
+    h.state_mut().settings_open = true;
+    h.run();
+    h.run();
+    let before = h.state().config.appearance.theme.clone();
+
+    // The ▶ caret is the only one on the page — it belongs to the theme row.
+    h.get_by_label(egui_phosphor::thin::CARET_RIGHT).click();
+    h.run();
+
+    let app = h.state();
+    assert_ne!(
+        app.config.appearance.theme, before,
+        "the arrow must advance the theme"
+    );
+    assert!(
+        !app.config.appearance.follow_os_theme,
+        "stepping the theme with the arrow is an explicit pick and must TAKE \
+         OWNERSHIP, exactly as choosing from the dropdown beside it does"
+    );
+    assert_eq!(
+        app.theme.name, app.config.appearance.theme,
+        "and the window must paint the theme the arrow landed on"
+    );
+}
+
 /// Phase 18 T18.2 — flipping `editor.grid_enabled` on creates the
 /// tile-tree at the top of the next frame and the central panel
 /// renders without panicking. Three frames are enough to exercise

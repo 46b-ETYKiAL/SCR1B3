@@ -122,7 +122,7 @@ toggle_zen = "f10"      # zen mode on F10
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `theme` | string | `"itasha-corp"` | Theme name: a built-in scheme or the file stem of a user theme in your themes directory. A broken/unknown theme falls back to `wired-noir`. See [THEMING.md](THEMING.md). |
-| `follow_os_theme` | boolean | `true` | Follow the OS dark/light preference. |
+| `follow_os_theme` | boolean | `true` | Follow the OS dark/light preference. While it is on, `theme` is not authoritative — the OS decides light vs dark. Picking a theme explicitly (Settings → Appearance, or the Cycle Theme command) therefore turns this **off**, so the theme you chose is the one that paints; re-tick "Follow OS dark/light" to hand control back. |
 | `frameless` | boolean | `true` | Use a frameless window with the custom brand titlebar (no OS title bar). Set `false` for standard OS window decorations. |
 | `toolbar_icons` | boolean | `false` | Render the quick-access toolbar as Phosphor (Thin) icon glyphs instead of text labels. |
 | `jp_glyph_labels` | boolean | `false` | Append a small, dim, English-redundant kanji to each toolbar action whose canonical Japanese term is verified (e.g. New → 新, Save → 保, Find → 検). Actions whose canonical kanji is uncertain (open-folder, palette, CRT, LSP) stay English-only — Folklore-Consultant gate (DECISION-2026-005). |

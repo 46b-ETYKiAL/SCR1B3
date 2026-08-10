@@ -156,6 +156,29 @@ pub(crate) fn row_visible(q: &str, label: &str) -> bool {
     q.is_empty() || label.to_lowercase().contains(q)
 }
 
+/// The side effects EVERY explicit theme pick in Settings carries.
+///
+/// `#88/#106` — a new theme clears both background overrides, so the theme that
+/// was picked shows its OWN backgrounds instead of the previous theme's pinned
+/// colours.
+///
+/// And the pick TAKES OWNERSHIP: `follow_os_theme` yields. With it on — the
+/// SHIPPED DEFAULT — `appearance.theme` is not authoritative:
+/// `effective_theme_name` returns `ghost-paper` unconditionally on a light OS,
+/// and on a dark OS substitutes `wired-noir` whenever the picked name is a light
+/// theme. So a pick advanced the config, persisted it, repainted the IDENTICAL
+/// theme, and left the picker naming a theme the window was not showing — the
+/// same lie the Cycle Theme command was fixed for.
+///
+/// The "Follow OS dark/light" checkbox sits directly beneath the picker, which
+/// is why this is the right place for the trade: the user SEES it untick where
+/// they made the choice, and re-ticking it is the one-click way back.
+fn take_theme_ownership(config: &mut Config) {
+    config.appearance.background_override = None;
+    config.appearance.note_background_override = None;
+    config.appearance.follow_os_theme = false;
+}
+
 /// F-037 — a per-setting "restore default" affordance. Renders a small ↺
 /// button that is enabled only when `cur != def`; clicking it resets the
 /// field and returns `true` so the caller marks settings dirty. Placed at the
@@ -634,11 +657,9 @@ fn render_sections(
                     let step = |config: &mut Config, delta: isize| {
                         let next = step_theme_index(names, &config.appearance.theme, delta);
                         config.appearance.theme = names[next].to_string();
-                        // #88/#106 — switching theme resets BOTH the app and note
-                        // background overrides to the new theme (parity with the
-                        // dropdown path below).
-                        config.appearance.background_override = None;
-                        config.appearance.note_background_override = None;
+                        // Parity with the dropdown path below — the arrows are
+                        // the same explicit pick by another control.
+                        take_theme_ownership(config);
                     };
                     if ui
                         .add(egui::Button::new(egui_phosphor::thin::CARET_LEFT))
@@ -656,16 +677,15 @@ fn render_sections(
                         .selected_text(config.appearance.theme.clone())
                         .show_ui(ui, |ui| {
                             for name in names {
-                                if ui
+                                let picked = ui
                                     .selectable_value(
                                         &mut config.appearance.theme,
                                         (*name).to_string(),
                                         *name,
                                     )
-                                    .changed()
-                                {
-                                    config.appearance.background_override = None;
-                                    config.appearance.note_background_override = None;
+                                    .changed();
+                                if picked {
+                                    take_theme_ownership(config);
                                     changed = true;
                                 }
                             }
@@ -697,8 +717,10 @@ fn render_sections(
                     )
                     .changed();
                 if name_changed {
-                    config.appearance.background_override = None;
-                    config.appearance.note_background_override = None;
+                    // Naming a user theme is as explicit a pick as choosing a
+                    // built-in, and the OS-follow substitution silences it just
+                    // as completely — so it takes ownership on the same terms.
+                    take_theme_ownership(config);
                     changed = true;
                 }
                 ui.end_row();

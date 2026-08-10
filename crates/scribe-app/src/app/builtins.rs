@@ -154,11 +154,17 @@ impl ScribeApp {
                     // the choice is explicit, announced in the status line, and
                     // reversible from Settings → "Follow OS dark/light".
                     //
-                    // Only the COMMAND surfaces do this. The Settings theme
-                    // picker deliberately does not: the "Follow OS dark/light"
-                    // checkbox sits directly beneath it, so a user choosing there
-                    // can see why the picked theme may not paint. A keyboard
-                    // shortcut and a palette entry carry no such context.
+                    // EVERY explicit pick does this, the Settings theme picker
+                    // included (`settings::take_theme_ownership`). The picker
+                    // was once exempted on the grounds that the "Follow OS
+                    // dark/light" checkbox sits directly beneath it, so a user
+                    // choosing there could see why the picked theme may not
+                    // paint. That reasoned about the wrong thing: a nearby
+                    // checkbox explains the automatic mode, it does not stop the
+                    // pick being silently overridden — the picker still showed a
+                    // theme the window was not painting. Its real value is as
+                    // the visible one-click way back, and it now unticks in
+                    // place when the pick takes ownership.
                     let was_following = std::mem::take(&mut self.config.appearance.follow_os_theme);
                     self.save_config();
                     // Writing the config name is only half of a theme change:
