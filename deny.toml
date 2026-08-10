@@ -23,6 +23,22 @@ ignore = [
     # egui update wayland-scanner past the patched quick-xml.
     "RUSTSEC-2026-0194",
     "RUSTSEC-2026-0195",
+    # RUSTSEC-2026-0249 — smartstring 1.0.1 unmaintained (repo archived by the
+    # owner 2026-05-03). Filed 2026-08-10. This is an UNMAINTAINED notice, not
+    # a vulnerability: no CVE, no advisory patch, and the advisory itself says
+    # "No safe upgrade is available!".
+    #
+    # Sole path is transitive and unavoidable:
+    #   smartstring 1.0.1 <- rhai 1.25.1 <- scribe-core
+    # rhai is the pure-Rust sandboxed scripting engine behind the plugin "easy
+    # mode"; it declares smartstring as a NON-optional dependency (rhai's
+    # Cargo.toml `[dependencies.smartstring]`, no `optional = true`), so no
+    # feature combination drops it, and 1.25.1 is the newest published rhai —
+    # `cargo update -p rhai` locks 0 packages. We never name smartstring
+    # ourselves. The advisory's suggested replacements (compact_str, smol_str)
+    # are a migration for rhai upstream to make, not something we can select.
+    # Re-evaluate when rhai publishes a release that drops smartstring.
+    "RUSTSEC-2026-0249",
 ]
 
 [licenses]
