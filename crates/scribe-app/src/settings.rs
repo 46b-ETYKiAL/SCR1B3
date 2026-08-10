@@ -10,6 +10,9 @@
 //! false])` is the load-bearing idiom here). Every control carries an
 //! `.on_hover_text` tooltip.
 
+mod chrome;
+
+use chrome::{group, head, space};
 use eframe::egui;
 use scribe_core::config::{ClaimType, ToolbarConfig, UpdateMode};
 use scribe_core::{Config, ReportingMode};
@@ -599,26 +602,6 @@ fn render_sections(
     // Roomier vertical rhythm so rows don't feel cramped — egui's default item
     // spacing (~3px) is what made settings hard to read. Applies to every row.
     ui.spacing_mut().item_spacing.y = 8.0;
-    let space = |ui: &mut egui::Ui| ui.add_space(12.0);
-    // Sub-group header inside a category page (Copland-style #102): a strong
-    // single-concept label, a muted one-line "what it controls" sentence, and a
-    // thin rule — mirroring Copland's CONFIG.md section formatting so every
-    // group reads as a self-explanatory section.
-    let group = |ui: &mut egui::Ui, label: &str, desc: &str| {
-        ui.add_space(8.0);
-        ui.label(egui::RichText::new(label).strong());
-        if !desc.is_empty() {
-            ui.label(egui::RichText::new(desc).weak().small());
-        }
-        ui.separator();
-    };
-    // Category page header: the heading plus a muted one-line description of what
-    // the page covers, so each section is self-explanatory at a glance (#69).
-    let head = |ui: &mut egui::Ui, title: &str, desc: &str| {
-        ui.heading(title);
-        ui.label(egui::RichText::new(desc).weak().small());
-        ui.add_space(2.0);
-    };
     // F-037 — the default config, used by `reset_to_default` for every
     // per-setting ↺ revert button. Cheap to construct once per render.
     let def = Config::default();

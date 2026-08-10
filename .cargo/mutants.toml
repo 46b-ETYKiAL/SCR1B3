@@ -231,6 +231,22 @@ exclude_re = [
   '\brender_toolbar_editor\b',
   '\btoolbar_list_editor\b',
   'settings\.rs.*\bshow\b',
+  # settings/chrome.rs — the page-chrome helpers (`space`/`group`/`head`) that
+  # were closures INSIDE `render_sections` until the settings decomposition.
+  # Their bodies are unchanged: ui.add_space / ui.label / ui.heading /
+  # ui.separator only — painted pixels, `-> ()`, no app-observable state
+  # (ADR-0007 egui-paint). They were already pardoned as part of
+  # `\brender_sections\b`; lifting them to free functions is why they now need
+  # to be named, and the pardon set is SCOPE-PRESERVING, not widened: the lift
+  # moved 1 mutant out of render_sections (192 -> 191) and produced 4 here, the
+  # 3 extra being the whole-function `with ()` shape a closure never generates.
+  # FILE-QUALIFIED, not `\b`-bounded bare: `space`, `group` and `head` are
+  # common words that would collide across the tree (the same reason `show` is
+  # file-scoped above). `head` in particular must not reach `TableHead` arms in
+  # md_preview.rs, and `group` must not reach egui `group(` calls elsewhere.
+  'settings/chrome\.rs.*\bspace\b',
+  'settings/chrome\.rs.*\bgroup\b',
+  'settings/chrome\.rs.*\bhead\b',
   # app/chrome.rs frameless-window chrome painting
   '\bcaption_btn\b',
   '\bhandle_frameless_resize\b',
