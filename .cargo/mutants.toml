@@ -420,6 +420,100 @@ exclude_re = [
   # FILE-BACKED buffers" contract (the sibling predicates ARE tested).
   'app/session_persist\.rs:\d+:68: replace && with \|\| in ScribeApp::persist_session_and_autosave',
 
+  # --- Wave-2 pardons (survivor-anchored, deliberately NOT whole-function) ---
+  #
+  # Every entry below was cross-checked against the recovered CI survivor list
+  # before it was written: it pardons ONLY mutants that were actually observed
+  # MISSED. Where the wave-2 design proposed a whole-FUNCTION token, the token
+  # was NARROWED to the observed survivors instead, because the measurement
+  # said the broad form would have un-gated mutants the tests currently KILL —
+  # `\brender_blocks\b` would have swallowed 13 of them, `\brender_runs_inner\b`
+  # 9, `\brender_table\b` 4, and `\brender_notes_pane\b` 2 plus the one real,
+  # killable gap at notes_ui.rs:506:75 that the design explicitly left open.
+  # That is floor-lowering wearing a pardon's clothes, and this file's own
+  # header forbids it: over-suppression is worse than rotation. Narrowing is a
+  # TIGHTENING, not a widening — the same move the reporting.rs entry above
+  # documents.
+  #
+  # tray.rs: `mod imp` is `#[cfg(windows)]` (tray.rs:195) and the mutation
+  # runner is ubuntu-latest, so these are generated from SOURCE but never
+  # compiled there — the same vacuous-MISSED condition ci.yml already excludes
+  # integration/windows.rs for. No Linux test can kill them. Their real
+  # coverage is `classify_menu` / `apply_toggle` / `toggle_from_ctx`, which are
+  # NOT cfg-gated and ARE mutation-tested here. A pardon whose premise is a cfg
+  # gate needs that premise pinned, so
+  # `tray_imp_is_cfg_gated_so_the_mutation_pardon_stays_honest` (tray.rs) fails
+  # the suite the moment the gate is removed — forcing these entries out rather
+  # than letting them silently start hiding compiled, untested code.
+  'tray\.rs.*\bimp::icon\b',
+  'tray\.rs.*\bimp::init\b',
+  # The OUTER `tray::init`'s `#[cfg(not(windows))]` body is `let _ = ctx;` — no
+  # return value, no side effect — so `with ()` is provably equivalent on the
+  # runner's target. Bounded to `with \(\)` deliberately, exactly like the
+  # scribe-win32-chrome wrappers above.
+  'replace tray::init with \(\)',
+  # md_preview.rs table Start-arms: both clears are DEFENSIVE. `t.row` is
+  # `mem::take`n at End(TableHead)/End(TableRow) and `runs` at End(TableCell),
+  # so both buffers are already empty at every Start and deleting either arm is
+  # byte-identical on any balanced pulldown-cmark stream. NOT argued from the
+  # source alone: each arm was deleted locally (sha256 recorded before/after, so
+  # the deletion provably landed) and all 84 md_preview tests stayed green.
+  # NOTE: this rests on those three `mem::take`s. If any becomes a non-draining
+  # read, DROP this pardon — the arms would start carrying state.
+  'md_preview\.rs.*delete match arm Event::Start\(Tag::TableHead\)',
+  'md_preview\.rs.*delete match arm Event::Start\(Tag::TableCell\)',
+  # Paint-only siblings added by this PR — the same ADR-0007 egui-paint class as
+  # `\bpaint_squiggle\b` above: the body is painter.rect_filled / line_segment /
+  # text, the return is `()`, and nothing outside GPU pixels changes. Whole-
+  # function tokens are used for exactly these two because EVERY mutant they
+  # currently generate is a confirmed survivor (18/18 and 13/13), so the broad
+  # form suppresses nothing that is killed today. The pure logic each one once
+  # inlined is EXTRACTED and separately tested — `mark_lane`/`mark_y`/
+  # `merge_marks` (overview_mark_tests) out of the first, `ws_marker`
+  # (grid_methods_tests) out of the second — so neither pardon hides a logic gap.
+  '\bpaint_overview_marks\b',
+  '\bpaint_whitespace_markers\b',
+  # paint_secondary_carets is the SAME class but gets survivor-anchored entries
+  # rather than a whole-function token: 4 of its 10 current mutants
+  # (`replace + with *` at two columns) were never observed MISSED, and 12 of
+  # the 24 CI shards were cancelled at the 100-minute timeout, so "absent from
+  # the survivor list" does NOT mean "caught" — it means UNKNOWN. Pardoning an
+  # unknown is pardoning without evidence. Those four stay gated until a
+  # complete run reports them; the six below were observed surviving.
+  # (`same_galley_row` was lifted out of this body and IS tested.)
+  'replace paint_secondary_carets with \(\)',
+  'delete ! in paint_secondary_carets',
+  'replace \+ with - in paint_secondary_carets',
+  # md_preview.rs render_runs_inner: `\brender_runs\b` above CANNOT match it —
+  # the next character is `_`, which IS a word character, so the boundary never
+  # applies. The fix is a SECOND EXPLICIT ENTRY; never unbound `render_runs`,
+  # which would silently re-widen every other `\b`-bounded token in this array.
+  # The second entry is description-anchored rather than a bare
+  # `\brender_runs_inner\b`, because 9 of that function's 16 mutants are killed
+  # today (the `>` at :1217 and the `<` at :1230 families) and a whole-function
+  # token would un-gate all nine. These two descriptions cover the fn's only
+  # `||` and its only three `&&`, i.e. exactly 4 of its 7 survivors. The three
+  # surviving `delete !` on the same line are deliberately NOT pardoned: their
+  # description and their columns both collide with the killed `delete !` at
+  # :1201/:1203, and there is no anchor that separates them without
+  # over-suppressing. They stay honestly red.
+  'replace \|\| with && in render_runs_inner',
+  'replace && with \|\| in render_runs_inner',
+  # md_preview.rs render_blocks / render_table: one survivor each, both inside
+  # egui Grid/indent emission. Description-anchored to that single survivor —
+  # the sibling operators at the SAME line and column (`< with ==`/`< with >`,
+  # `+= with -=`) are killed today and must stay gated.
+  'replace < with <= in render_blocks',
+  'replace \+= with \*= in render_table',
+  # notes_ui.rs tag-tree indent: `node.depth as f32 * TAG_TREE_INDENT` feeds
+  # `ui.add_space` only (painted pixels). These are the function's ONLY `*`
+  # mutants, so the description cannot reach anything else — in particular it
+  # does NOT touch `notes_ui.rs:506:75` (`selected_tag == node.tag`), which
+  # drives `selectable_label` and is a REAL, killable gap awaiting an
+  # egui_kittest fixture. Pardoning that one by using a whole-function token
+  # here would have hidden it.
+  'replace \* with (\+|/) in ScribeApp::render_notes_pane',
+
   # --- The ONLY three literal-line anchors that survive, and why -------------
   # Each pardons a mutant whose NAME is byte-identical to a NEIGHBOUR in the
   # same function at the SAME column — so neither the description nor the column

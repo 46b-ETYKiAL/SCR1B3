@@ -255,6 +255,22 @@ impl RenamePlan {
     }
 }
 
+/// True when a rename completed only PARTIALLY — some notes, or some links,
+/// were not written.
+///
+/// Extracted from `rename_note_active` so the four-way comparison is assertable
+/// without a live vault, a tab set, and a filesystem that can be made to fail
+/// halfway. Writing MORE than planned is not a failure.
+#[must_use]
+pub(super) fn rename_incomplete(
+    written: usize,
+    planned_notes: usize,
+    links: usize,
+    planned_links: usize,
+) -> bool {
+    written < planned_notes || links < planned_links
+}
+
 /// Compute the rewrite plan for renaming `old_path` to `new_path` inside
 /// `vault`.
 ///
@@ -517,7 +533,7 @@ impl ScribeApp {
             if links == 1 { "" } else { "s" },
             if written == 1 { "" } else { "s" }
         );
-        if written < planned_notes || links < planned_links {
+        if rename_incomplete(written, planned_notes, links, planned_links) {
             self.toast = Some(
                 "Renamed, but some notes couldn't be updated. Check that the vault is writable."
                     .into(),
@@ -1351,6 +1367,89 @@ mod tests {
         assert!(
             app.tabs[app.active].doc.path().is_none(),
             "nothing is written"
+        );
+    }
+
+    #[test]
+    fn rename_incomplete_flags_exactly_the_partial_writes() {
+        // Each row is chosen to break one mutation of the two comparisons and
+        // the `||`: row 1 is the all-clear (so `==` / `<=` on either side turns
+        // it into a false alarm), rows 2 and 3 fail on exactly ONE side (so `&&`
+        // and a flipped `>` both stop reporting them).
+        // (written, planned_notes, links, planned_links, want)
+        for (written, planned_notes, links, planned_links, want) in [
+            (3usize, 3usize, 7usize, 7usize, false), // everything landed
+            (2, 3, 7, 7, true),                      // a note could not be written
+            (3, 3, 6, 7, true),                      // a link could not be rewritten
+            (2, 3, 6, 7, true),                      // both fell short
+            (4, 3, 8, 7, false),                     // more than planned is not a failure
+        ] {
+            assert_eq!(
+                rename_incomplete(written, planned_notes, links, planned_links),
+                want,
+                "written={written}/{planned_notes} links={links}/{planned_links}"
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_ish_resolves_a_not_yet_existing_destination_through_its_parent() {
+        // `vault_relative_works_for_a_file_that_does_not_exist_yet` also covers
+        // this arm, but it compares a tempdir path against its own canonical
+        // form — which on LINUX (the mutation runner) are the same bytes, so the
+        // arm can be deleted and that test still passes. Route through a `..`
+        // component instead: canonicalisation normalises it away on every
+        // platform, so the canonical and raw forms differ everywhere.
+        let root = tempfile::tempdir().expect("temp root");
+        std::fs::create_dir(root.path().join("sub")).expect("sub dir");
+        let canonical_root = std::fs::canonicalize(root.path()).expect("canonicalize root");
+
+        let dest = root.path().join("sub").join("..").join("New.md");
+        assert!(
+            !dest.exists(),
+            "the fixture must be a destination that does NOT exist"
+        );
+
+        // A rename destination cannot be `canonicalize`d directly, so the parent
+        // arm is the only thing that can produce a comparable path. Without it
+        // the raw `…/sub/../New.md` is compared against a canonical vault and
+        // reads as "outside the vault" — refusing every legitimate rename.
+        assert_eq!(canonical_ish(&dest), canonical_root.join("New.md"));
+    }
+
+    #[test]
+    fn rename_plan_links_sums_the_link_count_of_every_edit() {
+        // The status line reports this number to the user ("updated N links in M
+        // notes") and `rename_incomplete` compares against it, so a stubbed
+        // constant is a silently wrong report AND a silently wrong toast.
+        let plan = RenamePlan {
+            old_path: PathBuf::from("/v/Old.md"),
+            new_path: PathBuf::from("/v/New.md"),
+            new_target: "New".into(),
+            edits: vec![
+                RenameEdit {
+                    path: PathBuf::from("/v/a.md"),
+                    content: String::new(),
+                    links: 2,
+                },
+                RenameEdit {
+                    path: PathBuf::from("/v/b.md"),
+                    content: String::new(),
+                    links: 1,
+                },
+            ],
+        };
+        // 3 = 2 + 1: a value neither a `-> 0` nor a `-> 1` stub can produce, and
+        // one that a per-edit max (rather than a sum) would report as 2.
+        assert_eq!(plan.links(), 3);
+        assert_eq!(
+            RenamePlan {
+                edits: Vec::new(),
+                ..plan
+            }
+            .links(),
+            0,
+            "no edits is genuinely zero links"
         );
     }
 }

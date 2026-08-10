@@ -169,13 +169,18 @@ pub(super) fn lines_of_offsets(text: &str, offsets: &[usize]) -> Vec<usize> {
     let mut cursor = 0usize;
     let bytes = text.as_bytes();
     for off in sorted {
+        // `sorted` is ascending and `min` is monotone, so `cursor <= off` always
+        // holds and the slice below is never inverted.
+        //
+        // Counted over a slice rather than walked with a `cursor += 1` loop
+        // deliberately: the per-byte form generated a `cursor *= 1` mutant that
+        // pinned `cursor` at 0 and made the `while` non-terminating, so the
+        // mutation gate reported a TIMEOUT no test could ever convert into a
+        // kill. Removing the increment removes the mutant at the source instead
+        // of leaving a hang for a future run to re-pay. Same O(n) single pass.
         let off = off.min(bytes.len());
-        while cursor < off {
-            if bytes[cursor] == b'\n' {
-                line += 1;
-            }
-            cursor += 1;
-        }
+        line += bytes[cursor..off].iter().filter(|&&b| b == b'\n').count();
+        cursor = off;
         out.push(line);
     }
     out
@@ -872,6 +877,46 @@ mod overview_mark_tests {
         let second_line_start = "日本語\n".len(); // 10 bytes
         assert_eq!(lines_of_offsets(text, &[0, second_line_start]), vec![0, 1]);
     }
+
+    #[test]
+    fn mark_lane_widths_are_twelve_percent_clamped_and_the_lanes_sit_where_documented() {
+        // The non-overlap test above can never fail for any `w` inside the
+        // 2..=6 clamp band, so it passes on `width + 0.12` and `width / 0.12`
+        // alike. Pin the VALUES: the width is 12% of the panel under a 2..=6
+        // clamp, Change is flush left, Search is CENTRED, Error is flush right.
+        // (`width, expected lane width`)
+        for (width, want_w) in [
+            (16.0_f32, 2.0_f32), // 12% = 1.92 -> clamped UP to the 2px floor.
+            //                      Below the 48px minimum panel, so this row
+            //                      pins totality rather than a reachable state.
+            (48.0, 5.76), // narrowest real panel; 12% sits inside the band
+            (50.0, 6.0),  // 12% == 6.0, exactly on the ceiling
+            (260.0, 6.0), // widest real panel; 12% = 31.2 -> clamped DOWN
+        ] {
+            let (cx, cw) = mark_lane(width, MarkLane::Change);
+            let (sx, sw) = mark_lane(width, MarkLane::Search);
+            let (ex, ew) = mark_lane(width, MarkLane::Error);
+
+            for (name, w) in [("change", cw), ("search", sw), ("error", ew)] {
+                assert!(
+                    (w - want_w).abs() < EPS,
+                    "{name} lane width at panel {width}: want {want_w}, got {w}"
+                );
+            }
+            assert!(
+                (cx - 0.0).abs() < EPS,
+                "change lane must be flush left at {width}"
+            );
+            assert!(
+                ((sx + sw * 0.5) - width * 0.5).abs() < EPS,
+                "search lane must be CENTRED at {width}: x={sx} w={sw}"
+            );
+            assert!(
+                ((ex + ew) - width).abs() < EPS,
+                "error lane must be flush right at {width}: x={ex} w={ew}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1044,6 +1089,31 @@ mod overview_source_tests {
         }];
         assert!(app.tabs[0].doc.path().is_none());
         assert!(app.overview_error_lines().is_empty());
+    }
+
+    #[test]
+    fn overview_error_lines_is_empty_when_the_active_index_is_out_of_range() {
+        // The `||` guard is two guards: the empty-diagnostics half is a pure
+        // fast path (the filter below returns empty anyway), but the
+        // active-out-of-range half is the one that keeps `self.tabs[self.active]`
+        // from panicking. With `&&` the short-circuit inverts and a stale
+        // `active` — the state a tab close leaves behind for one frame — indexes
+        // past the end and takes the whole frame down.
+        let mut app = ScribeApp::new_test(Config::default());
+        app.diagnostics = vec![scribe_core::lsp::protocol::Diagnostic {
+            uri: "file:///nowhere.rs".into(),
+            line: 0,
+            character: 0,
+            end_line: 0,
+            end_character: 0,
+            severity: 1,
+            message: "boom".into(),
+        }];
+        app.active = app.tabs.len(); // out of range, diagnostics NON-empty
+        assert!(
+            app.overview_error_lines().is_empty(),
+            "an out-of-range active index must yield no marks, not a panic"
+        );
     }
 }
 

@@ -678,3 +678,61 @@ pub(super) fn handle_frameless_resize(ctx: &egui::Context) {
         ctx.stop_dragging();
     }
 }
+
+#[cfg(test)]
+mod chrome_state_tests {
+    use super::{
+        caption_btn_union, set_caption_btn_union, set_titlebar_band, swap_last_band_pass,
+        titlebar_band,
+    };
+
+    /// The three pieces of per-context chrome state are a latch and two rect
+    /// slots, and every one of them is only ever read back through its own
+    /// getter — so a getter that always returned the "unset" answer, or a setter
+    /// that dropped its argument, would be invisible to every other test in the
+    /// tree. Assert the two things that distinguish a live slot from a stub: the
+    /// UNSET reading is the documented sentinel, and a stored value comes back
+    /// unchanged.
+    #[test]
+    fn per_context_chrome_state_starts_unset_and_round_trips() {
+        let ctx = egui::Context::default();
+
+        // `u64::MAX` is the "never published / retracted" sentinel, and the swap
+        // must return the PREVIOUS value — not the one just written, and not 0.
+        assert_eq!(
+            swap_last_band_pass(&ctx, 7),
+            u64::MAX,
+            "a fresh context must report the never-published sentinel"
+        );
+        assert_eq!(
+            swap_last_band_pass(&ctx, 9),
+            7,
+            "swap must return the previous pass, which is what makes \
+             first-caption-button-of-this-pass-wins a single read-modify-write"
+        );
+
+        assert_eq!(
+            titlebar_band(&ctx),
+            None,
+            "unset titlebar band reads as None"
+        );
+        let band = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 32.0));
+        set_titlebar_band(&ctx, Some(band));
+        assert_eq!(
+            titlebar_band(&ctx),
+            Some(band),
+            "a stored band must read back"
+        );
+        set_titlebar_band(&ctx, None);
+        assert_eq!(titlebar_band(&ctx), None, "retraction must clear the slot");
+
+        assert_eq!(caption_btn_union(&ctx), None, "unset union reads as None");
+        let union = egui::Rect::from_min_size(egui::pos2(700.0, 0.0), egui::vec2(100.0, 32.0));
+        set_caption_btn_union(&ctx, Some(union));
+        assert_eq!(
+            caption_btn_union(&ctx),
+            Some(union),
+            "a stored caption-button union must read back"
+        );
+    }
+}

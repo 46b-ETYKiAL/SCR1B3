@@ -2656,4 +2656,21 @@ mod tests {
         // "123:foo" can never be coerced into a handler.
         assert!(!is_safe_link_scheme("1http://x"));
     }
+
+    #[test]
+    fn align_at_returns_the_declared_alignment_and_defaults_past_the_last_column() {
+        // A ragged table's delimiter row can be SHORTER than a body row; the
+        // fallback is what keeps the extra columns rendering at all. Pin both
+        // halves — a stub returning `Default::default()` satisfies the fallback
+        // and silently discards every declared alignment in the table.
+        let aligns = [MdAlign::Right, MdAlign::Center];
+        assert_eq!(align_at(&aligns, 0), MdAlign::Right);
+        assert_eq!(align_at(&aligns, 1), MdAlign::Center);
+        assert_eq!(
+            align_at(&aligns, 2),
+            MdAlign::None,
+            "past the end falls back"
+        );
+        assert_eq!(align_at(&[], 0), MdAlign::None, "no delimiter row at all");
+    }
 }

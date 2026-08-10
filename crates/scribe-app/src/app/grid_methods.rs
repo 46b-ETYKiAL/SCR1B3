@@ -948,6 +948,30 @@ impl ScribeApp {
     }
 }
 
+/// True when two galley Y positions are the same visual row.
+///
+/// `paint_secondary_carets` only draws a selection BAND for a single-row
+/// selection; a multi-row secondary selection is left to the caret alone.
+/// Lifted out of that paint body so the half-pixel band — a real product
+/// decision about when a selection reads as one line — is assertable without a
+/// laid-out galley.
+#[must_use]
+fn same_galley_row(a_y: f32, b_y: f32) -> bool {
+    (a_y - b_y).abs() < 0.5
+}
+
+/// The render-whitespace glyph for `c`, or `None` when `c` is not whitespace
+/// the editor marks. Lifted out of `paint_whitespace_markers` so the mapping —
+/// a documented, user-visible product decision — is assertable without a galley.
+#[must_use]
+fn ws_marker(c: char) -> Option<&'static str> {
+    match c {
+        ' ' => Some("·"),
+        '\t' => Some("→"),
+        _ => None,
+    }
+}
+
 /// Paint each secondary caret (and its single-row selection band) so
 /// multi-cursor renders distinctly from egui's own primary caret. Lifted from
 /// the single-pane path so both surfaces draw an identical caret set.
@@ -966,7 +990,7 @@ fn paint_secondary_carets(
                 .galley
                 .pos_from_cursor(egui::text::CCursor::new(r.start));
             let re = out.galley.pos_from_cursor(egui::text::CCursor::new(r.end));
-            if (rs.min.y - re.min.y).abs() < 0.5 {
+            if same_galley_row(rs.min.y, re.min.y) {
                 let sel = egui::Rect::from_min_max(
                     gp + egui::vec2(rs.min.x, rs.min.y),
                     gp + egui::vec2(re.max.x, re.max.y),
@@ -1000,10 +1024,8 @@ fn paint_whitespace_markers(
         let row_off = origin + row.pos.to_vec2();
         let cy = row_off.y + row.size.y * 0.5;
         for g in &row.glyphs {
-            let marker = match g.chr {
-                ' ' => "·",
-                '\t' => "→",
-                _ => continue,
+            let Some(marker) = ws_marker(g.chr) else {
+                continue;
             };
             let cx = row_off.x + g.pos.x + g.advance_width * 0.5;
             painter.text(
@@ -1014,5 +1036,57 @@ fn paint_whitespace_markers(
                 ws_color,
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod grid_methods_tests {
+    use super::{same_galley_row, ws_marker};
+    use crate::app::ScribeApp;
+    use scribe_core::Config;
+
+    #[test]
+    fn apply_pending_caret_ops_ignores_an_out_of_range_active_index() {
+        // Same inverted-short-circuit hazard as `overview_error_lines`: with
+        // `&&`, `active >= len` no longer returns early and the very next term
+        // indexes `self.tabs[active]`.
+        let mut app = ScribeApp::new_test(Config::default());
+        let ctx = egui::Context::default();
+        let id = egui::Id::new("apply_pending_caret_ops_guard");
+        app.pending_jump_bracket = true;
+        let out_of_range = app.tabs.len();
+        app.apply_pending_caret_ops(&ctx, id, out_of_range);
+        assert!(
+            app.pending_jump_bracket,
+            "an out-of-range pane must be a no-op — the latch stays for the real pane"
+        );
+    }
+
+    #[test]
+    fn whitespace_markers_use_the_documented_middot_and_arrow_glyphs() {
+        assert_eq!(ws_marker(' '), Some("·"), "a space renders as a middle dot");
+        assert_eq!(ws_marker('\t'), Some("→"), "a tab renders as an arrow");
+        for c in ['a', '\u{00a0}', '\n', '·'] {
+            assert_eq!(ws_marker(c), None, "{c:?} must not be marked");
+        }
+    }
+
+    #[test]
+    fn same_galley_row_is_a_half_pixel_band_around_equality() {
+        assert!(same_galley_row(12.0, 12.0), "identical rows");
+        assert!(
+            same_galley_row(12.0, 12.4),
+            "sub-half-pixel jitter is one row"
+        );
+        assert!(same_galley_row(12.4, 12.0), "and it is symmetric");
+        assert!(
+            !same_galley_row(12.0, 12.5),
+            "exactly half a pixel is NOT one row"
+        );
+        assert!(!same_galley_row(12.0, 30.0), "a whole row apart");
+        assert!(
+            !same_galley_row(30.0, 12.0),
+            "symmetric on the far side too"
+        );
     }
 }

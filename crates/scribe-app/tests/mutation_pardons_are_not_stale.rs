@@ -252,6 +252,22 @@ struct ParsedConfig {
 /// after one, so a second entry sharing a line would have been permanently
 /// invisible to every check in this file.
 fn parse_exclude_re(toml: &str) -> ParsedConfig {
+    parse_array(toml, "exclude_re")
+}
+
+/// Every string literal in the `exclude_globs` array, comments stripped.
+///
+/// Same parser, different key. `exclude_globs` had NO guard of any kind until
+/// this was added: a glob that selects zero files suppresses nothing while
+/// still reading as coverage — the `exclude_re` rotation failure with a
+/// different spelling.
+fn parse_exclude_globs(toml: &str) -> ParsedConfig {
+    parse_array(toml, "exclude_globs")
+}
+
+/// The shared array reader. `key` is the bare TOML key whose `[ … ]` array of
+/// string literals is wanted.
+fn parse_array(toml: &str, key: &str) -> ParsedConfig {
     let mut patterns = Vec::new();
     let mut entry_lines = 0usize;
     let mut unparsed = Vec::new();
@@ -260,7 +276,7 @@ fn parse_exclude_re(toml: &str) -> ParsedConfig {
     for raw in toml.lines() {
         let line = raw.trim_start();
         if !inside {
-            if line.starts_with("exclude_re") && raw.contains('[') {
+            if line.starts_with(key) && raw.contains('[') {
                 inside = true;
             }
             continue;
@@ -637,6 +653,184 @@ fn the_config_parser_reads_every_exclude_re_entry() {
         cfg.patterns.len(),
         cfg.entry_lines
     );
+}
+
+// ---------------------------------------------------------------------------
+// exclude_globs: a glob that selects nothing is stale by definition
+// ---------------------------------------------------------------------------
+
+/// Does `pattern` select at least one file that exists in the tree?
+///
+/// A literal path (every current entry) is answered by `exists()`. A wildcard
+/// pattern is answered by walking the tree, because "I cannot evaluate this"
+/// must never resolve to "it is fine".
+fn glob_selects_any(root: &Path, pattern: &str) -> bool {
+    let pat = pattern.replace('\\', "/");
+    if !pat.contains('*') && !pat.contains('?') {
+        return root.join(&pat).exists();
+    }
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            let name = p
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if p.is_dir() {
+                // `target/` is build output and `.git/` is history — neither is
+                // source cargo-mutants would ever mutate, and walking them turns
+                // this guard into a minute-long scan.
+                if name != "target" && name != ".git" {
+                    stack.push(p);
+                }
+                continue;
+            }
+            let rel = p
+                .strip_prefix(root)
+                .unwrap_or(&p)
+                .to_string_lossy()
+                .replace('\\', "/");
+            if glob_match(&pat, &rel) || (!pat.contains('/') && glob_match(&pat, &name)) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// `*` matches within one path segment, `**` crosses segments, `?` is one
+/// non-separator character. Deliberately small: the alternative is a guard that
+/// cannot answer, and a guard that cannot answer is one that always passes.
+fn glob_match(pattern: &str, text: &str) -> bool {
+    fn go(p: &[char], t: &[char]) -> bool {
+        if p.is_empty() {
+            return t.is_empty();
+        }
+        match p[0] {
+            '*' if p.len() > 1 && p[1] == '*' => {
+                let rest = &p[2..];
+                // `**/` must also match ZERO directories, so `a/**/b.rs` still
+                // selects `a/b.rs`.
+                if rest.first() == Some(&'/') && go(&rest[1..], t) {
+                    return true;
+                }
+                (0..=t.len()).any(|i| go(rest, &t[i..]))
+            }
+            '*' => {
+                for i in 0..=t.len() {
+                    if go(&p[1..], &t[i..]) {
+                        return true;
+                    }
+                    if t.get(i) == Some(&'/') {
+                        break;
+                    }
+                }
+                false
+            }
+            '?' => !t.is_empty() && t[0] != '/' && go(&p[1..], &t[1..]),
+            c => !t.is_empty() && t[0] == c && go(&p[1..], &t[1..]),
+        }
+    }
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    go(&p, &t)
+}
+
+/// The globs that currently select nothing, named individually.
+fn dead_globs(root: &Path, patterns: &[String]) -> Vec<String> {
+    patterns
+        .iter()
+        .filter(|g| !glob_selects_any(root, g))
+        .cloned()
+        .collect()
+}
+
+/// A whole-FILE exclusion that matches no file is a pardon with nothing behind
+/// it.
+///
+/// `exclude_re` has carried a staleness guard since the rotation incidents;
+/// `exclude_globs` had none. The failure mode is the same and quieter: rename or
+/// move `app/grid_render.rs` and its glob keeps sitting in the config, reading
+/// as "this file is deliberately not mutated" while the file it names is gone
+/// and the file it MOVED to is now silently mutation-gated (or, worse, the
+/// reader assumes it is still excluded). Zero selection is stale by definition —
+/// fail here, naming the dead pattern, rather than leaving it to be discovered
+/// by a survivor nobody expected.
+#[test]
+fn every_exclude_glob_still_selects_a_file_that_exists() {
+    let cfg = parse_exclude_globs(&read_config());
+
+    assert!(
+        cfg.unparsed.is_empty(),
+        "the exclude_globs parser found no string literal on these entry lines, \
+         so those exclusions are invisible to this check:\n  {}",
+        cfg.unparsed.join("\n  ")
+    );
+    // The array has 10 entries today. A floor of 8 refuses to run vacuously: a
+    // parser that lost the block would otherwise report "no dead globs" simply
+    // by seeing nothing — the exact silence this file exists to forbid.
+    assert!(
+        cfg.patterns.len() >= 8,
+        "only {} exclude_globs entries parsed — the array shrank or the parser \
+         lost the block; either way this check has stopped checking anything",
+        cfg.patterns.len()
+    );
+
+    let dead = dead_globs(&repo_root(), &cfg.patterns);
+    assert!(
+        dead.is_empty(),
+        "these exclude_globs entries select ZERO files, so they exclude nothing \
+         while still reading as a deliberate exclusion. Delete each one, or \
+         repoint it at the path the file actually moved to:\n  {}",
+        dead.join("\n  ")
+    );
+}
+
+/// Proof the check above is not vacuous: a glob aimed at a path that does not
+/// exist MUST be reported, and its own name MUST appear in the failure.
+#[test]
+fn fail_proof_a_glob_pointing_at_a_missing_file_is_caught() {
+    let root = repo_root();
+    let live = "crates/scribe-app/src/app/grid_render.rs".to_string();
+    let dead = "crates/scribe-app/src/app/this_file_does_not_exist.rs".to_string();
+
+    assert!(
+        glob_selects_any(&root, &live),
+        "the control pattern must select a REAL file, otherwise this proof \
+         cannot tell a working checker from a broken one"
+    );
+    assert_eq!(
+        dead_globs(&root, &[live.clone(), dead.clone()]),
+        vec![dead],
+        "only the missing path may be reported dead"
+    );
+}
+
+/// Proof the wildcard branch is real. A `**` pattern that matches must pass and
+/// a `**` pattern that cannot match must be reported — otherwise a future
+/// wildcard entry would sail through the literal-path fast path untested.
+#[test]
+fn fail_proof_a_wildcard_glob_is_evaluated_not_waved_through() {
+    let root = repo_root();
+    assert!(
+        glob_selects_any(&root, "crates/**/grid_render.rs"),
+        "`**` must cross directory segments"
+    );
+    assert!(
+        !glob_selects_any(&root, "crates/**/no_such_source_file_xyzzy.rs"),
+        "a wildcard that matches nothing must be reported dead, not assumed live"
+    );
+    // The segment rules the matcher claims to implement.
+    assert!(glob_match("a/*.rs", "a/b.rs"));
+    assert!(!glob_match("a/*.rs", "a/b/c.rs"), "`*` must not cross `/`");
+    assert!(glob_match("a/**/c.rs", "a/b/c.rs"));
+    assert!(glob_match("a/**/c.rs", "a/c.rs"), "`**/` matches zero dirs");
+    assert!(glob_match("a/?.rs", "a/b.rs"));
+    assert!(!glob_match("a/?.rs", "a/bc.rs"));
 }
 
 /// No pardon may pin a coordinate without being registered — either axis, any

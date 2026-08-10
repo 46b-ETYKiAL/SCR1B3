@@ -481,4 +481,32 @@ mod tests {
             "a focused, non-minimized window must decide MINIMIZE"
         );
     }
+
+    /// The `tray::imp` pardons in `.cargo/mutants.toml` rest entirely on `mod imp`
+    /// being `#[cfg(windows)]`. The mutation runner is ubuntu-latest, so nothing
+    /// inside that module is compiled there and no Linux test can ever kill its
+    /// mutants — which is what makes the pardon honest. If the gate is ever
+    /// removed the module starts compiling on the runner, its mutants become real
+    /// signal, and the pardon would begin hiding compiled, untested code. Fail
+    /// here rather than there.
+    #[test]
+    fn tray_imp_is_cfg_gated_so_the_mutation_pardon_stays_honest() {
+        let src = include_str!("tray.rs");
+        // ASSEMBLED, never written as a literal. This test reads its OWN file, so
+        // a literal needle would sit in the source and `matches` would count the
+        // needle itself — passing no matter what the real declaration said. Same
+        // discipline as `windows_module_is_cfg_gated_so_the_mutation_exclusion_stays_honest`
+        // in integration/mod.rs.
+        let needle = ["#[cfg(", "windows", ")]\n", "mod imp {"].concat();
+        assert_eq!(
+            src.matches(needle.as_str()).count(),
+            1,
+            "`mod imp` is no longer exactly `#[cfg(windows)]`-gated (or this test \
+             now self-matches). If that module compiles off Windows its mutants \
+             are real signal: DROP the `tray\\.rs.*\\bimp::icon\\b` / \
+             `tray\\.rs.*\\bimp::init\\b` entries and the `replace tray::init with \
+             \\(\\)` entry from .cargo/mutants.toml and delete this test, rather \
+             than leaving a pardon that silently hides code it claims cannot compile."
+        );
+    }
 }
