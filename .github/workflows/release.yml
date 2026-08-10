@@ -1011,7 +1011,19 @@ jobs:
             # pre-existing behaviour, deliberately unchanged for non-tags).
             # It lives in a script so the gate can be executed — and therefore
             # shown to fail — by a test; an unfalsifiable gate is the defect.
-            sh packaging/require-signing-key.sh
+            #
+            # `src/` prefix, NOT a bare `packaging/…`: this job checks the repo
+            # out with `path: src` and declares no `working-directory:`/
+            # `defaults:`, so $PWD is $GITHUB_WORKSPACE and the tree is one level
+            # down — the same reason the self-verify below reads
+            # `src/crates/scribe-core/…`. Bare, `sh` exits 127 on a missing file
+            # under `set -e`, so a PRERELEASE tag with no key HARD-FAILED
+            # (the opposite of the documented warn-and-continue) and a stable tag
+            # failed before its ::error:: could print — the right outcome for the
+            # wrong reason. Pinned by
+            # `the_release_signing_step_calls_the_key_guard_before_returning_early`,
+            # which now asserts this prefix against the job's checkout `path:`.
+            sh src/packaging/require-signing-key.sh
             exit 0
           fi
           cargo install rsign2 --locked --version "^0.6"

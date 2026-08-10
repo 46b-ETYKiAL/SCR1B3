@@ -687,29 +687,76 @@ mod packaging_consistency_tests {
 
     /// The guard is only worth anything if the workflow actually calls it. This
     /// pins the wiring: inside the empty-secret branch, `require-signing-key.sh`
-    /// must run BEFORE the `exit 0` that skips signing + self-verify.
+    /// must run BEFORE the `exit 0` that skips signing + self-verify — and it
+    /// must be invoked at a path that RESOLVES.
+    ///
+    /// The path half is not pedantry, it is the defect this test failed to
+    /// catch. The step read `sh packaging/require-signing-key.sh` while the
+    /// `release` job checks out with `path: src` and sets no
+    /// `working-directory:`/`defaults:`, so $PWD was $GITHUB_WORKSPACE and the
+    /// file was one level down at `src/packaging/…`. `sh` on a missing file
+    /// exits 127 under `set -e`, so a PRERELEASE tag with no key HARD-FAILED
+    /// instead of warning and continuing as documented, and a stable tag failed
+    /// before printing the ::error:: that explains why — the right outcome for
+    /// the wrong reason, which is indistinguishable from the gate working.
+    ///
+    /// A `contains("packaging/require-signing-key.sh")` cannot see any of that:
+    /// it matches `src/packaging/…` and a bare `packaging/…` identically. So the
+    /// checkout `path:` is read out of the job and asserted as the PREFIX of the
+    /// invoked path, which is the property that actually has to hold.
     #[test]
     fn the_release_signing_step_calls_the_key_guard_before_returning_early() {
         const RELEASE: &str = include_str!("../../../../.github/workflows/release.yml");
+        const SCRIPT: &str = "packaging/require-signing-key.sh";
+
+        // The `release` job is the last in the file, so its body runs to EOF.
+        let job_start = RELEASE
+            .find("\n  release:")
+            .expect("release.yml must declare a `release` job");
+        let job = &RELEASE[job_start..];
+
+        // The checkout `path:` the job's own tree lives under. `None` = a root
+        // checkout, in which case the bare script path is the correct one.
+        let checkout_path = job.split("\n          path: ").nth(1).map(|tail| {
+            tail.lines()
+                .next()
+                .expect("a `path:` value must be on its line")
+                .trim()
+                .to_string()
+        });
+        let expected = match checkout_path.as_deref() {
+            // `dist` is download-artifact's destination, not a source checkout;
+            // if the first `path:` in the job is that, the source tree is at the
+            // root and the bare path is right.
+            Some(p) if p != "dist" => format!("{p}/{SCRIPT}"),
+            _ => SCRIPT.to_string(),
+        };
+
         let marker = "if [ -z \"${MINISIGN_SECRET_KEY:-}\" ]; then";
-        let start = RELEASE
+        let start = job
             .find(marker)
             .expect("release.yml must still branch on an empty MINISIGN_SECRET_KEY");
-        let branch = &RELEASE[start..];
+        let branch = &job[start..];
         let end = branch
             .find("\n          fi")
             .expect("the empty-secret branch must be closed");
         let branch = &branch[..end];
 
-        let guard = branch
-            .find("packaging/require-signing-key.sh")
-            .unwrap_or_else(|| {
-                panic!(
-                    "the empty-secret branch of release.yml no longer calls \
-                     packaging/require-signing-key.sh, so an unsigned STABLE tag \
-                     publishes green again:\n{branch}"
-                )
-            });
+        let guard = branch.find(SCRIPT).unwrap_or_else(|| {
+            panic!(
+                "the empty-secret branch of release.yml no longer calls \
+                 {SCRIPT}, so an unsigned STABLE tag publishes green \
+                 again:\n{branch}"
+            )
+        });
+        assert!(
+            branch.contains(&format!("sh {expected}")),
+            "the branch invokes {SCRIPT} but not at `{expected}`, which is where \
+             the job's own checkout puts it ({checkout_path:?}). `sh` on a path \
+             that does not resolve exits 127 under `set -e`, so the gate fails \
+             for the WRONG reason: a prerelease tag hard-fails instead of \
+             warning, and a stable tag never prints its ::error::.\n{branch}"
+        );
         let early_exit = branch
             .find("exit 0")
             .expect("the branch must still skip signing when the key is absent");
@@ -717,6 +764,85 @@ mod packaging_consistency_tests {
             guard < early_exit,
             "the guard must run BEFORE the `exit 0`; after it, it is \
              unreachable and the gate is decorative:\n{branch}"
+        );
+    }
+
+    /// A hyphen is not a prerelease. The classifier was
+    /// `case "${REF_NAME}" in *-*)`, and release.yml triggers on `v*`, so every
+    /// stable tag that merely CONTAINED a hyphen took the unsigned-is-fine path
+    /// and published green artifacts every deployed client rejects.
+    ///
+    /// These are the tags that were mis-sorted. They are real shapes, not
+    /// contrivances: a `-final`/`-hotfix` suffix on a two-field version and a
+    /// date-style tag.
+    #[test]
+    fn a_hyphenated_non_semver_tag_is_stable_and_must_fail_unsigned() {
+        for tag in ["v1.0-final", "v0.5-hotfix", "v2026-08-10", "v1.2.3.4-x"] {
+            let (code, log) = run_signing_guard("tag", tag);
+            assert_eq!(
+                code,
+                Some(1),
+                "{tag} carries no SemVer prerelease segment, so it is a STABLE \
+                 tag and must FAIL unsigned. Classifying it as a prerelease \
+                 ships a release the fail-closed updater rejects. Guard \
+                 output:\n{log}"
+            );
+        }
+    }
+
+    /// The other side of the same predicate: a well-formed SemVer prerelease —
+    /// including one carrying build metadata — must still be tolerated, or the
+    /// fix above would have been "reject everything", which passes the test
+    /// above while making every rc tag unshippable.
+    #[test]
+    fn a_wellformed_semver_prerelease_is_still_tolerated() {
+        for tag in ["v0.4.63-rc.1", "0.4.63-rc.1", "v1.2.3-alpha.2+build.5"] {
+            let (code, log) = run_signing_guard("tag", tag);
+            assert_eq!(
+                code,
+                Some(0),
+                "{tag} IS a SemVer prerelease and must still be allowed to ship \
+                 unsigned with a warning. Guard output:\n{log}"
+            );
+        }
+    }
+
+    /// Both msi jobs must resolve the installer version by the SAME mechanism.
+    ///
+    /// ci.yml's `msi-build` exists so that CI green predicts release green. It
+    /// used `cargo pkgid --offline -p scribe-app` while release.yml's
+    /// `windows-msi` read Cargo.toml directly — the same answer today, but two
+    /// different mechanisms, so CI could not fail for a reason the tag-time job
+    /// can. A mirrored gate whose mirror differs in the one step that computes
+    /// what gets stamped into the package is not a mirror.
+    #[test]
+    fn both_msi_jobs_resolve_the_version_the_same_way() {
+        const CI: &str = include_str!("../../../../.github/workflows/ci.yml");
+        const RELEASE: &str = include_str!("../../../../.github/workflows/release.yml");
+
+        // To end of LINE, not to the first `)"` — the shared `sed -E
+        // 's/.*"([^"]+)".*/\1/'` contains a `)"` of its own, so stopping there
+        // would compare only a prefix and could call two different tails equal.
+        let extract = |job: &str, label: &str| -> String {
+            job.split("VER=\"$(")
+                .nth(1)
+                .unwrap_or_else(|| panic!("the `{label}` job must resolve a VER"))
+                .lines()
+                .next()
+                .expect("the VER assignment must be on one line")
+                .trim()
+                .to_string()
+        };
+        let ci_ver = extract(job_body(CI, "msi-build", "gate"), "msi-build");
+        let rel_ver = extract(
+            job_body(RELEASE, "windows-msi", "linux-installers"),
+            "windows-msi",
+        );
+        assert_eq!(
+            ci_ver, rel_ver,
+            "the two msi jobs compute the installer version differently, so the \
+             CI job cannot fail for a version-resolution reason the tag-time job \
+             can — the exact blind spot the mirrored job exists to remove"
         );
     }
 

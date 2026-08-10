@@ -343,11 +343,11 @@ jobs:
     # turns "too big to finish" into an actionable message BEFORE burning the
     # budget, rather than a silent cancellation five hours later.
     #
-    # The shard count is the throughput dial. It was raised 8 -> 24 because
-    # real PRs in this repo exceed the 640-mutant cap the 8-shard matrix could
-    # test — a capped-out PR is refused, i.e. NOT mutation tested, which is a
-    # coverage hole even though it is a loud one. The fix is more shards, never
-    # a bigger per-shard cap: see the derivation on the pre-flight step.
+    # The shard count is the throughput dial. It was raised 8 -> 24 -> 40
+    # because real PRs in this repo exceed the cap a smaller matrix could test —
+    # a capped-out PR is refused, i.e. NOT mutation tested, which is a coverage
+    # hole even though it is a loud one. The fix is more shards, never a bigger
+    # per-shard cap: see the derivation on the pre-flight step.
     name: mutation testing (in-diff)
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
@@ -359,6 +359,8 @@ jobs:
           [
             0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11,
             12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
+            24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35,
+            36, 37, 38, 39,
           ]
     steps:
       - name: Harden the runner (egress audit)
@@ -399,15 +401,31 @@ jobs:
         # whole block exists to prevent.
         #
         # `SHARDS` is the THROUGHPUT property, and is the only half raised:
-        # 8 -> 24 widens the total cap 640 -> 1920 while every shard still does
-        # at most 80 mutants, so the per-shard arithmetic — and therefore the
-        # 100-minute timeout — is unchanged. 24 shards also exceeds the free
-        # concurrency ceiling, so some shards queue rather than start at once;
-        # that costs latency, not correctness, because each shard carries its
-        # own independent timeout.
+        # 8 -> 24 -> 40 widens the total cap 640 -> 1920 -> 3200 while every
+        # shard still does at most 80 mutants, so the per-shard arithmetic — and
+        # therefore the 100-minute timeout — is unchanged. The matrix already
+        # exceeds the free concurrency ceiling, so some shards queue rather than
+        # start at once; that costs latency, not correctness, because each shard
+        # carries its own independent timeout.
+        #
+        # 24 -> 40 is the fix for a gate that could no longer COMPLETE. A PR
+        # yielding 1857 in-diff mutants (96.7% of the 1920 cap) passed the
+        # pre-flight and then put ~77 mutants on every shard — right at the 80
+        # ceiling — and 12 of the 24 shards were killed by the 100-minute
+        # `timeout-minutes` with cargo-mutants still running. Not collateral of
+        # the failures: `fail-fast: false` is set above. The same 1857 mutants
+        # over 40 shards is ~47 each, which fits the existing budget with room.
+        # This SCALES the gate; the mutant set, the per-shard cap and the
+        # timeout are all untouched, so total coverage is identical.
+        #
+        # Residual, deliberately NOT patched here: the 80/shard ceiling is what
+        # the timed-out run empirically overran, so a future PR at the new 3200
+        # cap would again land ~80 on a shard and hit the same wall. The honest
+        # per-shard number is nearer 50 than 80; lowering it belongs with a
+        # matching shard raise so total capacity does not regress.
         env:
           MAX_PER_SHARD: 80
-          SHARDS: 24
+          SHARDS: 40
         run: |
           set -euo pipefail
           n=$(cargo mutants --list --in-diff pr.diff \
@@ -451,7 +469,7 @@ jobs:
         # split keeps every compiled line of `lib.rs` under mutation.
         run: >
           cargo mutants --in-diff pr.diff --test-tool nextest --timeout 300 --in-place
-          --shard ${{ matrix.shard }}/24
+          --shard ${{ matrix.shard }}/40
           --exclude '**/src/integration/windows.rs'
           --exclude '**/scribe-win32-chrome/src/imp.rs'
 
@@ -834,11 +852,19 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # `cargo pkgid` rather than `cargo metadata | jq`: jq's presence on the
-          # runner image is an incidental detail, and pkgid needs no parser.
-          # It prints `...#0.4.62` (or `...#scribe-app@0.4.62`); the version is
-          # whatever follows the last `#` or `@` in either form.
-          VER="$(cargo pkgid --offline -p scribe-app | sed -E 's/.*[#@]//')"
+          # Read the version EXACTLY as release.yml's `windows-msi` job does.
+          # This job used `cargo pkgid --offline -p scribe-app`, which agrees
+          # today but is a DIFFERENT mechanism from the one that runs at tag
+          # time — and the whole value of this job is that CI green predicts
+          # release green. Two mechanisms means CI cannot fail for a reason the
+          # tag-time job can (a workspace-inheritance change, a pkgid output
+          # format change, an offline-registry state difference), which is
+          # precisely the gap a mirrored gate must not have. Both jobs check out
+          # at the repo ROOT, so the path is the same in both. The workspace root
+          # carries the real number; scribe-app inherits it via
+          # `version.workspace = true`. Pinned by
+          # `both_msi_jobs_resolve_the_version_the_same_way`.
+          VER="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
           # WiX requires x.x.x.x with each field <= 65534, so a non-numeric or
           # empty version must stop here rather than reach candle as garbage.
           echo "$VER" | grep -qE '^[0-9]+(\.[0-9]+){1,3}$' \

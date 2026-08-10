@@ -1,8 +1,26 @@
 # winget installer manifest (schema 1.6). Submit to microsoft/winget-pkgs.
 # Self-update is disabled in winget builds (winget owns updates); the portable
 # .zip build has the in-app updater enabled.
+#
+# NOT SUBMITTABLE YET, and deliberately not dressed up as if it were. No
+# published release contains an .msi: release.yml's `windows-msi` job is newer
+# than v0.4.62, so the newest release ships `scr1b3-v0.4.62-x86_64-setup.exe`
+# (the FORGE-WIRE native installer) and no MSI at all. Verified with
+# `gh release view v0.4.62 --repo 46b-ETYKiAL/SCR1B3 --json assets`.
+#
+# What WAS fixed: the InstallerUrl named `scr1b3-x86_64-pc-windows-msvc.msi`,
+# the TARBALL's target triple, which the MSI job never produces under any
+# version. The job's own naming step is
+# `mv scr1b3-installer.msi "dist/scr1b3-${TAG}-x86_64.msi"`, so the filename
+# below is now the one a release will actually publish.
+#
+# To submit: replace VERSION in both fields below with the first tag whose
+# release carries `scr1b3-v<tag>-x86_64.msi`, and replace InstallerSha256 with
+# that asset's published `.sha256`. The zeroed hash is a placeholder — winget
+# validation rejects it, which is the intended fail-closed behaviour while no
+# such asset exists.
 PackageIdentifier: ItashaCorp.SCR1B3
-PackageVersion: 0.1.0
+PackageVersion: VERSION
 InstallerType: wix
 Scope: user
 InstallModes:
@@ -10,7 +28,7 @@ InstallModes:
   - silent
 Installers:
   - Architecture: x64
-    InstallerUrl: https://github.com/46b-ETYKiAL/SCR1B3/releases/download/v0.1.0/scr1b3-x86_64-pc-windows-msvc.msi
+    InstallerUrl: https://github.com/46b-ETYKiAL/SCR1B3/releases/download/vVERSION/scr1b3-vVERSION-x86_64.msi
     InstallerSha256: 0000000000000000000000000000000000000000000000000000000000000000
 ManifestType: installer
 ManifestVersion: 1.6.0
