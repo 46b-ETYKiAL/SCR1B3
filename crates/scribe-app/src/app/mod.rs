@@ -289,6 +289,21 @@ struct EditorTab {
     /// to invalidate after any external mutation of `text` (reload, plugin,
     /// find-replace, sort-lines) so the next frame rebuilds it.
     rope_buf: Option<scribe_core::buffer::Buffer>,
+    /// The ONE text-derived cache that does NOT live on this struct: the egui
+    /// `TextEdit` path's undo history. It is an `Undoer<(CCursorRange, String)>`
+    /// inside egui's own memory, keyed
+    /// `Id::new("scr1b3-central-editor").with(doc_id)` (single pane) /
+    /// `pane_editor_id(doc_id)` (grid pane). `set_text` has no `&egui::Context`,
+    /// so `note_text_mutated` cannot reach it — and neither can the exhaustive
+    /// destructure in `set_text_invalidates_every_text_derived_cache`, which is
+    /// why that guard never caught this and why this flag exists as its proxy.
+    ///
+    /// Set by `set_text` (the EXTERNAL-replacement seam) and consumed by each
+    /// render path immediately before its `TextEdit` renders, which clears the
+    /// undoer. NOT set by `set_text_keep_undo`, by the `TextEdit`'s own
+    /// `.changed()` writer, by `accept_completion`, or by the multi-cursor
+    /// replay — those are edits the undoer is SUPPOSED to be able to revert.
+    textedit_undo_stale: bool,
     /// Per-tab line bookmarks (0-based line indices). Toggled with Ctrl+F2 on
     /// the cursor line; F2 / Shift+F2 jump to the next / previous bookmark.
     /// A dot marker is drawn in the line-number gutter for each bookmarked
@@ -372,6 +387,7 @@ impl EditorTab {
             disk_text: String::new(),
             rope_state: None,
             rope_buf: None,
+            textedit_undo_stale: false,
             bookmarks: std::collections::BTreeSet::new(),
             edit_gen: 0,
             external_change: false,
@@ -395,6 +411,7 @@ impl EditorTab {
             disk_text: text.clone(),
             rope_state: None,
             rope_buf: None,
+            textedit_undo_stale: false,
             bookmarks: std::collections::BTreeSet::new(),
             edit_gen: 0,
             external_change: false,
@@ -430,6 +447,7 @@ impl EditorTab {
                     disk_text,
                     rope_state: None,
                     rope_buf: None,
+                    textedit_undo_stale: false,
                     bookmarks: std::collections::BTreeSet::new(),
                     edit_gen: 0,
                     external_change: false,
@@ -471,14 +489,56 @@ impl EditorTab {
     /// `edit_gen` is bumped, which is what invalidates the gen-keyed
     /// minimap / spellcheck / change-bar (`change_gen`) caches.
     ///
-    /// EVERY external mutation of `text` MUST go through here. Writing
+    /// EVERY external mutation of `text` MUST go through this seam or its
+    /// undo-preserving twin [`EditorTab::set_text_keep_undo`]. Writing
     /// `tabs[i].text` directly leaves a stale `rope_buf` alive, and on the
     /// rope path (`use_rope_editor`) the next content edit writes that stale
     /// rope back over `text` — silently destroying the user's edit.
     ///
     /// The rope editor itself writes `text` directly (it owns the rope) and
     /// must NOT go through here, or it would discard its own live buffer.
+    ///
+    /// This is the SAFE DEFAULT of the two replacement seams: it additionally
+    /// flags the egui `TextEdit` path's undo history stale (see
+    /// `textedit_undo_stale`), so a Ctrl+Z after the replacement cannot
+    /// `replace_with` the PREVIOUS document over the new content. Use it for
+    /// every replacement whose content did not come from the current buffer —
+    /// a disk reload, a session restore, a plugin transform — and for anything
+    /// you have not classified. A user-issued in-buffer editing command that
+    /// SHOULD stay revertible calls [`EditorTab::set_text_keep_undo`] instead.
+    ///
+    /// The polarity is deliberate. Forgetting to classify a new call site here
+    /// costs the user one undo step; forgetting it on the other seam costs the
+    /// user their document. The default must be the one that cannot lose data.
     fn set_text(&mut self, new: String) {
+        self.set_text_keep_undo(new);
+        // The egui TextEdit path's undo history is the one text-derived cache
+        // that is NOT a field of this struct (see `textedit_undo_stale`), so
+        // `note_text_mutated` cannot reach it. Its `Undoer` still holds
+        // snapshots of the PREVIOUS document; without this flag the first
+        // Ctrl+Z after an external replacement calls `text.replace_with(old)`
+        // and overwrites the new content wholesale — the exact silent data
+        // loss `invalidate_rope_state` already prevents on the rope path.
+        self.textedit_undo_stale = true;
+    }
+
+    /// [`EditorTab::set_text`] MINUS the egui-undo invalidation: the buffer is
+    /// replaced and every on-struct derived cache is invalidated exactly as
+    /// `set_text` does, but the `TextEdit` undo history is left intact so
+    /// Ctrl+Z still reverts the replacement.
+    ///
+    /// PRECONDITION for using this seam: the new text was produced by a
+    /// USER-ISSUED in-buffer editing command from the CURRENT buffer contents
+    /// (sort lines, toggle comment, replace-all, case transform, table format,
+    /// auto-pair, …). Under that precondition the snapshot the undoer holds is
+    /// a state the user genuinely had a moment ago, so restoring it destroys
+    /// nothing the user has not seen — it is what undo is FOR.
+    ///
+    /// It is NOT for content arriving from outside the buffer. A disk reload,
+    /// a session restore, or a plugin that can read anywhere must use
+    /// [`EditorTab::set_text`], or Ctrl+Z resurrects a document the user no
+    /// longer has over content they never saw.
+    fn set_text_keep_undo(&mut self, new: String) {
         self.text = new;
         self.note_text_mutated();
     }
@@ -2489,6 +2549,9 @@ mod build_plugins_tests;
 
 #[cfg(test)]
 mod deferred_actions_tests;
+
+#[cfg(test)]
+mod textedit_undo_invalidation_tests;
 
 #[cfg(test)]
 mod keyboard_input_tests;

@@ -2438,7 +2438,7 @@ impl ScribeApp {
                         }
                     }
                     if text != self.tabs[active].text {
-                        self.tabs[active].set_text(text);
+                        self.tabs[active].set_text_keep_undo(text);
                         self.tabs[active].doc.mark_dirty();
                     }
                 }
@@ -2900,6 +2900,21 @@ impl ScribeApp {
                 // highlight) and undo history bled across tabs — the reported bug.
                 let editor_id =
                     egui::Id::new("scr1b3-central-editor").with(self.tabs[active].doc_id);
+                // `set_text` replaced this buffer from an EXTERNAL source (a
+                // disk reload, a session restore, a plugin). egui keeps this
+                // widget's undo history in ITS OWN memory under `editor_id`,
+                // where `set_text` cannot reach — so drop it here, before the
+                // widget renders. The `feed_state` inside `TextEdit::show`
+                // then seeds a fresh first undo point from the NEW content,
+                // making the next Ctrl+Z a no-op instead of a wholesale
+                // overwrite with a document the user no longer has. Same
+                // honest outcome `invalidate_rope_state` gives the rope path.
+                if std::mem::take(&mut self.tabs[active].textedit_undo_stale) {
+                    if let Some(mut st) = egui::TextEdit::load_state(ctx, editor_id) {
+                        st.clear_undoer();
+                        st.store(ctx, editor_id);
+                    }
+                }
                 let editor_focused = ctx.memory(|m| m.has_focus(editor_id));
                 if !read_only && editor_focused && ctx.input(|i| i.key_pressed(egui::Key::Tab)) {
                     let shift = ctx.input(|i| i.modifiers.shift);
