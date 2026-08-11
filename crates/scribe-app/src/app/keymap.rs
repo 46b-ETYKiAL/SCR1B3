@@ -1363,4 +1363,35 @@ mod tests {
         // Unrelated bindings still resolve.
         assert!(km.chord(action::FIND).is_some());
     }
+
+    /// The three clipboard-command predicates mirror egui-winit line for line,
+    /// and each opens with a bare `keycode == Key::Cut/Copy/Paste` term for the
+    /// dedicated media keys. Nothing asserted that term, so it could be flipped
+    /// to `!=` — which both stops the media key being recognised AND makes
+    /// every OTHER key report as that command. Both directions are pinned.
+    #[test]
+    fn clipboard_predicates_match_their_own_key_and_nothing_else() {
+        let none = egui::Modifiers::NONE;
+
+        assert!(is_cut_command(none, egui::Key::Cut), "Cut key is a cut");
+        assert!(is_copy_command(none, egui::Key::Copy), "Copy key is a copy");
+        assert!(
+            is_paste_command(none, egui::Key::Paste),
+            "Paste key is a paste"
+        );
+
+        // An unrelated key with no modifiers is none of the three. This is the
+        // half that catches `==` -> `!=`: negated, the bare term is true for
+        // every key that is NOT the media key.
+        for key in [egui::Key::A, egui::Key::Space, egui::Key::Enter] {
+            assert!(!is_cut_command(none, key), "{key:?} is not a cut");
+            assert!(!is_copy_command(none, key), "{key:?} is not a copy");
+            assert!(!is_paste_command(none, key), "{key:?} is not a paste");
+        }
+
+        // The media keys are also distinct from each other.
+        assert!(!is_cut_command(none, egui::Key::Copy));
+        assert!(!is_copy_command(none, egui::Key::Paste));
+        assert!(!is_paste_command(none, egui::Key::Cut));
+    }
 }

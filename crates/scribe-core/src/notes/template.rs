@@ -248,4 +248,33 @@ mod tests {
             assert!(c.lookup(other).is_none(), "{other:?} must not resolve");
         }
     }
+
+    /// Every separator position in the fixed ISO-8601 layout is checked by one
+    /// `||` chain, so a single corrupted separator must be enough to reject the
+    /// stamp. Testing only a well-formed stamp (and only a wholesale-garbage
+    /// one) leaves the chain free to be rewritten as `&&`, which would demand
+    /// that ALL separators be wrong before rejecting — i.e. accept a stamp with
+    /// one bad separator and slice fields out of the wrong offsets.
+    #[test]
+    fn each_separator_position_alone_rejects_the_stamp() {
+        const GOOD: &str = "2026-08-10T12:34:56Z";
+        assert!(
+            TemplateContext::from_iso8601_utc(GOOD, "t").is_some(),
+            "the control stamp must parse, or this test proves nothing"
+        );
+
+        // index -> the separator that belongs there
+        for (idx, sep) in [(4usize, '-'), (7, '-'), (10, 'T'), (13, ':'), (16, ':')] {
+            let mut bad: Vec<char> = GOOD.chars().collect();
+            assert_eq!(bad[idx], sep, "layout drifted at index {idx}");
+            // Swap in a character that is neither the right separator nor a
+            // digit, so only the separator check can reject it.
+            bad[idx] = '/';
+            let bad: String = bad.into_iter().collect();
+            assert!(
+                TemplateContext::from_iso8601_utc(&bad, "t").is_none(),
+                "a wrong separator at index {idx} must reject: {bad}"
+            );
+        }
+    }
 }

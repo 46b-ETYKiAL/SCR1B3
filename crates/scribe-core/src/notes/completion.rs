@@ -429,4 +429,59 @@ mod tests {
             "a single bracket is not a link opener"
         );
     }
+
+    /// Inside `[[…]]`, EITHER a `#` (heading anchor) or a `|` (display alias)
+    /// ends note completion — the text after it is no longer a title.
+    ///
+    /// The pool here deliberately contains titles that themselves hold a `#`
+    /// and a `|`. Against an ordinary pool this test cannot see the anchor
+    /// check at all: `[[Road#` yields no candidates either way (no title
+    /// contains "road#"), so `None` comes back whether the check fired or not,
+    /// and the guard could be flipped to `&&` unnoticed. With a title that DOES
+    /// match, the two outcomes finally differ.
+    #[test]
+    fn either_anchor_or_alias_alone_ends_link_completion() {
+        let notes = pool(&["C# notes", "Draft | v2", "Roadmap"]);
+        let at = |text: &str| complete(text, text.len(), &tags(), &notes, 8);
+
+        assert!(
+            at("[[road").is_some(),
+            "the control case must complete, or this test proves nothing"
+        );
+        assert!(
+            at("[[c").is_some(),
+            "the anchor-bearing title is reachable before the `#` is typed"
+        );
+
+        assert!(
+            at("[[c#").is_none(),
+            "a heading anchor alone ends note completion, even though \
+             'C# notes' would otherwise match"
+        );
+        assert!(
+            at("[[draft |").is_none(),
+            "a display alias alone ends note completion, even though \
+             'Draft | v2' would otherwise match"
+        );
+        assert!(
+            at("[[Road#a|b").is_none(),
+            "both together still end note completion"
+        );
+    }
+
+    /// Prefix matches outrank substring matches. With an empty query the two
+    /// tiers are indistinguishable (every string starts with ""), so the
+    /// ranking can only be pinned by a NON-empty query where a substring match
+    /// would sort ahead of the prefix match alphabetically.
+    #[test]
+    fn a_prefix_match_outranks_a_substring_match() {
+        let notes = pool(&["Abstract road", "Roadmap"]);
+        let s =
+            complete("[[road", 6, &tags(), &notes, 8).expect("a partial link opens a completion");
+        assert_eq!(
+            s.candidates,
+            vec!["Roadmap".to_string(), "Abstract road".to_string()],
+            "the prefix match must come first even though it sorts later"
+        );
+    }
 }
