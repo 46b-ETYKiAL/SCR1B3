@@ -15,7 +15,7 @@
 use super::notes_ui::{
     backlink_rows, body_cap_end, collect_backlinks, filter_docs, filter_replacement, is_active_row,
     notes_list_height, outgoing_links, scan_vault, selected_tag_from_filter, show_no_match_hint,
-    suggestion_chip_label, tag_filter_for, NoteDoc,
+    suggestion_chip_label, tag_filter_for, tag_row_is_selected, NoteDoc,
 };
 use super::ScribeApp;
 use scribe_core::notes::{completion, query};
@@ -1046,4 +1046,49 @@ fn the_links_out_row_shows_the_alias_and_opens_the_real_target() {
         !dir.path().join("Q3 plan.md").exists(),
         "the label must never be followed as a target — that would create a phantom note"
     );
+}
+
+/// The tag tree highlights the row the filter names — and only that row.
+///
+/// `tag_row_is_selected` is what `render_notes_pane` hands to
+/// `Button::selectable`. It was inline as `selected_tag.as_deref() ==
+/// Some(node.tag.as_str())` and its `==` mutant survived, because egui 0.34 does
+/// NOT report `selected` in that widget's `WidgetInfo`: the highlight never
+/// reaches the accessibility tree, so no label, geometry or click-outcome
+/// assertion can see it. Naming the rule puts the decision somewhere a test can
+/// reach — inverted to `!=` every row EXCEPT the active one lights up, and the
+/// tree then tells the user the opposite of what the list is showing.
+///
+/// The rule is the mirror of `tag_filter_for`'s toggle-off condition, so the two
+/// are asserted to AGREE: the row that draws selected is exactly the row whose
+/// click clears the filter.
+#[test]
+fn the_tag_row_highlight_marks_the_filtered_tag_and_no_other() {
+    assert!(
+        tag_row_is_selected(Some("project"), "project"),
+        "the row the filter names is the selected one"
+    );
+    assert!(
+        !tag_row_is_selected(Some("project"), "project/frontend"),
+        "a CHILD of the filtered tag is not itself the selection"
+    );
+    assert!(
+        !tag_row_is_selected(Some("project"), "errand"),
+        "an unrelated row is not selected"
+    );
+    assert!(
+        !tag_row_is_selected(None, "project"),
+        "with no tag filter no row is selected"
+    );
+
+    // The highlight and the click must describe the same row: whichever row
+    // draws selected is the one a click TOGGLES OFF.
+    for tag in ["project", "project/frontend", "errand"] {
+        let selected = Some("project");
+        assert_eq!(
+            tag_row_is_selected(selected, tag),
+            tag_filter_for(tag, selected).is_empty(),
+            "the highlight for {tag:?} must agree with the click's toggle-off"
+        );
+    }
 }

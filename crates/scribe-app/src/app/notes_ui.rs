@@ -503,7 +503,8 @@ impl ScribeApp {
                             ui.horizontal(|ui| {
                                 #[allow(clippy::cast_precision_loss)]
                                 ui.add_space(node.depth as f32 * TAG_TREE_INDENT);
-                                let is_selected = selected_tag.as_deref() == Some(node.tag.as_str());
+                                let is_selected =
+                                    tag_row_is_selected(selected_tag.as_deref(), &node.tag);
                                 let clicked = ui
                                     .selectable_label(
                                         is_selected,
@@ -684,6 +685,21 @@ pub(crate) fn selected_tag_from_filter(filter: &str) -> Option<String> {
         }] => Some(tag.clone()),
         _ => None,
     }
+}
+
+/// Whether the tag-tree row for `node_tag` should draw as the selected one.
+///
+/// Split out of the row renderer because the selected state is drawn by
+/// `Button::selectable`, and egui 0.34 does NOT report `selected` in that
+/// widget's `WidgetInfo` — so the highlight reaches the accessibility tree
+/// nowhere and is observable only as painted pixels. Inline, the rule was
+/// therefore untestable; named, it is a pure predicate with a test, and the
+/// row renderer is left with no decision of its own to get wrong.
+///
+/// It is the exact mirror of [`tag_filter_for`]'s toggle-off condition: the row
+/// that a click would CLEAR is the row that draws as selected.
+pub(crate) fn tag_row_is_selected(selected: Option<&str>, node_tag: &str) -> bool {
+    selected == Some(node_tag)
 }
 
 /// The filter string a click on tag-tree node `node_tag` should produce.

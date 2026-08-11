@@ -603,3 +603,59 @@ fn helper_fuzzy_move_selection_saturates_and_clamps() {
     // Empty list → always 0 (the caller guards, but the helper is safe alone).
     assert_eq!(fuzzy_move_selection(5, 0, true, true), 0, "empty list → 0");
 }
+
+// ===========================================================================
+// Ctrl+1..9 — activating a tab by index. The bound is `idx < self.tabs.len()`;
+// widened to `<=` the ninth chord on an eight-tab window would set `active` to
+// a tab that does not exist instead of saying so.
+// ===========================================================================
+
+/// Ctrl+3 with only two tabs open must NOT switch: it reports "no tab 3" and
+/// leaves the active tab alone.
+///
+/// `if idx < self.tabs.len()` is the only thing separating "activate" from
+/// "explain". With `<=`, `idx == len` takes the activate arm and writes an
+/// out-of-range index into `active` — every later `self.tabs[active]` is then
+/// one past the end, and the status the code deliberately emits ("say nothing
+/// happened, and say why") never appears. Kills keyboard_input.rs:281:28.
+#[test]
+fn ctrl_three_with_two_tabs_reports_no_such_tab_instead_of_switching() {
+    let mut app = app_ready();
+    app.tabs.push(EditorTab::scratch());
+    assert_eq!(app.tabs.len(), 2, "the fixture opens exactly two tabs");
+    let mut h = harness(app);
+    h.run();
+
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Num3);
+    h.run();
+
+    assert_eq!(
+        h.state().active,
+        0,
+        "a chord for a tab that does not exist must not move the active tab"
+    );
+    assert_eq!(
+        h.state().status,
+        "no tab 3",
+        "and it must say so rather than silently doing nothing"
+    );
+}
+
+/// The inverse leg, so the test above cannot pass by the chord being inert:
+/// Ctrl+2 on the same two-tab window DOES switch.
+#[test]
+fn ctrl_two_with_two_tabs_activates_the_second_tab() {
+    let mut app = app_ready();
+    app.tabs.push(EditorTab::scratch());
+    let mut h = harness(app);
+    h.run();
+
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Num2);
+    h.run();
+
+    assert_eq!(
+        h.state().active,
+        1,
+        "a chord for a tab that DOES exist activates it"
+    );
+}

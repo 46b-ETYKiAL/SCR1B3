@@ -302,3 +302,123 @@ fn a_forwarded_jump_targets_the_forwarded_tab_not_tab_zero() {
         "the jump must apply to the forwarded file"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The wake thread + the degenerate jump target — two surfaces the frame loop
+// executed and nothing asserted, so both mutants survived the in-diff gate.
+// ---------------------------------------------------------------------------
+
+/// How long to wait for the watcher thread's first poll. It sleeps 250ms before
+/// looking, so this is a ~40x margin: the real function wakes well inside it,
+/// and a body replaced by `()` never wakes at all.
+const WAKE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Install egui's cross-thread repaint callback and return the flag it sets.
+///
+/// This is how a real backend learns a repaint was requested from a thread that
+/// is not painting — the exact channel `spawn_handoff_watcher` exists to use.
+fn repaint_flag(ctx: &egui::Context) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+    let woken = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = std::sync::Arc::clone(&woken);
+    ctx.set_request_repaint_callback(move |_info| {
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+    });
+    woken
+}
+
+#[test]
+fn the_handoff_watcher_wakes_an_idle_window() {
+    // The queue is drained from the FRAME loop, so a minimized or fully-idle
+    // window never notices a forwarded file — that is the whole reason this
+    // thread exists. Replacing `spawn_handoff_watcher` with `()` leaves the app
+    // compiling, every other hand-off test green (they all poll explicitly),
+    // and the feature silently dead. Kills mod.rs:2136:9.
+    use std::sync::atomic::Ordering;
+
+    let (dir, app) = app_with_handoff();
+    let root = app.handoff_root.clone().unwrap();
+    std::fs::create_dir_all(&root).unwrap();
+    let file = dir.path().join("wake.txt");
+    std::fs::write(&file, "x\n").unwrap();
+    crate::single_instance::forward(
+        &root,
+        &Request {
+            paths: vec![file.display().to_string()],
+            jump: None,
+        },
+    )
+    .unwrap();
+    assert!(
+        crate::single_instance::pending(&root),
+        "the fixture must leave a request the watcher can see"
+    );
+
+    let ctx = egui::Context::default();
+    let woken = repaint_flag(&ctx);
+    app.spawn_handoff_watcher(&ctx);
+
+    let deadline = std::time::Instant::now() + WAKE_DEADLINE;
+    while !woken.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        woken.load(Ordering::SeqCst),
+        "a queued hand-off must wake the idle window; no repaint was requested \
+         within {WAKE_DEADLINE:?}"
+    );
+}
+
+#[test]
+fn the_handoff_watcher_stays_quiet_with_an_empty_queue() {
+    // The other leg, which keeps the wake test above honest: with no request
+    // queued the watcher must poll and say nothing. If it woke unconditionally
+    // the window would steal the foreground four times a second forever, and
+    // the test above would pass on a watcher that ignores the queue entirely.
+    use std::sync::atomic::Ordering;
+
+    let (_dir, app) = app_with_handoff();
+    let root = app.handoff_root.clone().unwrap();
+    std::fs::create_dir_all(&root).unwrap();
+    assert!(
+        !crate::single_instance::pending(&root),
+        "queue starts empty"
+    );
+
+    let ctx = egui::Context::default();
+    let woken = repaint_flag(&ctx);
+    app.spawn_handoff_watcher(&ctx);
+
+    // Comfortably past the 250ms poll interval — several polls will have run.
+    std::thread::sleep(std::time::Duration::from_millis(900));
+    assert!(
+        !woken.load(Ordering::SeqCst),
+        "an empty queue must not wake the window"
+    );
+}
+
+#[test]
+fn a_forwarded_jump_to_line_zero_does_not_jump() {
+    // Lines are 1-based, so `file:0:5` names no line. `if line > 0` is what
+    // rejects it; widened to `>=` line zero takes the jump arm, scrolls, and
+    // overwrites the open status with a go-to that never made sense.
+    // Kills mod.rs:2222:25.
+    let (dir, mut app) = app_with_handoff();
+    let file = dir.path().join("zero.txt");
+    std::fs::write(&file, "l1\nl2\nl3\nl4\n").unwrap();
+    app.pending_scroll = None;
+
+    app.apply_handoff_request(&Request {
+        paths: vec![file.display().to_string()],
+        jump: Some((0, Some(5))),
+    });
+
+    assert_eq!(
+        app.pending_scroll, None,
+        "line 0 names no line — nothing may scroll"
+    );
+    assert_eq!(
+        app.status, "opened 1 file(s) from a new launch",
+        "and the open status must stand, un-overwritten by a go-to that never \
+         happened"
+    );
+}
