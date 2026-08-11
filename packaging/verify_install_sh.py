@@ -339,7 +339,7 @@ class Release:
         manifest_matches_tampered: bool = False,
         omit: tuple[str, ...] = (),
         empty: tuple[str, ...] = (),
-        corrupt_manifest_digest: bool = False,
+        tamper_manifest_after_sign: bool = False,
         manifest_asset_name: str | None = None,
     ) -> None:
         """Stage a release, optionally tampered.
@@ -375,13 +375,22 @@ class Release:
         # signature check is the thing under test.
         listed = manifest_asset_name or self.asset
         digest = sha256_hex(art) if manifest_matches_tampered else genuine_digest
-        if corrupt_manifest_digest:
-            digest = "0" * 64
         manifest = f"{digest}  {listed}\n"
         (self.root / "SHA256SUMS").write_text(manifest, newline="\n")
         (self.root / "SHA256SUMS.minisig").write_text(
             manifest_key.sign(manifest.encode()), newline="\n"
         )
+
+        # Tamper AFTER signing. Editing the digest BEFORE the signing step -- as
+        # this harness originally did -- produces a manifest whose signature is
+        # perfectly valid, so the run aborts at the digest COMPARISON and the
+        # signature check is never the thing under test. That case looked like a
+        # manifest-tamper test and was actually a duplicate of `tampered_artifact`
+        # read from the other side. Overwriting the file after it has been signed
+        # is what an in-flight edit really looks like: published bytes the
+        # published signature no longer covers.
+        if tamper_manifest_after_sign:
+            (self.root / "SHA256SUMS").write_text(f"{'0' * 64}  {listed}\n", newline="\n")
 
         for name in omit:
             (self.root / name).unlink(missing_ok=True)
@@ -501,6 +510,11 @@ class Case:
     why: str
     expect_install: bool
     expect_text: str = ""
+    # Text that must NOT appear. "It aborted" is a weak claim when a script has
+    # several gates in series -- forbidding the LATER gate's message is what
+    # proves the EARLIER one fired, rather than the run limping past it and
+    # being caught by something else downstream.
+    forbid_text: str = ""
     tools: tuple[str, ...] = ("minisign", "sha256sum", "curl", "uname")
     uname_s: str = "Linux"
     uname_m: str = "x86_64"
@@ -582,6 +596,11 @@ def run_case(case: Case, install_sh: Path, python: str, harness: str, verbose: b
                 return False, "aborted-case exited 0"
             if case.expect_text and case.expect_text.lower() not in combined.lower():
                 return False, f"missing expected message {case.expect_text!r}"
+            if case.forbid_text and case.forbid_text.lower() in combined.lower():
+                return False, (
+                    f"reached a later gate: output contains {case.forbid_text!r}, "
+                    "so the gate under test did not reject this"
+                )
             if not combined.strip():
                 return False, "aborted silently with no message"
         return True, ""
@@ -635,11 +654,39 @@ CASES = [
         build={"artifact_marker": b"MALICIOUS", "manifest_matches_tampered": True},
     ),
     Case(
-        "tampered_manifest_digest",
-        "An edited SHA256SUMS with a stale signature must fail authenticity.",
+        "tampered_manifest",
+        "SHA256SUMS edited after signing must be rejected as INAUTHENTIC, before "
+        "any digest is read out of it. Forbidding the checksum-mismatch message "
+        "is the point: a manifest must fail on authenticity, not merely because "
+        "its contents happened to disagree with the artifact.",
         expect_install=False,
         expect_text="sha256sums signature verification failed",
-        build={"corrupt_manifest_digest": True},
+        forbid_text="checksum mismatch",
+        build={"tamper_manifest_after_sign": True},
+    ),
+    Case(
+        "manifest_signed_by_attacker",
+        "A manifest signed by an ATTACKER key, alongside a genuinely signed "
+        "artifact, must be rejected. Isolates the manifest key check from the "
+        "artifact key check, which `foreign_signing_key` cannot -- it swaps both.",
+        expect_install=False,
+        expect_text="sha256sums signature verification failed",
+        forbid_text="checksum mismatch",
+        build={"manifest_key": "attacker"},
+    ),
+    Case(
+        "mutant_manifest_signature_unchecked",
+        "MUTANT: neuter the manifest signature check and the SAME tampered "
+        "manifest must get past authenticity and be caught downstream by the "
+        "digest comparison instead. Proves the abort in `tampered_manifest` came "
+        "from the signature line rather than from some coincidence of the fixture.",
+        expect_install=False,
+        expect_text="checksum mismatch",
+        build={"tamper_manifest_after_sign": True},
+        mutate_script=(
+            'verify_sig "${tmp}/SHA256SUMS" "${tmp}/SHA256SUMS.minisig"',
+            "true",
+        ),
     ),
     Case(
         "foreign_signing_key",
@@ -708,6 +755,17 @@ CASES = [
         expect_text="no sha256 tool",
         tools=("minisign", "curl", "uname"),
     ),
+    Case(
+        "mutant_artifact_signature_unchecked",
+        "MUTANT: neuter the per-artifact signature check and the tampered tarball "
+        "whose manifest was adjusted to match now INSTALLS. Expecting an install "
+        "here is the point -- it demonstrates that this one line is the only thing "
+        "standing between a matching-checksum forgery and an executed binary, and "
+        "so that the checksum is not a security control on its own.",
+        expect_install=True,
+        build={"artifact_marker": b"MALICIOUS", "manifest_matches_tampered": True},
+        mutate_script=('verify_sig "${tmp}/${asset}" "${tmp}/sig"', "true"),
+    ),
     # ---- mutants: prove the URL coordinates are load-bearing -----------------
     Case(
         "mutant_stale_repo_name",
@@ -718,6 +776,29 @@ CASES = [
         mutate_script=('REPO="46b-ETYKiAL/SCR1B3"', 'REPO="46b-ETYKiAL/OLD-NAME"'),
     ),
 ]
+
+
+def check_shipped_bytes(install_sh: Path) -> list[str]:
+    """Assert the file users actually download is executable AS STORED.
+
+    Every case below runs a COPY that `patch_pubkey` rewrites with LF endings.
+    That is necessary -- the key has to be substituted -- but it means the
+    fixture normalizes away a whole defect class: a CRLF-committed install.sh
+    would pass all twenty cases and still fail for every real user with
+    `bad interpreter: /bin/sh^M`, because `curl | sh` gets the stored bytes, not
+    a rewritten copy. So the real bytes are checked here, where the rewrite
+    cannot hide them.
+    """
+    problems = []
+    raw = install_sh.read_bytes()
+    if b"\r\n" in raw:
+        problems.append(
+            "install.sh contains CRLF line endings -- `curl ... | sh` would die "
+            "on ^M. .gitattributes pins *.sh to eol=lf; something overrode it."
+        )
+    if not raw.startswith(b"#!/bin/sh\n"):
+        problems.append(f"install.sh does not begin with '#!/bin/sh': {raw[:24]!r}")
+    return problems
 
 
 def unit_check_stub() -> list[str]:
@@ -752,6 +833,15 @@ def main() -> int:
         print(f"error: {install_sh} not found", file=sys.stderr)
         return 2
     python = sys.executable
+
+    print("== shipped-bytes check (the copy under test is rewritten; these are not) ==")
+    byte_problems = check_shipped_bytes(install_sh)
+    for p in byte_problems:
+        print(f"  FAIL {p}")
+    if byte_problems:
+        print("\nINVALID: the stored script is not runnable as published.")
+        return 1
+    print("  ok  LF line endings / '#!/bin/sh' shebang\n")
 
     print("== stub self-check (must both accept and reject) ==")
     problems = unit_check_stub()
