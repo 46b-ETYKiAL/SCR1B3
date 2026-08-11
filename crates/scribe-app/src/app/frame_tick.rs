@@ -3205,6 +3205,7 @@ impl ScribeApp {
                         layout_fg,
                         url_color,
                         detect_links,
+                        inline_md_palette(&self.theme, self.config.editor.inline_markdown_preview),
                     );
                     // Per-tab scroll: salt the ScrollArea Id with the tab's stable
                     // `doc_id` so egui keeps each note's scroll offset independently.

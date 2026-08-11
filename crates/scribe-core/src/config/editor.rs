@@ -55,6 +55,19 @@ pub struct EditorConfig {
     /// open is gated on an explicit modifier-click.
     #[serde(default = "default_true")]
     pub detect_links: bool,
+    /// INLINE (hybrid) markdown preview: render markdown formatting IN PLACE in
+    /// the editing surface — heading text scaled by level, `*emphasis*` in real
+    /// italics, `**strong**` colour-lifted, inline/fenced code on a tinted plate,
+    /// quotes toned, link labels underlined, and the `#`/`**`/`` ` ``/`>` markers
+    /// dimmed so they recede — instead of only in the side preview pane.
+    ///
+    /// Styling ONLY: the source bytes are never inserted, removed or rewritten,
+    /// so the caret, selection, find/replace and LSP offsets are untouched.
+    /// Applies to markdown files only, and only on the `TextEdit`-family editor
+    /// arms (see `md_preview::inline`). Default ON — a purely visual, per-file,
+    /// instantly reversible improvement to the app's primary format.
+    #[serde(default = "default_true")]
+    pub inline_markdown_preview: bool,
     /// Master switch for the extra markdown/note token-colouring passes that
     /// colour tokens the grammar leaves plain: `----` & decorative dividers,
     /// `#tags`, `~~strikethrough~~`, task boxes `[ ]`/`[x]`, and table `|` cell
@@ -371,6 +384,7 @@ impl Default for EditorConfig {
             render_whitespace: false,
             syntax_from_theme: false,
             detect_links: true,
+            inline_markdown_preview: true,
             md_rich_coloring: true,
             md_color_dividers: true,
             md_color_tags: true,

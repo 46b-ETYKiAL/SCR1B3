@@ -23,6 +23,7 @@
 //! `Tag::Link { dest_url, .. }`; `Tag::CodeBlock(CodeBlockKind)`).
 
 mod cache;
+pub(crate) mod inline;
 mod math;
 
 use egui::{Color32, RichText};

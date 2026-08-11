@@ -1075,6 +1075,22 @@ fn render_sections(
             changed |= grid_bool(
                 ui,
                 q,
+                "inline hybrid markdown preview live formatting in place headings \
+                 bold italic code editor surface",
+                "Inline markdown preview",
+                "Render markdown formatting IN PLACE while you edit a .md note — \
+                 headings sized by level, *emphasis* slanted, **strong** lifted, \
+                 `code` on a tinted plate, quotes toned, link labels underlined, and \
+                 the #, ** and ` markers dimmed so they recede. Styling only: not a \
+                 single character of your note is hidden, moved or rewritten, so the \
+                 caret and find/replace behave exactly as before. Independent of the \
+                 side preview pane.",
+                &mut config.editor.inline_markdown_preview,
+                &def.editor.inline_markdown_preview,
+            );
+            changed |= grid_bool(
+                ui,
+                q,
                 "rich markdown note colouring tokens master switch",
                 "Rich markdown colouring",
                 "Colour extra note tokens the syntax grammar leaves plain — divider \

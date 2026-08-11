@@ -279,6 +279,10 @@ impl ScribeApp {
             "url",
             self.theme.ui("accent", Rgba::new(0x4c, 0xc2, 0xff, 255)),
         ));
+        // Inline (hybrid) markdown preview — the SAME palette the single-pane and
+        // fold arms use, from the one builder, so a grid pane cannot render
+        // markdown differently from the editor it was split out of.
+        let inline_md = inline_md_palette(&self.theme, self.config.editor.inline_markdown_preview);
         // #R5: theme colours + focused-pane id for the chip-styled pane headers
         // (the per-pane note bar now mirrors the top tab strip's chip look).
         let accent = ui_color(&self.theme, "accent", Rgba::new(0, 255, 254, 255));
@@ -480,6 +484,7 @@ impl ScribeApp {
                     layout_fg,
                     url_color,
                     detect_links,
+                    inline_md,
                 );
                 let mut sa = egui::ScrollArea::both().id_salt(("scr1b3-grid-pane", doc_id.raw()));
                 if is_active {

@@ -2379,9 +2379,9 @@ mod render_support;
 // the A-01 wave-3 extraction. Mirrors the `commands` re-export above.
 pub(crate) use render_support::{
     apply_indent, build_fonts, byte_to_char_index, char_to_byte, completion_popup,
-    ensure_readable_tone, font_state_key, grip_handle, line_col_from_char_index, load_snippets,
-    load_theme, make_layouter, matching_bracket_char_indices, newline_with_indent, paint_squiggle,
-    panel_fill, pick_bookmark, spawn_config_watcher, use_rope_editor,
+    ensure_readable_tone, font_state_key, grip_handle, inline_md_palette, line_col_from_char_index,
+    load_snippets, load_theme, make_layouter, matching_bracket_char_indices, newline_with_indent,
+    paint_squiggle, panel_fill, pick_bookmark, spawn_config_watcher, use_rope_editor,
 };
 mod session_io;
 // The Settings → Keyboard page. It lives under `app/` (not beside `settings.rs`)

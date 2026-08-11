@@ -606,6 +606,43 @@ pub(crate) fn paint_squiggle(painter: &egui::Painter, x0: f32, x1: f32, y: f32, 
     }
 }
 
+/// The inline (hybrid) markdown-preview palette for the current theme, or `None`
+/// when the feature is off.
+///
+/// Built HERE, in one place, rather than at each of `make_layouter`'s three call
+/// sites: an arm that computed its own palette could quietly disagree with the
+/// others, which is the exact class of per-arm divergence the surface-parity
+/// matrix exists to catch.
+pub(crate) fn inline_md_palette(
+    theme: &scribe_core::theme::Theme,
+    enabled: bool,
+) -> Option<crate::md_preview::inline::InlinePalette> {
+    if !enabled {
+        return None;
+    }
+    let syn = |key: &str, fallback: Color32| {
+        scribe_render::color32(theme.syntax_color(key, {
+            let [r, g, b, a] = fallback.to_array();
+            Rgba::new(r, g, b, a)
+        }))
+    };
+    let muted = ui_color(theme, "line_number", Rgba::new(0x5a, 0x58, 0x69, 255));
+    let accent = ui_color(theme, "accent", Rgba::new(0x4c, 0xc2, 0xff, 255));
+    let fg = ui_color(theme, "foreground", Rgba::new(0xc8, 0xd6, 0xdc, 255));
+    Some(crate::md_preview::inline::InlinePalette {
+        marker: muted,
+        heading: syn("markup.heading", accent),
+        strong: syn("markup.bold", fg),
+        code: syn("markup.raw", accent),
+        // A backing tint, not a fill: derived from the muted tone at low alpha so
+        // it reads as a plate under the code on every theme without a new key.
+        code_bg: Color32::from_rgba_unmultiplied(muted.r(), muted.g(), muted.b(), 40),
+        quote: muted,
+        link: syn("url", accent),
+        list_marker: accent,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn make_layouter<'a>(
     hl: &'a Highlighter,
@@ -619,7 +656,14 @@ pub(crate) fn make_layouter<'a>(
     fg: Color32,
     url_color: Color32,
     detect_links: bool,
+    inline_md: Option<crate::md_preview::inline::InlinePalette>,
 ) -> impl FnMut(&egui::Ui, &dyn egui::TextBuffer, f32) -> std::sync::Arc<egui::Galley> + 'a {
+    // The markdown test is made ONCE, here, from the same `ext` the highlighter
+    // is keyed on — so an arm cannot opt itself in or out, and a new arm that
+    // calls `make_layouter` at all gets the feature by construction. This is the
+    // whole reason the flag is threaded into the layouter rather than applied at
+    // the call sites.
+    let inline_md = inline_md.filter(|_| crate::md_preview::inline::is_markdown_ext(ext));
     // egui 0.34: TextEdit::layouter callback now receives `&dyn TextBuffer`
     // instead of `&str` (so non-String buffers can be hosted). We still want
     // to hash + highlight by &str, so unpack via TextBuffer::as_str().
@@ -653,6 +697,28 @@ pub(crate) fn make_layouter<'a>(
         ub.hash(&mut hasher);
         ua.hash(&mut hasher);
         detect_links.hash(&mut hasher);
+        // The inline-markdown palette is an INPUT to the cached job (it rewrites
+        // the sections), so it belongs in the key. Without it, toggling the
+        // feature or switching theme would keep serving the previously-styled
+        // job for unchanged text — a stale render the user cannot clear.
+        match &inline_md {
+            Some(pal) => {
+                1u8.hash(&mut hasher);
+                for c in [
+                    pal.marker,
+                    pal.heading,
+                    pal.strong,
+                    pal.code,
+                    pal.code_bg,
+                    pal.quote,
+                    pal.link,
+                    pal.list_marker,
+                ] {
+                    c.to_array().hash(&mut hasher);
+                }
+            }
+            None => 0u8.hash(&mut hasher),
+        }
         let key = hasher.finish();
         let eff_wrap = effective_wrap_width(word_wrap, wrap);
         // Wave-3: full galley hit — same content key AND same wrap width. Return
@@ -671,7 +737,7 @@ pub(crate) fn make_layouter<'a>(
             match slot.as_ref() {
                 Some((k, j)) if *k == key => j.clone(),
                 _ => {
-                    let arc = std::sync::Arc::new(highlight_job(
+                    let mut built = highlight_job(
                         hl,
                         text,
                         ext,
@@ -681,7 +747,22 @@ pub(crate) fn make_layouter<'a>(
                         fg,
                         url_color,
                         detect_links,
-                    ));
+                    );
+                    // INLINE (hybrid) markdown preview. Runs over the finished
+                    // job, rewriting SECTION FORMATS only — `job.text` is never
+                    // touched, so every byte offset the caret, the selection,
+                    // find/replace and the diagnostics painter depend on is
+                    // unchanged. The spans are derived from `text`, the very
+                    // string this job was built from, which is what makes it
+                    // correct on the fold view's projected buffer too.
+                    if let Some(pal) = &inline_md {
+                        crate::md_preview::inline::restyle_job(
+                            &mut built,
+                            &crate::md_preview::inline::spans(text),
+                            pal,
+                        );
+                    }
+                    let arc = std::sync::Arc::new(built);
                     *slot = Some((key, arc.clone()));
                     arc
                 }
@@ -965,6 +1046,7 @@ mod tint_tests {
                 Color32::WHITE,
                 Color32::from_rgb(0, 0, 255),
                 false, // detect_links
+                None,  // inline markdown preview off — this pins the cache, not the styling
             );
             let s1 = String::from("first buffer contents");
             let s2 = String::from("second entirely different contents");
@@ -1008,6 +1090,7 @@ mod tint_tests {
                 Color32::WHITE,
                 Color32::from_rgb(0, 0, 255),
                 false, // detect_links
+                None,  // inline markdown preview off — this pins the cache, not the styling
             );
             let text = String::from("some buffer prose to lay out at two different widths");
             let _g_narrow = layouter(ui, &text, 60.0); // primes gcache with wrap=60

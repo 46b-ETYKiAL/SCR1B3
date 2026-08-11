@@ -689,6 +689,13 @@ impl ScribeApp {
             "url",
             self.theme.ui("accent", Rgba::new(0x4c, 0xc2, 0xff, 255)),
         ));
+        // Inline markdown styling applies here too. The fold view lays out a
+        // PROJECTED buffer whose offsets do not match the document — which is why
+        // a span OVERLAY (diagnostics, in document coordinates) must never be
+        // pointed at it. These spans run the opposite direction: they are derived
+        // from the projected string itself, so the projection styles its own
+        // markdown and the offset mismatch cannot arise. See `inline::restyle_job`.
+        let inline_md = inline_md_palette(&self.theme, self.config.editor.inline_markdown_preview);
         let mut layouter = make_layouter(
             hl,
             &self.hl_cache,
@@ -701,6 +708,7 @@ impl ScribeApp {
             layout_fg,
             url_color,
             detect_links,
+            inline_md,
         );
         egui::ScrollArea::both()
             .id_salt("fold-scroll")
