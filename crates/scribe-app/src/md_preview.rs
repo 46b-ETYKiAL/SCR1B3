@@ -1363,6 +1363,33 @@ mod tests {
             .collect()
     }
 
+    /// A harness that renders a hand-built block list through the REAL
+    /// [`render_blocks`], so the per-block layout (indent spacing, callout body,
+    /// tag splitting) can be asserted without going through `parse`.
+    fn harness_rendering(blocks: Vec<MdBlock>) -> egui_kittest::Harness<'static> {
+        let mut h = egui_kittest::Harness::builder()
+            .with_size(egui::Vec2::new(700.0, 900.0))
+            .build_ui(move |ui| {
+                let mut ctx = RenderCtx {
+                    accent: Color32::WHITE,
+                    muted: Color32::GRAY,
+                    clicked: Vec::new(),
+                    table_seq: 0,
+                };
+                render_blocks(ui, &blocks, &mut ctx, 0);
+            });
+        h.run();
+        h
+    }
+
+    /// A plain, unstyled text run.
+    fn text_run(text: &str) -> MdRun {
+        MdRun {
+            text: text.to_string(),
+            ..MdRun::default()
+        }
+    }
+
     fn harness_showing(md: &'static str) -> egui_kittest::Harness<'static> {
         let mut h = egui_kittest::Harness::builder()
             .with_size(egui::Vec2::new(700.0, 900.0))
@@ -2672,5 +2699,145 @@ mod tests {
             "past the end falls back"
         );
         assert_eq!(align_at(&[], 0), MdAlign::None, "no delimiter row at all");
+    }
+
+    // ---- Block flushing, indent geometry, callouts, tag splitting ---------
+
+    #[test]
+    fn display_math_after_quoted_text_flushes_the_lead_in_as_a_quote() {
+        // `$$…$$` mid-paragraph flushes the runs collected so far BEFORE the
+        // math block. `quote_depth > 0` is what decides whether that flush is a
+        // Quote or a Paragraph; inverted to `< 0` it is unsatisfiable for an
+        // unsigned depth, so quoted lead-in text silently loses its quote
+        // styling. Kills 678:52.
+        let blocks = parse("> lead in $$E = mc^2$$\n");
+        let quoted = blocks
+            .iter()
+            .find(|b| matches!(b, MdBlock::Quote(_)))
+            .unwrap_or_else(|| panic!("the quoted lead-in must flush as a Quote; got {blocks:?}"));
+        let MdBlock::Quote(runs) = quoted else {
+            unreachable!()
+        };
+        assert!(
+            runs_text(runs).contains("lead in"),
+            "the flushed quote carries the lead-in text, got {:?}",
+            runs_text(runs)
+        );
+        assert!(
+            blocks
+                .iter()
+                .any(|b| matches!(b, MdBlock::MathBlock { .. })),
+            "and the display math still becomes its own block"
+        );
+    }
+
+    #[test]
+    fn a_list_items_indent_is_sixteen_pixels_per_nesting_level() {
+        use egui_kittest::kittest::Queryable as _;
+        // `add_space(*indent as f32 * 16.0)` is the ONLY thing that indents a
+        // nested list item, and a LABEL query cannot see a spacing change — a
+        // label-based test here would pass on the mutant and be worse than no
+        // test at all. So this measures the GEOMETRY: `*` puts two levels 32px
+        // apart, while `+` yields 16.0 vs 18.0 (a 2px step) and `/` yields 0.0
+        // vs 0.125. Both marker glyphs are identical so the marker width
+        // cancels out of the difference. Kills 901:49 for both arms.
+        let h = harness_rendering(vec![
+            MdBlock::ListItem {
+                depth: 0,
+                marker: "•".into(),
+                runs: vec![text_run("shallow")],
+            },
+            MdBlock::ListItem {
+                depth: 2,
+                marker: "•".into(),
+                runs: vec![text_run("deep")],
+            },
+        ]);
+        let shallow = h.get_by_label("shallow").rect().left();
+        let deep = h.get_by_label("deep").rect().left();
+        let step = deep - shallow;
+        assert!(
+            (step - 32.0).abs() < 0.5,
+            "two nesting levels must indent by 2 x 16px; measured {step}px \
+             (shallow at {shallow}, deep at {deep})"
+        );
+    }
+
+    #[test]
+    fn a_task_items_indent_is_sixteen_pixels_per_nesting_level() {
+        use egui_kittest::kittest::Queryable as _;
+        // The task-list twin of the list-item indent, and the same geometry
+        // argument: the checkbox is identical on both rows so it cancels out of
+        // the difference, leaving only the `add_space`. Kills 835:49 for both
+        // the `+` and the `/` arm.
+        let h = harness_rendering(vec![
+            MdBlock::TaskItem {
+                depth: 0,
+                checked: false,
+                source_line: 0,
+                runs: vec![text_run("shallow")],
+            },
+            MdBlock::TaskItem {
+                depth: 2,
+                checked: false,
+                source_line: 1,
+                runs: vec![text_run("deep")],
+            },
+        ]);
+        let shallow = h.get_by_label("shallow").rect().left();
+        let deep = h.get_by_label("deep").rect().left();
+        let step = deep - shallow;
+        assert!(
+            (step - 32.0).abs() < 0.5,
+            "two nesting levels must indent by 2 x 16px; measured {step}px \
+             (shallow at {shallow}, deep at {deep})"
+        );
+    }
+
+    #[test]
+    fn a_callout_renders_its_body_and_not_just_its_title() {
+        use egui_kittest::kittest::Queryable as _;
+        // `if !body.is_empty()` is what draws the callout body. Delete the `!`
+        // and the guard inverts: a callout WITH a body renders the title alone
+        // and the warning text disappears. Kills 872:28.
+        let h = harness_rendering(vec![MdBlock::Quote(vec![text_run(
+            "[!warning] mind the gap",
+        )])]);
+        assert!(
+            h.query_by_label_contains("WARNING").is_some(),
+            "the callout title renders"
+        );
+        assert!(
+            h.query_by_label_contains("mind the gap").is_some(),
+            "and so does its body"
+        );
+    }
+
+    #[test]
+    fn a_plain_run_renders_each_hashtag_as_its_own_label() {
+        use egui_kittest::kittest::Queryable as _;
+        // `!r.code && !bold && !r.italic && contains_tag(..)` routes a plain run
+        // through `render_text_with_tags`, which emits ONE label per span so the
+        // tag can be accented. Deleting ANY of the three `!`s makes a plain run
+        // fail the guard and render as a single undivided label, so the tag
+        // stops being separately addressable. Kills 1240:12, 1240:23 and
+        // 1240:32.
+        let h = harness_rendering(vec![MdBlock::Paragraph(vec![text_run("see #idea now")])]);
+        assert!(
+            h.query_by_label("#idea").is_some(),
+            "the tag is split out into its own accented label"
+        );
+
+        // The inverse, which pins the `!r.code` term from the other side: a CODE
+        // run is never tag-split, so its `#idea` must NOT be addressable alone.
+        let h = harness_rendering(vec![MdBlock::Paragraph(vec![MdRun {
+            text: "see #idea now".into(),
+            code: true,
+            ..MdRun::default()
+        }])]);
+        assert!(
+            h.query_by_label("#idea").is_none(),
+            "a code run renders verbatim — its hashtag is not a tag"
+        );
     }
 }
