@@ -247,6 +247,36 @@ exclude_re = [
   'settings/chrome\.rs.*\bspace\b',
   'settings/chrome\.rs.*\bgroup\b',
   'settings/chrome\.rs.*\bhead\b',
+  # settings/<page>.rs — the category pages lifted OUT of `render_sections` by
+  # the settings decomposition. Each is one `if section_visible(…) { … }` block
+  # moved verbatim, at the same indent, into its own module; the bodies are
+  # unchanged. They were already pardoned as part of `\brender_sections\b`, and
+  # the pardon set stays SCOPE-PRESERVING rather than widened — measured per
+  # page with `cargo mutants --list`, the mutants leaving `render_sections`
+  # match the mutants arriving in the page, plus exactly two whole-function
+  # `-> bool` shapes (`with true` / `with false`) that a nested block never
+  # generates, minus one `|=` mutant on the new call line that STAYS gated in
+  # `render_sections`. Every page is a pure egui-paint surface under the
+  # ADR-0007 policy: its survivors are observable only through GPU-painted
+  # pixels or live-frame widget interaction. The pure LOGIC each block once
+  # inlined is EXTRACTED and separately unit-tested (parse_hex_color,
+  # step_theme_index, step_index, nudge_up/nudge_down, section_visible,
+  # row_visible, action_label, apply_toolbar_drop, apply_keyboard_move,
+  # reporting_mode_label) and those helpers live in `settings.rs`, NOT in these
+  # pages — so a whole-page pardon hides no logic gap.
+  #
+  # FILE-QUALIFIED, never `\b`-bounded bare. Every page's entry point is called
+  # `render`, and a bare `\brender\b` would also match the two OTHER functions
+  # named exactly `render` in this tree — `md_preview/math.rs::render` and
+  # `scribe-core/src/notes/template.rs::render`. Both are pure `-> String` logic
+  # that IS unit-testable and MUST stay mutation-gated; pardoning them by
+  # accident would be a silent green. File-qualifying is the same discipline
+  # `show`, `space`, `group` and `head` already follow above.
+  #
+  # Per-page mutant accounting (render_sections baseline 191 after the chrome
+  # lift):
+  #   appearance : render_sections 191 -> 177, appearance.rs 17 (15 moved + 2)
+  'settings/appearance\.rs.*\brender\b',
   # app/chrome.rs frameless-window chrome painting
   '\bcaption_btn\b',
   '\bhandle_frameless_resize\b',
