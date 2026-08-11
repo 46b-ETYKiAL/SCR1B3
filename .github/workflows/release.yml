@@ -530,10 +530,18 @@ jobs:
             echo "::error::the compiled MSI carries only $built RegistryValue rows (floor $REGISTRY_ROW_FLOOR) -- the registry table did not make it into the package."
             exit 1
           fi
-          if [ "$built" -ne "$src" ]; then
-            echo "::error::registry rows differ between source ($src) and compiled MSI ($built) -- rows were dropped or merged during the build."
+          # Written as `[ good ] || { fail; }`, matching the licfiles check
+          # below, NOT as `if [ bad ]; then fail; fi`. `src` comes from a
+          # `grep -c ... || true` over a path this step never asserts exists,
+          # so it can be empty. `[ 350 -ne "" ]` exits 2 ("integer expression
+          # expected"), `if` reads 2 as false, and `set -e` does not fire on a
+          # failing `if` CONDITION -- so the bad-condition form silently
+          # skipped its own then-branch and the check no-opped. The `||` form
+          # treats 2 as "not true" and fails closed on the same input.
+          [ "$built" -eq "$src" ] || {
+            echo "::error::registry rows differ between source ($src) and compiled MSI ($built) -- rows were dropped or merged during the build, or main.wxs could not be read."
             exit 1
-          fi
+          }
           # License delivery, asserted against the BUILT package rather than
           # the staging directory. A staged tree only proves the collector
           # ran; the File table is what proves the texts actually SHIP. The
@@ -1077,6 +1085,12 @@ jobs:
             fi
             verified=$((verified + 1))
           done < <(find dist -type f ! -name '*.minisig')
+          # (0) non-vacuity. EVERY check above lives inside that loop, and the
+          # parity check below reduces to `[ 0 -eq 0 ]`, so an empty `dist/`
+          # skipped all of them and printed "release gate GREEN: 0 verified" —
+          # a staging/download-artifact failure was indistinguishable from a
+          # fully verified release. A gate that cannot fail is not a gate.
+          [ "$assets" -gt 0 ] || { echo "::error::self-verify found ZERO assets under dist/ — nothing was checked. Refusing to report a pass."; exit 1; }
           nminisig=$(find dist -name '*.minisig' | wc -l | tr -d ' ')                                                          # (B) parity
           [ "$verified" -eq "$nminisig" ] || { echo "::error::sig parity $verified != $nminisig"; exit 1; }
           orig=$(find dist -type f ! -name '*.minisig' | head -1)                                                              # (G) tamper
@@ -1086,6 +1100,12 @@ jobs:
               echo "::error::tamper test passed — gate broken"; exit 1
             fi
             rm -f "$tf"
+          else
+            # Unreachable while (0) holds, and deliberately kept as a second
+            # latch: the tamper probe is the only check that proves the
+            # verifier still REJECTS anything. Silently skipping it would let
+            # a broken verifier ship a green release.
+            echo "::error::no asset available for the tamper probe — cannot prove the verifier rejects modified bytes"; exit 1
           fi
           rm -f rsign.pub
           echo "release gate GREEN: $assets verified vs embedded key (crypto+identity+digest+parity+tamper)."
@@ -1138,19 +1158,48 @@ jobs:
             echo "::error::No artifacts found under dist/ — refusing to publish an empty release."
             exit 1
           fi
+          # Is this ref a stable release, or a prerelease / dispatch build?
+          #
+          # This step used to have NO notion of a prerelease: it forced
+          # `--draft=false --latest` on every ref. packaging/require-signing-key.sh
+          # deliberately TOLERATES an unsigned prerelease (rc builds are opt-in
+          # downloads, not auto-update targets) — so cutting `v0.5.0-rc.1` with
+          # no signing key provisioned published UNSIGNED artifacts as the
+          # repo's CURRENT release, served by every download link and offered to
+          # the updater, which is built to reject exactly those bytes. Neither
+          # behaviour was wrong alone; the hole was that the two disagreed.
+          #
+          # The predicate is therefore READ FROM THE SAME FILE the signing guard
+          # reads, not restated here — two copies could drift back apart, and a
+          # drift is the bug in its general form (an artifact both "unsigned
+          # because prerelease" and "published because stable"). `src/` prefix
+          # for the same reason the signing step uses it: this job checks out
+          # with `path: src`.
+          class=$(sh src/packaging/semver-tag-class.sh)
+          echo "ref $tag classified: $class"
           # Idempotent: create the release if absent, else upload/clobber into it
           # (so a re-run after a partial failure recovers instead of erroring).
           if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$tag" --repo "$GITHUB_REPOSITORY" --clobber "${assets[@]}"
           else
+            create_flags=()
+            [ "$class" = "stable" ] || create_flags+=(--prerelease)
             gh release create "$tag" \
               --repo "$GITHUB_REPOSITORY" \
               --title "$tag" \
               --generate-notes \
+              "${create_flags[@]}" \
               "${assets[@]}"
           fi
-          # Always finish PUBLISHED + marked latest. GitHub auto-demotes a
-          # release to a draft when its tag is deleted, so a delete+re-push tag
-          # (re-cut) would otherwise leave an invisible draft after the upload
-          # path. This makes the release reliably public + installable.
-          gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+          # Always finish PUBLISHED. GitHub auto-demotes a release to a draft
+          # when its tag is deleted, so a delete+re-push tag (re-cut) would
+          # otherwise leave an invisible draft after the upload path.
+          #
+          # Only a STABLE tag is promoted to Latest. Both flags are passed
+          # explicitly in BOTH directions so a re-cut that changes a tag's class
+          # is corrected rather than inheriting the previous run's marking.
+          if [ "$class" = "stable" ]; then
+            gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --draft=false --prerelease=false --latest
+          else
+            gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --draft=false --prerelease --latest=false
+          fi
