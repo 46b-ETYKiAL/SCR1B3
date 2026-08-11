@@ -47,14 +47,14 @@ fn scale_tab(idx: usize, ext: &str, dirty: bool, pinned: bool) -> EditorTab {
     let mut tab = EditorTab::scratch();
     tab.doc.set_text(&body);
     tab.doc.mark_clean();
-    tab.text = body.clone();
+    tab.set_text(body.clone());
     tab.disk_text = body.clone();
     tab.session_baseline = body.clone();
     tab.saved_baseline = body;
     tab.pinned = pinned;
     if dirty {
         // Diverge from the saved rope → is_dirty() == true (unsaved edit).
-        tab.text = format!("{}\n// unsaved edit {idx}\n", tab.text);
+        tab.set_text(format!("{}\n// unsaved edit {idx}\n", tab.text));
     }
     tab
 }
@@ -131,7 +131,7 @@ fn scenario1_many_tabs_present_and_strip_renders_without_panic() {
 fn scenario2_tab_switching_changes_active_and_visible_buffer() {
     let mut app = scale_app();
     // Record the per-tab body so we can prove the RIGHT buffer becomes active.
-    let bodies: Vec<String> = app.tabs.iter().map(|t| t.text.clone()).collect();
+    let bodies: Vec<String> = app.tabs.iter().map(|t| t.text.to_string()).collect();
 
     // Switch across the strip by index (the click handler sets `self.active = i`;
     // we drive the same state transition the click resolves to, then render).
@@ -239,7 +239,7 @@ fn scenario3_dirty_marker_pinned_retention_and_close_guards() {
     let dirty = (0..app.tabs.len())
         .find(|&i| !app.tabs[i].pinned && app.tabs[i].is_dirty())
         .expect("scale session has a dirty unpinned tab");
-    let dirty_text = app.tabs[dirty].text.clone();
+    let dirty_text = app.tabs[dirty].text.to_string();
     app.close_tab(dirty);
     assert!(
         app.closed_tabs.iter().any(|c| c.text == dirty_text),
@@ -286,7 +286,7 @@ fn scenario4_session_save_restore_round_trip_preserves_set_active_and_flags() {
         tab.doc_id = app.next_doc_id.next();
         if i % 4 == 0 {
             // Diverge → dirty (unsaved edit) so a backup is written for it.
-            tab.text = format!("{}\n// dirty {i}\n", tab.text);
+            tab.set_text(format!("{}\n// dirty {i}\n", tab.text));
         }
         app.tabs.push(tab);
     }

@@ -21,9 +21,9 @@ fn grid_two_doc_app() -> ScribeApp {
     cfg.appearance.frameless = false;
     cfg.editor.grid_enabled = true;
     let mut app = ScribeApp::new_test(cfg);
-    app.tabs[0].text = "fn main() {}\n".into();
+    app.tabs[0].set_text("fn main() {}\n".into());
     app.tabs.push(EditorTab::scratch());
-    app.tabs[1].text = "second note\n".into();
+    app.tabs[1].set_text("second note\n".into());
     app
 }
 

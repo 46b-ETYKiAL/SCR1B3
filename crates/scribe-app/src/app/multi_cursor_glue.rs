@@ -109,7 +109,7 @@ impl ScribeApp {
         // Ctrl/Cmd+D — select the word under the caret, then add each next match.
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::D)) {
             if let Some(primary) = mc_load_primary(ctx, editor_id) {
-                let text = self.tabs[active].text.clone();
+                let text = self.tabs[active].text.to_string();
                 match self.multi_cursor.select_next_occurrence(&text, primary) {
                     CtrlDOutcome::SelectWord { start, end } => {
                         // First Ctrl+D just selects the word (egui adopts it).
@@ -154,14 +154,20 @@ impl ScribeApp {
                 egui::text::CCursor::new(primary.anchor),
                 egui::text::CCursor::new(primary.head),
             ),
-            self.tabs[active].text.clone(),
+            self.tabs[active].text.to_string(),
         );
-        for op in ops {
-            let np = self
-                .multi_cursor
-                .apply_edit(&mut self.tabs[active].text, primary, op);
-            primary = Caret::at(np);
-        }
+        // The replay splices `text` IN PLACE, so it goes through the in-place
+        // seam: the raw `&mut String` exists only inside the closure and the
+        // invalidation runs after the whole replay, once. `_keep_undo` because
+        // a multi-cursor edit is user-issued in-buffer work the undoer should
+        // revert — the checkpoint pushed below is what it reverts to.
+        let mc = &mut self.multi_cursor;
+        self.tabs[active].text.splice_in_place_keep_undo(|text| {
+            for op in ops {
+                let np = mc.apply_edit(text, primary, op);
+                primary = Caret::at(np);
+            }
+        });
         mc_push_undo_checkpoint(ctx, editor_id, undo_checkpoint);
         // Parity with the TextEdit edit path: mark the doc dirty and invalidate
         // every `text`-derived cache. `apply_edit` splices `tabs[active].text`
@@ -173,7 +179,6 @@ impl ScribeApp {
         // focus/`TextEdit::load_state` guards do. `note_text_mutated` removes
         // the dependency on those guards holding.
         self.tabs[active].doc.mark_dirty();
-        self.tabs[active].note_text_mutated();
         mc_set_primary(ctx, editor_id, primary.head, primary.head);
         // The carets still index into THIS tab's (now-mutated) buffer; refresh the
         // owner so the tab-scope reconcile keeps them alive next frame.

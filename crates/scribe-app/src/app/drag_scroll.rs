@@ -602,7 +602,7 @@ mod tests {
 
     fn page_app(ctx: &egui::Context, id: egui::Id, caret_line: usize) -> ScribeApp {
         let mut app = ScribeApp::new_test(page_config());
-        app.tabs[app.active].text = page_text();
+        app.tabs[app.active].set_text(page_text());
         set_caret(ctx, id, line_start(caret_line));
         app
     }

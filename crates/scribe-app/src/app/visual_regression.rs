@@ -238,7 +238,7 @@ fn app_with_sample() -> ScribeApp {
     let mut app = ScribeApp::new_test(vr_config());
     app.tabs.clear();
     let mut t = EditorTab::scratch();
-    t.text = SAMPLE.to_string();
+    t.set_text(SAMPLE.to_string());
     t.session_baseline = SAMPLE.to_string();
     t.saved_baseline = SAMPLE.to_string();
     app.tabs.push(t);

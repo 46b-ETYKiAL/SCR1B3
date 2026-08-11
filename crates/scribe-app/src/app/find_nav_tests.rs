@@ -11,7 +11,7 @@ fn goto_line_sets_exact_pending_scroll_via_line_height_fallback() {
     // line_1based=3 -> line0=2; pending = 2 * (size*line_height). Kills 27:57
     // (size*lh) and 28:55 (line0*lh) offset mutants.
     let mut app = ScribeApp::new_test(Config::default());
-    app.tabs[0].text = "a\nb\nc\nd\ne\n".into();
+    app.tabs[0].set_text("a\nb\nc\nd\ne\n".into());
     let size = app.config.fonts.clamped_editor_size();
     let lh = app.config.fonts.clamped_line_height();
     let expected = 2.0_f32 * (size * lh);
@@ -35,7 +35,7 @@ fn find_navigate_clamps_a_stale_match_index_before_wrapping() {
     // A STALE idx >= n must clamp to n-1 BEFORE wrapping. n=3, idx=3, forward:
     // clean min(3,2)=2 -> (2+1)%3=0; a +/÷ mutant on `n - 1` lands on 1. Kills 105:57(x2).
     let mut app = ScribeApp::new_test(Config::default());
-    app.tabs[0].text = "foo bar foo baz foo".into();
+    app.tabs[0].set_text("foo bar foo baz foo".into());
     app.find_query = "foo".into();
     app.find_open = true;
     assert_eq!(app.find_matches_active().len(), 3);
@@ -50,7 +50,7 @@ fn find_navigate_sets_exact_pending_scroll_from_newline_count() {
     // scroll_to_offset (private) through find_navigate. Kills 76:9 (stub),
     // 76:24 (guard flip), 84:33 (newline filter !=), 91:57 + 92:55 (offset math).
     let mut app = ScribeApp::new_test(Config::default());
-    app.tabs[0].text = "aaaa\nfoo".into();
+    app.tabs[0].set_text("aaaa\nfoo".into());
     app.find_query = "foo".into();
     app.find_open = true;
     assert_eq!(app.find_matches_active().len(), 1);

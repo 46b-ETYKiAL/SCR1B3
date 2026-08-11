@@ -1132,7 +1132,7 @@ fn open_cfg_seeds_defaults_on_a_cold_install() {
 fn app_with_lines(line0: usize) -> (ScribeApp, egui::Context) {
     let (mut app, ctx) = app();
     let i = app.active;
-    app.tabs[i].text = "alpha\nbravo\ncharlie".to_string();
+    app.tabs[i].set_text("alpha\nbravo\ncharlie".to_string());
     set_caret_line0(&mut app, line0);
     (app, ctx)
 }
@@ -1240,7 +1240,7 @@ fn join_does_not_leave_a_leading_space_when_the_line_is_empty() {
     // would silently indent the joined text by one space.
     let (mut app, _ctx) = app();
     let i = app.active;
-    app.tabs[i].text = "\nbravo".to_string();
+    app.tabs[i].set_text("\nbravo".to_string());
     set_caret_line0(&mut app, 0);
 
     app.join_cursor_line_with_next();
@@ -1255,7 +1255,7 @@ fn join_does_not_leave_a_leading_space_when_the_line_is_empty() {
 fn join_does_not_leave_a_trailing_space_when_the_next_line_is_empty() {
     let (mut app, _ctx) = app();
     let i = app.active;
-    app.tabs[i].text = "alpha\n".to_string();
+    app.tabs[i].set_text("alpha\n".to_string());
     set_caret_line0(&mut app, 0);
 
     // "alpha\n" is ONE line once the phantom trailing element is popped, so
@@ -1270,7 +1270,7 @@ fn join_does_not_leave_a_trailing_space_when_the_next_line_is_empty() {
 fn join_collapses_indentation_of_the_joined_line() {
     let (mut app, _ctx) = app();
     let i = app.active;
-    app.tabs[i].text = "alpha   \n    bravo".to_string();
+    app.tabs[i].set_text("alpha   \n    bravo".to_string());
     set_caret_line0(&mut app, 0);
 
     app.join_cursor_line_with_next();
@@ -1306,7 +1306,7 @@ fn duplicate_line_on_an_empty_buffer_yields_two_empty_lines() {
     // pops the only line and the whole operation becomes a silent no-op.
     let (mut app, _ctx) = app();
     let i = app.active;
-    app.tabs[i].text = String::new();
+    app.tabs[i].set_text(String::new());
     set_caret_line0(&mut app, 0);
 
     app.duplicate_cursor_line();
@@ -1323,7 +1323,7 @@ fn duplicate_line_keeps_a_trailing_newline_from_growing() {
     // phantom empty last element must not be duplicated or counted as a line.
     let (mut app, _ctx) = app();
     let i = app.active;
-    app.tabs[i].text = "alpha\n".to_string();
+    app.tabs[i].set_text("alpha\n".to_string());
     set_caret_line0(&mut app, 0);
 
     app.duplicate_cursor_line();

@@ -184,7 +184,7 @@ impl ScribeApp {
             BuiltinCommand::StartLsp => self.start_lsp_for_active(),
             BuiltinCommand::FoldAll => {
                 if self.active < self.tabs.len() {
-                    let text = self.tabs[self.active].text.clone();
+                    let text = self.tabs[self.active].text.to_string();
                     // P2-4: markdown/text notes fold by heading section.
                     let lang = self.tabs[self.active].doc.language_hint();
                     let regions = crate::editor_features::fold_regions_for(&text, lang.as_deref());
@@ -432,9 +432,7 @@ impl ScribeApp {
     fn deliver_editor_event(&mut self, ctx: &egui::Context, event: egui::Event) {
         if self.active_editor_is_rope() {
             let tab = &mut self.tabs[self.active];
-            tab.rope_state
-                .get_or_insert_with(scribe_render::RopeEditorState::new)
-                .inject_event(event);
+            tab.text.rope_state_or_new().inject_event(event);
             // The queue is drained by the editor's next paint; make sure one
             // happens even if nothing else requested it.
             ctx.request_repaint();

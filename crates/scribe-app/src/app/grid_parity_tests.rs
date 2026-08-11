@@ -40,9 +40,9 @@ fn grid_config() -> Config {
 /// A two-pane grid app whose two tabs carry the supplied texts.
 fn grid_app(first: &str, second: &str) -> ScribeApp {
     let mut app = ScribeApp::new_test(grid_config());
-    app.tabs[0].text = first.to_string();
+    app.tabs[0].set_text(first.to_string());
     app.tabs.push(EditorTab::scratch());
-    app.tabs[1].text = second.to_string();
+    app.tabs[1].set_text(second.to_string());
     app
 }
 
@@ -161,7 +161,7 @@ fn grid_badge_clears_when_the_active_pane_returns_to_a_small_buffer() {
         h.query_by_label("[ ROPE ]").is_some(),
         "precondition: the big pane badges as ROPE"
     );
-    h.state_mut().tabs[0].text = "now tiny".into();
+    h.state_mut().tabs[0].set_text("now tiny".into());
     h.run();
     h.run();
     h.run();
@@ -222,7 +222,7 @@ fn crossing_the_rope_threshold_raises_a_one_shot_notice() {
     let mut cfg = grid_config();
     cfg.editor.grid_enabled = false; // the single-pane path, for isolation
     let mut app = ScribeApp::new_test(cfg);
-    app.tabs[0].text = big_text(400);
+    app.tabs[0].set_text(big_text(400));
 
     raw_frame(&mut app, &ctx);
     let toast = app
@@ -353,7 +353,7 @@ fn a_grid_pane_records_the_scroll_metrics_the_minimap_reads() {
     let mut cfg = grid_config();
     cfg.editor.rope_editor_auto_threshold_bytes = 0; // never auto-swap
     let mut app = ScribeApp::new_test(cfg);
-    app.tabs[0].text = big_text(300);
+    app.tabs[0].set_text(big_text(300));
     app.tabs.push(EditorTab::scratch());
     let mut h = harness(app);
     h.run();
@@ -380,7 +380,7 @@ fn page_down_in_a_grid_pane_moves_the_caret_a_whole_page() {
     let mut cfg = grid_config();
     cfg.editor.rope_editor_auto_threshold_bytes = 0; // TextEdit pane
     let mut app = ScribeApp::new_test(cfg);
-    app.tabs[0].text = big_text(300);
+    app.tabs[0].set_text(big_text(300));
     app.tabs.push(EditorTab::scratch());
     app.tabs[1].pinned = true; // tab 0 owns the unique Pin glyph
     let mut h = harness(app);
@@ -405,7 +405,7 @@ fn page_down_in_a_grid_pane_moves_the_caret_a_whole_page() {
     h.run();
 
     let caret = pane_caret(&h.ctx, doc0).expect("the pane editor stored a caret");
-    let text = h.state().tabs[0].text.clone();
+    let text = h.state().tabs[0].text.to_string();
     let line = line_of(&text, caret);
     assert!(
         line >= 5,
@@ -421,7 +421,7 @@ fn a_typed_character_replays_at_every_caret_in_a_grid_pane() {
     let mut cfg = grid_config();
     cfg.editor.rope_editor_auto_threshold_bytes = 0; // TextEdit pane
     let mut app = ScribeApp::new_test(cfg);
-    app.tabs[0].text = "abab".into();
+    app.tabs[0].set_text("abab".into());
     app.tabs.push(EditorTab::scratch());
     app.tabs[1].pinned = true; // tab 0 owns the unique Pin glyph
     let mut h = harness(app);
@@ -446,7 +446,7 @@ fn a_typed_character_replays_at_every_caret_in_a_grid_pane() {
         .push(egui::Event::Text("X".to_string()));
     h.run();
 
-    let text = h.state().tabs[0].text.clone();
+    let text = h.state().tabs[0].text.to_string();
     assert_eq!(
         text.matches('X').count(),
         2,
@@ -723,9 +723,9 @@ fn diag_grid_text() -> String {
 fn diag_grid_app(diags: Vec<Diagnostic>) -> ScribeApp {
     let mut app = ScribeApp::new_test(diag_grid_config());
     let text = diag_grid_text();
-    app.tabs[0].text.clone_from(&text);
+    app.tabs[0].set_text(text.clone());
     app.tabs.push(EditorTab::scratch());
-    app.tabs[1].text = text;
+    app.tabs[1].set_text(text);
     app.active = 0;
     app.diagnostics = diags;
     app
@@ -826,9 +826,9 @@ fn diag_grid_rope_config() -> Config {
 fn diag_grid_rope_app(diags: Vec<Diagnostic>) -> ScribeApp {
     let mut app = ScribeApp::new_test(diag_grid_rope_config());
     let text = diag_grid_text();
-    app.tabs[0].text.clone_from(&text);
+    app.tabs[0].set_text(text.clone());
     app.tabs.push(EditorTab::scratch());
-    app.tabs[1].text = text;
+    app.tabs[1].set_text(text);
     app.active = 0;
     app.diagnostics = diags;
     app
@@ -850,7 +850,7 @@ fn rope_pane_diag_ink(diags: Vec<Diagnostic>) -> Vec<[egui::Pos2; 2]> {
     );
     let active = app.active;
     assert!(
-        app.tabs[active].rope_state.is_some(),
+        app.tabs[active].text.rope_state().is_some(),
         "precondition: the active pane rendered through the OWNED ROPE arm — \
          `rope_state` is created by that arm and by nothing else here. Without \
          this, a blank or missing pane would look exactly like a passing \
@@ -956,7 +956,7 @@ fn the_single_pane_rope_path_still_paints_the_inline_diagnostic_squiggle() {
         cfg.editor.experimental_rope_editor = true;
         cfg.spellcheck.enabled = false; // its squiggle is the SAME #e53e3e
         let mut app = ScribeApp::new_test(cfg);
-        app.tabs[0].text = diag_grid_text();
+        app.tabs[0].set_text(diag_grid_text());
         app.diagnostics = diags;
 
         let err = error_color(&app);
@@ -969,7 +969,7 @@ fn the_single_pane_rope_path_still_paints_the_inline_diagnostic_squiggle() {
              grid tree this would be measuring the pane path instead"
         );
         assert!(
-            app.tabs[0].rope_state.is_some(),
+            app.tabs[0].text.rope_state().is_some(),
             "precondition: the rope arm must be the one rendering — `rope_state` \
              is created by that arm and by nothing else here"
         );
@@ -1163,7 +1163,7 @@ fn focus_the_pane(p: &Probe, app: &mut ScribeApp) {
 fn ctrl_clicking_a_wikilink_in_a_grid_pane_opens_the_note() {
     let v = vault();
     let mut app = grid_vault_app(&v.path);
-    app.tabs[0].text = wall_of("[[Target]]");
+    app.tabs[0].set_text(wall_of("[[Target]]"));
 
     let p = Probe::new();
     p.settle(&mut app);
@@ -1215,7 +1215,7 @@ fn ctrl_clicking_a_wikilink_in_a_grid_pane_opens_the_note() {
 fn a_plain_click_on_a_wikilink_in_a_grid_pane_opens_nothing() {
     let v = vault();
     let mut app = grid_vault_app(&v.path);
-    app.tabs[0].text = wall_of("[[Target]]");
+    app.tabs[0].set_text(wall_of("[[Target]]"));
 
     let p = Probe::new();
     p.settle(&mut app);
@@ -1236,7 +1236,7 @@ fn a_traversal_wikilink_clicked_in_a_grid_pane_is_refused() {
     let v = vault();
     let outside = v.path.parent().unwrap().to_path_buf();
     let mut app = grid_vault_app(&v.path);
-    app.tabs[0].text = wall_of("[[../escaped]]");
+    app.tabs[0].set_text(wall_of("[[../escaped]]"));
 
     let p = Probe::new();
     p.settle(&mut app);
@@ -1263,7 +1263,7 @@ fn a_traversal_wikilink_clicked_in_a_grid_pane_is_refused() {
 fn hovering_a_wikilink_in_a_grid_pane_previews_its_target() {
     let v = vault();
     let mut app = grid_vault_app(&v.path);
-    app.tabs[0].text = wall_of("[[Target|shown]]");
+    app.tabs[0].set_text(wall_of("[[Target|shown]]"));
 
     let p = Probe::new();
     p.settle(&mut app);
@@ -1282,7 +1282,7 @@ fn hovering_a_wikilink_in_a_grid_pane_previews_its_target() {
 fn ctrl_v_with_a_clipboard_image_pastes_into_a_grid_pane() {
     let v = vault();
     let mut app = grid_vault_app(&v.path);
-    app.tabs[0].text = "before\n".repeat(80);
+    app.tabs[0].set_text("before\n".repeat(80));
 
     let p = Probe::new();
     p.settle(&mut app);
@@ -1311,7 +1311,7 @@ fn ctrl_v_with_a_clipboard_image_pastes_into_a_grid_pane() {
     p.idle(&mut app); // deliver the queued insertion
     p.idle(&mut app); // …and let the pane editor settle it
 
-    let text = app.tabs[0].text.clone();
+    let text = app.tabs[0].text.to_string();
     assert!(
         text.contains("![pasted image](attachments/pasted-"),
         "Ctrl+V must insert the attachment markdown into the pane, got {text:?}"
@@ -1333,7 +1333,7 @@ fn ctrl_v_with_a_clipboard_image_pastes_into_a_grid_pane() {
 fn a_text_paste_in_a_grid_pane_is_not_hijacked_by_the_image_branch() {
     let v = vault();
     let mut app = grid_vault_app(&v.path);
-    app.tabs[0].text = "before\n".repeat(80);
+    app.tabs[0].set_text("before\n".repeat(80));
 
     let p = Probe::new();
     p.settle(&mut app);
@@ -1374,7 +1374,7 @@ fn a_text_paste_in_a_grid_pane_is_not_hijacked_by_the_image_branch() {
 fn ctrl_shift_v_does_not_paste_an_image_in_a_grid_pane() {
     let v = vault();
     let mut app = grid_vault_app(&v.path);
-    app.tabs[0].text = "before\n".repeat(80);
+    app.tabs[0].set_text("before\n".repeat(80));
 
     let p = Probe::new();
     p.settle(&mut app);
@@ -1412,7 +1412,7 @@ fn ctrl_shift_v_does_not_paste_an_image_in_a_grid_pane() {
 fn ctrl_b_wraps_the_selection_in_a_grid_pane() {
     let v = vault();
     let mut app = grid_vault_app(&v.path);
-    app.tabs[0].text = "hello world\n".repeat(80);
+    app.tabs[0].set_text("hello world\n".repeat(80));
 
     let p = Probe::new();
     p.settle(&mut app);

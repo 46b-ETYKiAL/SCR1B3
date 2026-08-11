@@ -71,7 +71,7 @@ fn app_with(text: &str) -> ScribeApp {
     let mut app = ScribeApp::new_test(Config::default());
     app.tabs.clear();
     let mut tab = super::EditorTab::scratch();
-    tab.text = text.to_string();
+    tab.set_text(text.to_string());
     tab.doc_id = crate::grid::DocId(1);
     app.tabs.push(tab);
     app.active = 0;
@@ -173,9 +173,11 @@ fn spell_count_stable_and_correct_across_idle_frames() {
     app.tabs.clear();
     let mut tab = super::EditorTab::scratch();
     // A plainly-misspelled token in prose so the whole-text scan flags it.
-    tab.text = "this is deffinitely wrong
+    tab.set_text(
+        "this is deffinitely wrong
 "
-    .to_string();
+        .to_string(),
+    );
     tab.doc_id = crate::grid::DocId(7);
     app.tabs.push(tab);
     app.active = 0;
@@ -227,7 +229,7 @@ fn spell_count_is_zero_when_spellcheck_disabled() {
     let mut app = ScribeApp::new_test(cfg);
     app.tabs.clear();
     let mut tab = super::EditorTab::scratch();
-    tab.text = "zzqqxx wwvvbb".to_string();
+    tab.set_text("zzqqxx wwvvbb".to_string());
     tab.doc_id = crate::grid::DocId(3);
     app.tabs.push(tab);
     app.active = 0;
@@ -248,11 +250,11 @@ fn spell_memo_recomputes_per_tab_not_stale_across_doc_ids() {
     let mut app = ScribeApp::new_test(cfg);
     app.tabs.clear();
     let mut t0 = super::EditorTab::scratch();
-    t0.text = String::new();
+    t0.set_text(String::new());
     t0.doc_id = crate::grid::DocId(1);
     app.tabs.push(t0);
     let mut t1 = super::EditorTab::scratch();
-    t1.text = "deffinitely zzqqxx".to_string();
+    t1.set_text("deffinitely zzqqxx".to_string());
     t1.doc_id = crate::grid::DocId(2);
     app.tabs.push(t1);
 
@@ -279,7 +281,7 @@ fn reload_spell_engine_picks_up_a_custom_dictionary() {
     let mut app = ScribeApp::new_test(cfg);
     app.tabs.clear();
     let mut tab = super::EditorTab::scratch();
-    tab.text = "zqxwv".to_string();
+    tab.set_text("zqxwv".to_string());
     tab.doc_id = crate::grid::DocId(9);
     app.tabs.push(tab);
     app.active = 0;

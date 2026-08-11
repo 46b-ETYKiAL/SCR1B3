@@ -161,7 +161,7 @@ fn find_navigate_cycles_through_matches_and_wraps() {
     // #R6 — the find bar can jump between matches (Next/Prev/F3), not just
     // count them.
     let mut app = ScribeApp::new_test(Config::default());
-    app.tabs[0].text = "foo bar foo baz foo".to_string(); // three "foo"
+    app.tabs[0].set_text("foo bar foo baz foo".to_string()); // three "foo"
     app.find_query = "foo".to_string();
     app.find_open = true;
     assert_eq!(app.find_matches_active().len(), 3);
@@ -255,7 +255,7 @@ fn closed_tabs_stack_is_capped_at_twenty() {
     app.tabs.clear();
     for i in 0..23u64 {
         let mut t = EditorTab::scratch();
-        t.text = format!("content{i}");
+        t.set_text(format!("content{i}"));
         t.doc_id = crate::grid::DocId(i + 1);
         app.tabs.push(t);
     }
@@ -335,7 +335,7 @@ fn close_tab_clamps_active_into_range() {
     app.tabs.clear();
     for i in 0..4u64 {
         let mut t = EditorTab::scratch();
-        t.text = format!("t{i}");
+        t.set_text(format!("t{i}"));
         t.doc_id = crate::grid::DocId(i + 1);
         app.tabs.push(t);
     }

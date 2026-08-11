@@ -386,17 +386,11 @@ impl ScribeApp {
                     let focus_id = super::drag_scroll::rope_editor_focus_id(ui);
                     let viewport = ui.max_rect();
                     let tab = &mut tabs[idx];
-                    // Lazily (re)build the persistent rope from `text`, as a
-                    // separate `is_none` check rather than `get_or_insert_with`
-                    // so the closure does not capture `tab` while `rope_buf` is
-                    // mutably borrowed (disjoint-field borrow).
-                    if tab.rope_buf.is_none() {
-                        tab.rope_buf = Some(scribe_core::buffer::Buffer::from_text(&tab.text));
-                    }
-                    let buf = tab.rope_buf.as_mut().expect("rope_buf set above");
-                    let state = tab
-                        .rope_state
-                        .get_or_insert_with(scribe_render::RopeEditorState::new);
+                    // Lazily (re)build the persistent rope from `text`, and the
+                    // editing state alongside it. Both come back from ONE call
+                    // because they are disjoint fields of one sealed struct and
+                    // the caller cannot take two `&mut` borrows into it.
+                    let (buf, state) = tab.text.ensure_rope_parts_mut();
                     let mut editor =
                         scribe_render::RopeEditor::new(buf, font.clone(), gutter_row_h)
                             .with_text_color(layout_fg)
@@ -410,16 +404,12 @@ impl ScribeApp {
                     let (resp, clipboard) = editor.show_editable(ui, state);
                     // Sync `text` from the rope ONLY on a real content edit — the
                     // O(n) `to_string()` runs on keystrokes, not every frame.
-                    if resp.content_changed {
-                        if let Some(rope) = tab.rope_buf.as_ref().and_then(|b| b.as_rope()) {
-                            tab.text = rope.to_string();
-                            tab.doc.mark_dirty();
-                        }
-                        tab.edit_gen = tab.edit_gen.wrapping_add(1);
+                    if resp.content_changed && tab.text.sync_from_rope() {
+                        tab.doc.mark_dirty();
                     }
                     let content_h = tab
-                        .rope_buf
-                        .as_ref()
+                        .text
+                        .rope_buf()
                         .and_then(scribe_core::buffer::Buffer::as_rope)
                         .map_or(1.0, |r| r.len_lines() as f32 * gutter_row_h);
                     // ---- Inline LSP diagnostics (single-pane rope parity) ----
@@ -473,7 +463,7 @@ impl ScribeApp {
                 // out of `set_text`'s reach. Drop it before the widget renders
                 // so a Ctrl+Z after an EXTERNAL replacement cannot
                 // `replace_with` the previous document over the new content.
-                if std::mem::take(&mut tabs[idx].textedit_undo_stale) {
+                if tabs[idx].text.take_textedit_undo_stale() {
                     if let Some(mut st) = egui::TextEdit::load_state(ui.ctx(), pane_id) {
                         st.clear_undoer();
                         st.store(ui.ctx(), pane_id);
@@ -503,23 +493,22 @@ impl ScribeApp {
                 }
                 let sa_out = sa.show(ui, |ui| {
                     let vp_h = ui.available_height();
-                    let editor = egui::TextEdit::multiline(&mut tabs[idx].text)
-                        .id(pane_id)
-                        .code_editor()
-                        .desired_width(f32::INFINITY)
-                        .desired_rows(20)
-                        .lock_focus(true)
-                        .layouter(&mut layouter);
-                    let out = editor.show(ui);
-                    // Wave-3: per-pane edit-gen bump (grid panes share the
-                    // single-slot caches; a focus/edit change is a key change).
-                    // The full invalidation, not just the gen bump: a bare
-                    // `edit_gen` bump leaves a stale `rope_buf` alive and the next
-                    // rope-path frame writes it back over `text`. See
-                    // `Tab::note_text_mutated`.
-                    if out.response.changed() {
-                        tabs[idx].note_text_mutated();
-                    }
+                    // Same seam as the single-pane editor: the `&mut String`
+                    // lives only inside this closure and `edit_with_widget`
+                    // performs the full invalidation off the widget's own
+                    // `.changed()`. This pane's `.changed()` arm used to be
+                    // guarded by a source-text scan that called itself "the ONLY
+                    // police on that arm"; the seam retires the need for one.
+                    let out = tabs[idx].text.edit_with_widget(|buf| {
+                        egui::TextEdit::multiline(buf)
+                            .id(pane_id)
+                            .code_editor()
+                            .desired_width(f32::INFINITY)
+                            .desired_rows(20)
+                            .lock_focus(true)
+                            .layouter(&mut layouter)
+                            .show(ui)
+                    });
                     // A right-click makes this pane the one the menu's commands
                     // act on — recorded BEFORE the menu is built so the pick is
                     // drained against the right document.
@@ -1190,7 +1179,7 @@ mod grid_methods_tests {
         // which CLEARS the multi-cursor — the Alt-drag silently collapses to
         // one caret. Kills 775:29.
         let mut app = app_with_tabs(1);
-        app.tabs[0].text = COLUMN_TEXT.into();
+        app.tabs[0].set_text(COLUMN_TEXT.into());
         let ctx = egui::Context::default();
         app.column_anchor = Some(0);
         let seen = ActivePaneObserved::default();
@@ -1211,7 +1200,7 @@ mod grid_methods_tests {
         // so the primary lands on the line the drag STARTED on and the dragged
         // line is demoted to a secondary. Kills 779:59 for both arms.
         let mut app = app_with_tabs(1);
-        app.tabs[0].text = COLUMN_TEXT.into();
+        app.tabs[0].set_text(COLUMN_TEXT.into());
         let ctx = egui::Context::default();
         app.column_anchor = Some(0);
         let seen = ActivePaneObserved::default();

@@ -114,7 +114,7 @@ impl ScribeApp {
                 self.find_case_sensitive,
                 self.find_whole_word,
             ),
-            tab.edit_gen,
+            tab.text.edit_gen(),
             tab.doc_id.raw(),
         );
         // Cache HIT: query, edit generation, and active document all unchanged

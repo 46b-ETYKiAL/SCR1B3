@@ -8,7 +8,7 @@ use super::{use_rope_editor, ScribeApp};
 use scribe_core::Config;
 
 fn gen(app: &ScribeApp) -> u64 {
-    app.tabs[app.active].edit_gen
+    app.tabs[app.active].text.edit_gen()
 }
 
 #[test]
@@ -39,7 +39,7 @@ fn set_text_advances_edit_gen() {
 #[test]
 fn direct_edit_commands_advance_edit_gen() {
     let mut app = ScribeApp::new_test(Config::default());
-    app.tabs[app.active].text = "alpha\nbravo\ncharlie\n".to_string();
+    app.tabs[app.active].set_text("alpha\nbravo\ncharlie\n".to_string());
     app.last_cursor_line_col = Some((2, 1)); // 1-based line 2 (bravo)
 
     let g = gen(&app);

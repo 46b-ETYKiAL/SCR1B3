@@ -10,7 +10,7 @@ fn large_buffer_spell_scan_stays_bounded() {
     let mut cfg = Config::default();
     cfg.spellcheck.enabled = true;
     let mut app = ScribeApp::new_test(cfg);
-    app.tabs[0].text = "word ".repeat(20_000); // ~100 KB / 20k words
+    app.tabs[0].set_text("word ".repeat(20_000)); // ~100 KB / 20k words
     let t = std::time::Instant::now();
     let _ = app.misspellings_for_active();
     // Memoized + linear; a generous ceiling that still catches an O(n^2)
@@ -25,7 +25,10 @@ fn large_buffer_spell_scan_stays_bounded() {
 fn hostile_buffer_content_does_not_panic() {
     let mut app = ScribeApp::new_test(Config::default());
     // NUL + control chars + a very long line + an RTL-override + combining.
-    app.tabs[0].text = format!("\0\u{1}\u{7f}{}\u{202e}rtl\u{0301}", "x".repeat(50_000));
+    app.tabs[0].set_text(format!(
+        "\0\u{1}\u{7f}{}\u{202e}rtl\u{0301}",
+        "x".repeat(50_000)
+    ));
     let _ = app.misspellings_for_active();
     let _ = app.spell_count();
     // Byte→char mapping must clamp, never index mid-codepoint or overflow.

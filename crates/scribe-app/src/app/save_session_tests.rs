@@ -16,7 +16,7 @@ fn trim_and_final_newline_on_save_take_effect() {
     let mut app = ScribeApp::new_test(cfg);
     app.open_path(p.clone());
     let active = app.active;
-    app.tabs[active].text = "alpha   \nbeta".into(); // trailing spaces, no final \n
+    app.tabs[active].set_text("alpha   \nbeta".into()); // trailing spaces, no final \n
     app.save_active();
     let on_disk = std::fs::read_to_string(&p).unwrap();
     assert!(
@@ -38,7 +38,7 @@ fn save_hygiene_is_a_noop_when_disabled() {
     let mut app = ScribeApp::new_test(cfg);
     app.open_path(p.clone());
     let active = app.active;
-    app.tabs[active].text = "alpha   ".into();
+    app.tabs[active].set_text("alpha   ".into());
     app.save_active();
     assert_eq!(
         std::fs::read_to_string(&p).unwrap(),

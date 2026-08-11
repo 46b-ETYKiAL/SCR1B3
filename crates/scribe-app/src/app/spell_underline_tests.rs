@@ -20,7 +20,7 @@ fn active_buffer_misspelling_is_detected_when_enabled() {
     let mut cfg = Config::default();
     cfg.spellcheck.enabled = true;
     let mut app = ScribeApp::new_test(cfg);
-    app.tabs[0].text = "this zxqwyzz is wrong".into();
+    app.tabs[0].set_text("this zxqwyzz is wrong".into());
     let found = app.misspellings_for_active();
     assert!(
         found.iter().any(|m| m.word.contains("zxqwyzz")),
@@ -33,6 +33,6 @@ fn no_misspellings_when_spellcheck_disabled() {
     let mut cfg = Config::default();
     cfg.spellcheck.enabled = false;
     let mut app = ScribeApp::new_test(cfg);
-    app.tabs[0].text = "zxqwyzz".into();
+    app.tabs[0].set_text("zxqwyzz".into());
     assert!(app.misspellings_for_active().is_empty());
 }

@@ -79,12 +79,12 @@ impl ScribeApp {
             return;
         }
         let tab = &mut self.tabs[active];
-        if tab.change_gen == Some(tab.edit_gen) {
+        if tab.change_gen == Some(tab.text.edit_gen()) {
             return; // cache is current
         }
         if tab.text.len() > CHANGE_BAR_MAX_BYTES {
             tab.change_states.clear();
-            tab.change_gen = Some(tab.edit_gen);
+            tab.change_gen = Some(tab.text.edit_gen());
             return;
         }
         tab.change_states = crate::change_bar::compute_change_states(
@@ -92,7 +92,7 @@ impl ScribeApp {
             &tab.saved_baseline,
             &tab.text,
         );
-        tab.change_gen = Some(tab.edit_gen);
+        tab.change_gen = Some(tab.text.edit_gen());
     }
 
     /// Convert the active buffer to Markdown (by file type) and save it as a
@@ -104,7 +104,7 @@ impl ScribeApp {
         if active >= self.tabs.len() {
             return;
         }
-        let text = self.tabs[active].text.clone();
+        let text = self.tabs[active].text.to_string();
         let ext = self.tabs[active].doc.language_hint();
         let md = crate::to_markdown::to_markdown(&text, ext.as_deref());
         let suggested = self.tabs[active]

@@ -58,7 +58,7 @@ impl ScribeApp {
             return 0;
         };
         let mut h = std::collections::hash_map::DefaultHasher::new();
-        tab.edit_gen.hash(&mut h);
+        tab.text.edit_gen().hash(&mut h);
         tab.doc_id.raw().hash(&mut h);
         self.config.spellcheck.check_comments.hash(&mut h);
         self.config.spellcheck.check_strings.hash(&mut h);
@@ -135,7 +135,7 @@ impl ScribeApp {
         let key = {
             use std::hash::{Hash, Hasher};
             let mut h = std::collections::hash_map::DefaultHasher::new();
-            tab.edit_gen.hash(&mut h);
+            tab.text.edit_gen().hash(&mut h);
             tab.doc_id.raw().hash(&mut h);
             h.finish()
         };
@@ -166,7 +166,7 @@ impl ScribeApp {
             return (1, 0, 0);
         };
         if let Some((gen, doc, counts)) = self.count_cache.borrow().as_ref() {
-            if *gen == tab.edit_gen && *doc == tab.doc_id {
+            if *gen == tab.text.edit_gen() && *doc == tab.doc_id {
                 return *counts;
             }
         }
@@ -184,7 +184,7 @@ impl ScribeApp {
             )
         };
         let counts = (lines, words, chars);
-        *self.count_cache.borrow_mut() = Some((tab.edit_gen, tab.doc_id, counts));
+        *self.count_cache.borrow_mut() = Some((tab.text.edit_gen(), tab.doc_id, counts));
         counts
     }
 

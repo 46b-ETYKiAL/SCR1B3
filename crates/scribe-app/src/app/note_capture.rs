@@ -1329,7 +1329,7 @@ mod tests {
         d.idle(&mut app);
         d.idle(&mut app);
 
-        let text = app.tabs[active].text.clone();
+        let text = app.tabs[active].text.to_string();
         assert!(
             text.contains("![pasted image](attachments/pasted-"),
             "the markdown must be inserted into the buffer, got {text:?}"
@@ -1360,7 +1360,7 @@ mod tests {
         cfg.editor.first_run_completed = true;
         let mut app = ScribeApp::new_test(cfg);
         app.new_daily_note();
-        let text = app.tabs[app.active].text.clone();
+        let text = app.tabs[app.active].text.to_string();
         let today = crate::datetime::now_iso8601_utc()[0..10].to_string();
         assert!(text.contains(&today), "{text:?}");
         assert!(!text.contains("{{"), "{text:?}");

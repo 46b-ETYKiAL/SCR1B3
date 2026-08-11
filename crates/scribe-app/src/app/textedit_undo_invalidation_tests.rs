@@ -54,7 +54,7 @@ fn app_with_text(text: &str) -> ScribeApp {
     let mut cfg = Config::default();
     cfg.editor.first_run_completed = true;
     let mut app = ScribeApp::new_test(cfg);
-    app.tabs[0].text = text.to_string();
+    app.tabs[0].set_text(text.to_string());
     app
 }
 
@@ -154,7 +154,7 @@ fn ctrl_z_after_a_silent_external_reload_cannot_resurrect_the_pre_reload_documen
         "precondition — this tab must render through the egui `TextEdit`"
     );
     assert!(
-        app.tabs[app.active].rope_state.is_none(),
+        app.tabs[app.active].text.rope_state().is_none(),
         "precondition — the rope path must not have claimed this tab"
     );
 
@@ -167,7 +167,7 @@ fn ctrl_z_after_a_silent_external_reload_cannot_resurrect_the_pre_reload_documen
         egui::Modifiers::NONE,
         vec![egui::Event::Text("X".to_string())],
     );
-    let typed = app.tabs[app.active].text.clone();
+    let typed = app.tabs[app.active].text.to_string();
     assert_ne!(
         typed, V1,
         "precondition — the keystroke must actually reach the buffer"
@@ -214,7 +214,7 @@ fn ctrl_z_after_a_silent_external_reload_cannot_resurrect_the_pre_reload_documen
     // -- the payload: one Ctrl+Z.
     d.key(&mut app, egui::Key::Z, egui::Modifiers::COMMAND);
 
-    let after = app.tabs[app.active].text.clone();
+    let after = app.tabs[app.active].text.to_string();
     assert_ne!(
         after, V1,
         "SILENT DATA LOSS — Ctrl+Z resurrected the pre-reload document over the \
@@ -262,13 +262,13 @@ fn ordinary_typing_is_still_undoable() {
         egui::Modifiers::NONE,
         vec![egui::Event::Text("Z".to_string())],
     );
-    let typed = app.tabs[app.active].text.clone();
+    let typed = app.tabs[app.active].text.to_string();
     assert_ne!(
         typed, BEFORE,
         "precondition — the keystroke must actually reach the buffer"
     );
     assert!(
-        !app.tabs[app.active].textedit_undo_stale,
+        !app.tabs[app.active].text.textedit_undo_stale(),
         "the user's own keystroke is NOT an external replacement — flagging it \
          would clear the very history undo needs"
     );
@@ -329,7 +329,7 @@ fn a_user_issued_buffer_command_is_still_undoable() {
         "precondition — the command must actually transform the buffer"
     );
     assert!(
-        !app.tabs[app.active].textedit_undo_stale,
+        !app.tabs[app.active].text.textedit_undo_stale(),
         "a user-issued in-buffer command routes through `set_text_keep_undo`, \
          which must NOT flag the undo history stale"
     );

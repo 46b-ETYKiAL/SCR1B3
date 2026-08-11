@@ -34,7 +34,7 @@ fn scenario6_external_change_while_dirty_flags_divergence_no_silent_overwrite() 
     let active = app.active;
 
     // The user types unsaved edits (tab becomes dirty: text != doc.text()).
-    app.tabs[active].text = "MY UNSAVED EDIT\n".into();
+    app.tabs[active].set_text("MY UNSAVED EDIT\n".into());
     assert!(
         app.tabs[active].is_dirty(),
         "the tab must be dirty after editing"
@@ -100,7 +100,7 @@ fn scenario6_no_external_change_when_disk_unchanged_is_a_noop() {
     // spurious banner) even with unsaved edits present.
     let (mut app, p, _dir) = app_with_open_file("stable\n");
     let active = app.active;
-    app.tabs[active].text = "unsaved\n".into();
+    app.tabs[active].set_text("unsaved\n".into());
     // Refresh disk_mtime to the file's CURRENT mtime so the poll sees no change.
     app.tabs[active].disk_mtime = file_mtime(&p);
 
@@ -120,7 +120,7 @@ fn scenario6_dirty_tab_external_change_survives_save_and_overwrites_with_user_in
     // path is the user explicitly choosing to overwrite the disk version.
     let (mut app, p, _dir) = app_with_open_file("disk original\n");
     let active = app.active;
-    app.tabs[active].text = "user version\n".into();
+    app.tabs[active].set_text("user version\n".into());
     std::fs::write(&p, "concurrent disk edit\n").unwrap();
     app.tabs[active].disk_mtime = None;
     app.poll_external_disk_changes(1);
