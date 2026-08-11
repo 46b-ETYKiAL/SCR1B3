@@ -31,9 +31,10 @@ one-liners high above the fold.
 
 ## Release artifacts
 
-Tag-driven releases (`v*`) attach per-OS binaries + installers, each with a
-per-file `<asset>.sha256` checksum alongside it, so the "Releases" page and
-`packaging/install.sh` resolve the latest build automatically.
+Tag-driven releases (`v*`) attach per-OS binaries + installers, each with its
+own `<asset>.minisig` signature, plus one signed `SHA256SUMS` +
+`SHA256SUMS.minisig` covering the whole release, so the "Releases" page and
+`packaging/install.sh` resolve and verify the latest build automatically.
 
 ## Recommended GitHub settings
 

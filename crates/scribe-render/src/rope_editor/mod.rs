@@ -38,7 +38,9 @@ use egui::text::LayoutJob;
 use egui::{Color32, FontId, TextFormat, Ui};
 use ropey::Rope;
 
+pub mod page_nav;
 mod tab_geometry;
+pub mod word_nav;
 use scribe_core::buffer::Buffer;
 use scribe_core::syntax::{Highlighter, HlSpan, IncrementalHighlightState};
 use tab_geometry::{col_to_rel_x, layout_line, rel_x_to_col};
@@ -162,6 +164,7 @@ impl<'a> RopeEditor<'a> {
                 visible_line_range: 0..0,
                 buffer_mode: BufferModeSeen::Mmap,
                 content_changed: false, // read-only `show` path — never edits
+                rows: std::collections::HashMap::new(),
             };
         };
         let total_lines = rope.len_lines();
@@ -227,11 +230,16 @@ impl<'a> RopeEditor<'a> {
             visible_line_range: scroll.inner,
             buffer_mode: BufferModeSeen::Rope,
             content_changed: false, // read-only `show` path — never edits
+            // The read-only browse path lays no per-row galley out, so there is
+            // no row geometry to publish and a host overlay must degrade rather
+            // than guess. See `RopeEditorResponse::rows`.
+            rows: std::collections::HashMap::new(),
         }
     }
 
     /// Editable variant: consume keyboard/clipboard input via [`apply_event`]
-    /// (only while focused), then render text + caret + selection. Returns the
+    /// (keyboard input only while focused; [injected](RopeEditorState::inject_event)
+    /// events always), then render text + caret + selection. Returns the
     /// response plus any text the host should write to the OS clipboard (from
     /// Copy/Cut). The editor takes keyboard focus on click. Caret geometry
     /// assumes the monospace editor font (one advance per char).
@@ -247,11 +255,21 @@ impl<'a> RopeEditor<'a> {
         let mut content_changed = false;
 
         // ---- input phase (mutates the rope) ----
-        if focused {
-            let events = ui.input(|i| i.events.clone());
+        // Host-injected events (a command-palette / menu Copy-Cut-Paste-Undo-Redo)
+        // apply whether or not this editor holds egui focus: an explicit command
+        // must neither require the user to have clicked into the editor first nor
+        // steal focus from wherever they are to be delivered. Keyboard events are
+        // still focus-gated — only the focused editor consumes typing.
+        let injected = state.take_injected();
+        if focused || !injected.is_empty() {
+            let events = if focused {
+                ui.input(|i| i.events.clone())
+            } else {
+                Vec::new()
+            };
             let snippets = self.snippets;
             if let Some(rope) = self.buffer.as_rope_mut() {
-                for ev in &events {
+                for ev in injected.iter().chain(events.iter()) {
                     // Snippet Tab-trigger: a plain Tab right after a known prefix
                     // expands the snippet instead of indenting. Checked before
                     // apply_event so the normal Tab-indent path is skipped on a hit.
@@ -310,6 +328,7 @@ impl<'a> RopeEditor<'a> {
                     visible_line_range: 0..0,
                     buffer_mode: BufferModeSeen::Mmap,
                     content_changed,
+                    rows: std::collections::HashMap::new(),
                 },
                 clipboard,
             );
@@ -359,10 +378,8 @@ impl<'a> RopeEditor<'a> {
         // non-uniform glyph width), so the click hit-test (after the scroll
         // closure) inverse-maps a pointer x through the SAME galley the row
         // painted with, instead of arithmetic on the monospace advance.
-        let mut line_galleys: std::collections::HashMap<
-            usize,
-            (std::sync::Arc<egui::Galley>, f32),
-        > = std::collections::HashMap::new();
+        let mut line_galleys: std::collections::HashMap<usize, RopeRowGeom> =
+            std::collections::HashMap::new();
 
         // ---- highlight phase (P-02 fix + C-01 cross-line correctness) ----
         //
@@ -463,7 +480,16 @@ impl<'a> RopeEditor<'a> {
                     // NOT `col * char_w`. `col_x(col)` is the absolute screen x
                     // of the left edge of column `col`.
                     let line_galley = layout_line(ui, s, font.clone(), text_color);
-                    line_galleys.insert(li, (line_galley.clone(), text_rect.left()));
+                    line_galleys.insert(
+                        li,
+                        RopeRowGeom {
+                            row_left: row.response.rect.left(),
+                            text_left: text_rect.left(),
+                            top: text_rect.top(),
+                            bottom: text_rect.bottom(),
+                            galley: line_galley.clone(),
+                        },
+                    );
                     let col_x = |col: usize| text_rect.left() + col_to_rel_x(&line_galley, col);
 
                     // Render-whitespace overlay: paint a faint `·` centered in
@@ -577,10 +603,42 @@ impl<'a> RopeEditor<'a> {
                 range
             });
 
+        // Record the viewport's row count for the NEXT frame's PageUp/PageDown
+        // (the input phase runs before this paint, so the step is always the
+        // last painted height — which is what the user just saw).
+        //
+        // Delegates to `page_rows_for_viewport` rather than repeating the
+        // arithmetic: a second inline copy is the one the app actually runs, so
+        // the extracted-and-tested version would prove nothing about it.
+        state.page_rows = page_rows_for_viewport(scroll.inner_rect.height(), line_h);
+
         // Pointer input: click to place the caret, click-drag to select,
         // shift-click to extend (TextEdit parity). Clicking also focuses the
         // editor so keyboard input flows.
         let area = ui.interact(scroll.inner_rect, editor_id, egui::Sense::click_and_drag());
+        // Right-click clipboard / history menu — parity with the `TextEdit`
+        // path's context menu. This crate deliberately carries no OS-clipboard
+        // dependency (Paste needs one, and Copy/Cut hand their text back to the
+        // host to write), so a pick is PUBLISHED as a [`RopeEditorAction`]
+        // request in ctx-data and the host drains it via
+        // [`take_rope_action_request`]. Without this the rope path had no
+        // right-click clipboard menu at all.
+        area.context_menu(|ui| {
+            ui.set_min_width(160.0);
+            let pick = |ui: &mut Ui, label: &str, action: RopeEditorAction| {
+                if ui.button(label).clicked() {
+                    ui.ctx()
+                        .data_mut(|d| d.insert_temp(rope_action_request_id(), action));
+                    ui.close();
+                }
+            };
+            pick(ui, "Cut", RopeEditorAction::Cut);
+            pick(ui, "Copy", RopeEditorAction::Copy);
+            pick(ui, "Paste", RopeEditorAction::Paste);
+            ui.separator();
+            pick(ui, "Undo", RopeEditorAction::Undo);
+            pick(ui, "Redo", RopeEditorAction::Redo);
+        });
         if area.clicked() || area.drag_started() {
             ui.memory_mut(|m| m.request_focus(editor_id));
         }
@@ -603,7 +661,7 @@ impl<'a> RopeEditor<'a> {
             let clicked_line = (range_start as f32 + rel)
                 .clamp(0.0, total_lines.saturating_sub(1) as f32)
                 as usize;
-            let galley = line_galleys.get(&clicked_line).map(|(g, _)| g.as_ref());
+            let galley = line_galleys.get(&clicked_line).map(|g| g.galley.as_ref());
             Some(pos_to_char_offset(
                 rope,
                 pos,
@@ -615,7 +673,35 @@ impl<'a> RopeEditor<'a> {
         };
         if let Some(pos) = area.interact_pointer_pos() {
             let (shift, alt) = ui.input(|i| (i.modifiers.shift, i.modifiers.alt));
-            if area.clicked() {
+            // Multi-click MUST be tested before the plain-click arm. egui's
+            // `double_clicked()` / `triple_clicked()` are `CLICKED && count == n`
+            // (see `Response::double_clicked_by`), so `clicked()` is ALSO true on
+            // the second and third click — a plain-click arm placed first would
+            // collapse the caret and the word/line selection would never survive
+            // the frame it was made in.
+            if area.triple_clicked() {
+                // Triple-click selects the whole line INCLUDING its newline, so
+                // the follow-up the gesture exists for (Ctrl+X / type-over)
+                // removes the line rather than leaving a blank one behind.
+                if let Some(off) = pos_to_offset(pos) {
+                    state.block_anchor = None;
+                    state.clear_extra_carets();
+                    let (s, e) = line_span(rope, off);
+                    state.edit = EditState::at(s);
+                    state.edit.cursor = e;
+                }
+            } else if area.double_clicked() {
+                // Double-click selects the word under the pointer, using the
+                // SAME `word_bounds` Ctrl+D expands from — so what a double-click
+                // selects and what Ctrl+D matches can never disagree.
+                if let Some(off) = pos_to_offset(pos) {
+                    state.block_anchor = None;
+                    state.clear_extra_carets();
+                    let (s, e) = editing::word_bounds(rope, off);
+                    state.edit = EditState::at(s);
+                    state.edit.cursor = e;
+                }
+            } else if area.clicked() {
                 if let Some(off) = pos_to_offset(pos) {
                     state.block_anchor = None;
                     state.clear_extra_carets();
@@ -685,9 +771,54 @@ impl<'a> RopeEditor<'a> {
                 visible_line_range: scroll.inner,
                 buffer_mode: BufferModeSeen::Rope,
                 content_changed,
+                rows: line_galleys,
             },
             clipboard,
         )
+    }
+}
+
+/// Where one visible row actually landed on screen this frame.
+///
+/// The `TextEdit` path hands its host a galley, which is how the app paints
+/// overlays (LSP diagnostic squiggles, gutter marks) at a COLUMN. This widget
+/// culls to the viewport and lays every row out itself, so the host had nothing
+/// to hang an overlay off and its overlays silently vanished on this path.
+/// Publishing the painted rect plus the SAME galley the row drew with is what
+/// closes that gap — and it means the host never re-derives the gutter width,
+/// the glyph advance or the scroll offset, the three things a host-side copy
+/// would desync on the moment this widget's layout changed.
+#[derive(Debug, Clone)]
+pub struct RopeRowGeom {
+    /// Absolute screen x of the row's left edge — the gutter's left edge when
+    /// line numbers are on. Where a host paints a per-line gutter marker.
+    pub row_left: f32,
+    /// Absolute screen x of character column 0 (i.e. past the gutter).
+    pub text_left: f32,
+    /// Absolute screen y of the row's text top / bottom.
+    pub top: f32,
+    pub bottom: f32,
+    /// The row's laid-out galley — the authority for column ↔ x, tab stops
+    /// included.
+    pub galley: std::sync::Arc<egui::Galley>,
+}
+
+impl RopeRowGeom {
+    /// Absolute screen x of the left edge of character column `col`.
+    ///
+    /// Resolved through the row's own galley, so a `\t` advances to its tab
+    /// stop instead of `col * char_w`. Columns past the end of the row clamp to
+    /// the row's right edge (`Galley::pos_from_cursor` does the clamping).
+    #[must_use]
+    pub fn col_x(&self, col: usize) -> f32 {
+        self.text_left + col_to_rel_x(&self.galley, col)
+    }
+
+    /// The character column nearest absolute screen x `x` — the inverse of
+    /// [`col_x`](Self::col_x), for a host hit-test.
+    #[must_use]
+    pub fn col_at_x(&self, x: f32) -> usize {
+        rel_x_to_col(&self.galley, x - self.text_left)
     }
 }
 
@@ -703,6 +834,15 @@ pub struct RopeEditorResponse {
     /// The app uses this to sync `tab.text` from the persistent rope ONLY
     /// when a real edit occurred — avoiding a per-frame `rope.to_string()`.
     pub content_changed: bool,
+    /// Painted geometry for every row that was visible this frame, keyed by
+    /// ABSOLUTE line number.
+    ///
+    /// Populated by [`show_editable`](RopeEditor::show_editable). EMPTY on the
+    /// read-only [`show`](RopeEditor::show) browse path and whenever the buffer
+    /// is still memory-mapped — neither lays a galley out per row, so a host
+    /// overlay has nothing to position against and must say so rather than
+    /// pretend it painted.
+    pub rows: std::collections::HashMap<usize, RopeRowGeom>,
 }
 
 /// Monospace text layout geometry for pointer hit-testing: the top-left of the
@@ -763,6 +903,47 @@ fn pos_to_char_offset(
     };
     let col = raw_col.min(len);
     line_start + col
+}
+
+/// `(start, end)` char indices of the whole line containing `cursor`, INCLUDING
+/// its line terminator — what a triple-click selects.
+///
+/// The terminator is inside the span on purpose: a triple-click is the gesture
+/// users follow with Cut / type-over to remove a line, and a span that stopped
+/// short of the `\n` would leave an empty line behind. The final line of a
+/// buffer with no trailing newline simply ends at `len_chars`.
+///
+/// A free function rather than an inline block in the pointer handler for the
+/// same reason `page_rows_for_viewport` is: inline it would be reachable only
+/// through a live painted frame, where its arithmetic could drift unobserved.
+fn line_span(rope: &Rope, cursor: usize) -> (usize, usize) {
+    let n = rope.len_chars();
+    let c = cursor.min(n);
+    let line = rope.char_to_line(c);
+    let start = rope.line_to_char(line);
+    let end = if line + 1 < rope.len_lines() {
+        rope.line_to_char(line + 1)
+    } else {
+        n
+    };
+    (start, end)
+}
+
+/// Rows one PageUp/PageDown moves by, for a painted viewport of `viewport_h`
+/// at `line_h` per row.
+///
+/// One row is held back so a page keeps a line of context, matching every other
+/// editor, and the result is never 0 — a viewport too short for even one row
+/// still has to move the caret, or PageDown would do nothing forever.
+///
+/// Extracted from `show_editable` deliberately: inline, this arithmetic was
+/// reachable only through a live painted frame, so `/` could become `%` or `*`
+/// with nothing able to observe it (ADR-0007 "egui-paint"). As a free function
+/// it is ordinary testable math.
+fn page_rows_for_viewport(viewport_h: f32, line_h: f32) -> usize {
+    ((viewport_h / line_h).floor() as usize)
+        .saturating_sub(1)
+        .max(1)
 }
 
 /// Decimal digits needed to print the largest line number (>= 1).
@@ -980,6 +1161,55 @@ pub struct RopeEditorState {
     /// Edit-generation-keyed whole-document highlight cache (P-02 fix +
     /// C-01 cross-line correctness). See [`HighlightCache`].
     hl_cache: HighlightCache,
+    /// Rows of text the viewport showed on the last painted frame — the step
+    /// PageUp/PageDown moves by. Refreshed by `show_editable` each frame (so
+    /// it tracks window resizes / zoom); [`DEFAULT_PAGE_ROWS`] until the first
+    /// paint, and for headless callers that drive `apply_event` directly.
+    page_rows: usize,
+    /// Host-injected input events awaiting the next `show_editable` pass — the
+    /// delivery channel for a command-palette / menu Copy-Cut-Paste-Undo-Redo.
+    /// Applied REGARDLESS of egui focus (see [`RopeEditorState::inject_event`]).
+    injected: Vec<egui::Event>,
+}
+
+/// PageUp/PageDown step used before the first paint has reported a real
+/// viewport height (and by headless `apply_event` callers).
+pub const DEFAULT_PAGE_ROWS: usize = 20;
+
+/// A clipboard / history action picked from the rope editor's right-click
+/// context menu.
+///
+/// The menu cannot execute these itself: Paste needs to READ the OS clipboard
+/// and Copy/Cut need their text WRITTEN to it, and this crate owns no clipboard
+/// dependency. So a pick is published as a request and the host — which already
+/// owns the `arboard` round-trip for the palette route — drains and executes it
+/// via [`take_rope_action_request`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RopeEditorAction {
+    Copy,
+    Cut,
+    Paste,
+    Undo,
+    Redo,
+}
+
+/// ctx-data key a context-menu pick is published under.
+fn rope_action_request_id() -> egui::Id {
+    egui::Id::new("scr1b3-rope-action-request")
+}
+
+/// Take (and clear) a context-menu action request published by the rope
+/// editor's right-click menu, if one is pending. `None` when nothing was
+/// picked. The host calls this once per frame.
+pub fn take_rope_action_request(ctx: &egui::Context) -> Option<RopeEditorAction> {
+    ctx.data_mut(|d| {
+        let id = rope_action_request_id();
+        let v = d.get_temp::<RopeEditorAction>(id);
+        if v.is_some() {
+            d.remove::<RopeEditorAction>(id);
+        }
+        v
+    })
 }
 
 impl Default for RopeEditorState {
@@ -991,6 +1221,8 @@ impl Default for RopeEditorState {
             block_anchor: None,
             edit_gen: 0,
             hl_cache: HighlightCache::default(),
+            page_rows: DEFAULT_PAGE_ROWS,
+            injected: Vec::new(),
         }
     }
 }
@@ -998,6 +1230,31 @@ impl Default for RopeEditorState {
 impl RopeEditorState {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Queue an input event for the next [`RopeEditor::show_editable`] pass.
+    ///
+    /// Injected events are applied whether or not the editor holds egui
+    /// keyboard focus. That is what makes a command-palette / context-menu
+    /// Copy-Cut-Paste-Undo-Redo actually land on the rope path: the host cannot
+    /// deliver those by pushing an `egui::Event` and calling `request_focus`,
+    /// because the rope editor's focus id is derived from the `Ui` it is shown
+    /// in (`ui.id().with("scr1b3-rope-editable")`) and is not reproducible from
+    /// outside the render closure — and stealing focus to deliver a command is
+    /// itself a defect (it yanks the caret out of whatever the user is in).
+    pub fn inject_event(&mut self, ev: egui::Event) {
+        self.injected.push(ev);
+    }
+
+    /// Number of injected events not yet applied by a `show_editable` pass.
+    #[must_use]
+    pub fn injected_len(&self) -> usize {
+        self.injected.len()
+    }
+
+    /// Take the queued injected events, leaving the queue empty.
+    fn take_injected(&mut self) -> Vec<egui::Event> {
+        std::mem::take(&mut self.injected)
     }
 
     /// Clamp the caret/anchor into the current rope (after an external content
@@ -1131,10 +1388,22 @@ pub fn apply_event(
     // flag explicitly in their arms.
     let len_before = rope.len_chars();
 
+    // Record the pre-edit snapshot for an edit of `$kind`.
+    //
+    // The snapshot is built LAZILY (`History::record_with`) because a
+    // coalescing record — every keystroke of a typing run after the first —
+    // DISCARDS it. Built eagerly, `rope.to_string()` copied the entire buffer
+    // on every keypress and then threw the copy away, which is worst exactly at
+    // the multi-MiB sizes the rope path exists to make fast. `record_with` is
+    // defined in terms of the same predicate `record` uses, so the coalescing
+    // (and therefore undo/redo) semantics are unchanged — only the cost is.
     macro_rules! record_before {
         ($kind:expr) => {{
-            let before = Snapshot::new(rope.to_string(), state.edit.cursor);
-            state.history.record(before, $kind);
+            let cursor = state.edit.cursor;
+            let rope_ref = &*rope;
+            state
+                .history
+                .record_with($kind, || Snapshot::new(rope_ref.to_string(), cursor));
         }};
     }
 
@@ -1147,6 +1416,34 @@ pub fn apply_event(
             state.set_carets(carets);
         }};
     }
+    // Wrap a body that WRITES text into the rope, setting `mutated` BY
+    // CONSTRUCTION instead of leaving it to the length-delta derivation at the
+    // end of this function.
+    //
+    // That derivation is a PROXY, and it is blind to a same-length write:
+    // `editing::insert` (and `replace_selection`) delete the selection before
+    // inserting, so replacing an N-char selection with N chars — select "cat",
+    // type/paste/IME-commit "dog" — leaves `len_chars()` identical. The flag
+    // stayed false, `show_editable` never folded it into `content_changed`, and
+    // the app never ran `tab.text = rope.to_string()`. The rope held the edit
+    // and RENDERED it while `tab.text` still held the pre-edit content, so the
+    // edit was absent from the save, from `is_dirty()` (close discards it with
+    // no prompt), and from the hot-exit backup (which gates on `is_dirty()`).
+    //
+    // Only two arms set the flag explicitly before this — Ctrl+U case-toggle
+    // and undo/redo — which is exactly why those two same-length edits worked
+    // and every other one did not.
+    //
+    // An insertion is a content write whether or not the bytes happen to
+    // coincide with what was there, so this can over-report when a selection is
+    // replaced by identical text. That costs one redundant `to_string()` sync;
+    // the opposite error costs the user's work, so the flag fails toward true.
+    macro_rules! writes_content {
+        ($body:expr) => {{
+            $body;
+            out.mutated = true;
+        }};
+    }
     // Move every caret (no text change → no offset management needed).
     macro_rules! move_all {
         ($f:expr) => {{
@@ -1157,6 +1454,25 @@ pub fn apply_event(
             state.set_carets(carets);
         }};
     }
+    // Step the snapshot history one entry in either direction. Shared by
+    // Ctrl+Z, Ctrl+Shift+Z and Ctrl+Y so the three chords cannot drift apart.
+    macro_rules! history_step {
+        ($dir:ident) => {{
+            state.clear_extra_carets();
+            let current = Snapshot::new(rope.to_string(), state.edit.cursor);
+            if let Some(snap) = state.history.$dir(current) {
+                *rope = Rope::from_str(&snap.text);
+                state.edit = EditState::at(snap.cursor);
+                out.mutated = true;
+            }
+            out.consumed = true;
+        }};
+    }
+
+    // Rows one PageUp/PageDown moves by, measured from the last painted
+    // viewport (see `RopeEditorState::page_rows`). Read before the match so the
+    // caret-vector borrow in `move_all!` cannot conflict with it.
+    let page_rows = state.page_rows;
 
     match event {
         Event::Text(text) if !text.is_empty() => {
@@ -1190,21 +1506,25 @@ pub fn apply_event(
                 if state.edit.has_selection() {
                     let sel = editing::selected_text(rope, &state.edit);
                     let wrapped = format!("{text}{sel}{close}");
-                    editing::replace_selection(rope, &mut state.edit, &wrapped);
+                    writes_content!(editing::replace_selection(rope, &mut state.edit, &wrapped));
                 } else {
                     let pair = format!("{text}{close}");
-                    editing::insert(rope, &mut state.edit, &pair);
+                    writes_content!(editing::insert(rope, &mut state.edit, &pair));
                     state.edit.cursor = state.edit.cursor.saturating_sub(1);
                     state.edit.anchor = state.edit.cursor;
                 }
             } else {
-                edit_all!(|r: &mut Rope, st: &mut EditState| editing::insert(r, st, text));
+                writes_content!(edit_all!(|r: &mut Rope, st: &mut EditState| {
+                    editing::insert(r, st, text)
+                }));
             }
             out.consumed = true;
         }
         Event::Paste(text) if !text.is_empty() => {
             record_before!(EditKind::Other);
-            edit_all!(|r: &mut Rope, st: &mut EditState| editing::insert(r, st, text));
+            writes_content!(edit_all!(|r: &mut Rope, st: &mut EditState| {
+                editing::insert(r, st, text)
+            }));
             out.consumed = true;
         }
         // IME composition (CJK, dead-keys, compose). The OS candidate window
@@ -1216,7 +1536,9 @@ pub fn apply_event(
             match ime {
                 egui::ImeEvent::Commit(text) if !text.is_empty() => {
                     record_before!(EditKind::Other);
-                    edit_all!(|r: &mut Rope, st: &mut EditState| editing::insert(r, st, text));
+                    writes_content!(edit_all!(|r: &mut Rope, st: &mut EditState| {
+                        editing::insert(r, st, text)
+                    }));
                 }
                 _ => {}
             }
@@ -1291,6 +1613,19 @@ pub fn apply_event(
                     }
                     out.consumed = true;
                 }
+                // Ctrl+Backspace / Ctrl+Delete delete a whole word. Both arms
+                // MUST precede the plain Backspace/Delete arms below, which
+                // carry no modifier guard and would otherwise shadow them.
+                Key::Backspace if cmd => {
+                    record_before!(EditKind::Delete);
+                    edit_all!(word_nav::delete_word_prev);
+                    out.consumed = true;
+                }
+                Key::Delete if cmd => {
+                    record_before!(EditKind::Delete);
+                    edit_all!(word_nav::delete_word_next);
+                    out.consumed = true;
+                }
                 Key::Backspace => {
                     record_before!(EditKind::Delete);
                     edit_all!(editing::backspace);
@@ -1308,9 +1643,11 @@ pub fn apply_event(
                         // whitespace onto the new line.
                         let ws = editing::leading_whitespace(rope, state.edit.cursor);
                         let nl = format!("\n{ws}");
-                        editing::insert(rope, &mut state.edit, &nl);
+                        writes_content!(editing::insert(rope, &mut state.edit, &nl));
                     } else {
-                        edit_all!(|r: &mut Rope, st: &mut EditState| editing::insert(r, st, "\n"));
+                        writes_content!(edit_all!(|r: &mut Rope, st: &mut EditState| {
+                            editing::insert(r, st, "\n")
+                        }));
                     }
                     out.consumed = true;
                 }
@@ -1327,9 +1664,14 @@ pub fn apply_event(
                         // Tab indents every line of a multi-line selection.
                         editing::indent_lines(rope, &mut state.edit, "    ", false);
                     } else {
-                        edit_all!(|r: &mut Rope, st: &mut EditState| editing::insert(
-                            r, st, "    "
-                        ));
+                        // Tab over an N-char selection inserts 4 chars — with a
+                        // 4-char selection that is another same-length write.
+                        // (The two `indent_lines` branches above stay
+                        // length-derived: an outdent with nothing to remove is a
+                        // genuine no-op and must NOT report a change.)
+                        writes_content!(edit_all!(|r: &mut Rope, st: &mut EditState| {
+                            editing::insert(r, st, "    ");
+                        }));
                     }
                     out.consumed = true;
                 }
@@ -1353,6 +1695,22 @@ pub fn apply_event(
                         editing::replace_selection(rope, &mut state.edit, &cased);
                         out.mutated = true; // same-length edit — not length-derived
                     }
+                    out.consumed = true;
+                }
+                // Ctrl+Left / Ctrl+Right (and their Shift-extending forms) jump
+                // by a word, using the SAME boundary functions egui's TextEdit
+                // path uses — see `word_nav`. Guarded arms first: the plain
+                // arrow arms below have no modifier guard.
+                Key::ArrowLeft if cmd => {
+                    move_all!(|r: &mut Rope, c: &mut EditState| word_nav::move_word(
+                        r, c, -1, shift
+                    ));
+                    out.consumed = true;
+                }
+                Key::ArrowRight if cmd => {
+                    move_all!(|r: &mut Rope, c: &mut EditState| word_nav::move_word(
+                        r, c, 1, shift
+                    ));
                     out.consumed = true;
                 }
                 Key::ArrowLeft => {
@@ -1379,6 +1737,34 @@ pub fn apply_event(
                     ));
                     out.consumed = true;
                 }
+                // PageUp/PageDown — egui implements neither on any path, so
+                // both editors get them from `page_nav`. The step is the last
+                // painted viewport's row count.
+                Key::PageUp => {
+                    move_all!(|r: &mut Rope, c: &mut EditState| page_nav::move_page(
+                        r, c, -1, page_rows, shift
+                    ));
+                    out.consumed = true;
+                }
+                Key::PageDown => {
+                    move_all!(|r: &mut Rope, c: &mut EditState| page_nav::move_page(
+                        r, c, 1, page_rows, shift
+                    ));
+                    out.consumed = true;
+                }
+                // Ctrl+Home / Ctrl+End jump to the document ends. They collapse
+                // to a single caret first: every caret would otherwise land on
+                // the same offset and be deduped into one anyway.
+                Key::Home if cmd => {
+                    state.clear_extra_carets();
+                    word_nav::move_document(rope, &mut state.edit, -1, shift);
+                    out.consumed = true;
+                }
+                Key::End if cmd => {
+                    state.clear_extra_carets();
+                    word_nav::move_document(rope, &mut state.edit, 1, shift);
+                    out.consumed = true;
+                }
                 Key::Home => {
                     move_all!(|r: &mut Rope, c: &mut EditState| editing::move_line_start(
                         r, c, shift
@@ -1396,33 +1782,32 @@ pub fn apply_event(
                     editing::select_all(rope, &mut state.edit);
                     out.consumed = true;
                 }
-                Key::Z if cmd && !shift => {
-                    state.clear_extra_carets();
-                    let current = Snapshot::new(rope.to_string(), state.edit.cursor);
-                    if let Some(prev) = state.history.undo(current) {
-                        *rope = Rope::from_str(&prev.text);
-                        state.edit = EditState::at(prev.cursor);
-                        out.mutated = true;
-                    }
-                    out.consumed = true;
-                }
-                Key::Z if cmd && shift => {
-                    state.clear_extra_carets();
-                    let current = Snapshot::new(rope.to_string(), state.edit.cursor);
-                    if let Some(next) = state.history.redo(current) {
-                        *rope = Rope::from_str(&next.text);
-                        state.edit = EditState::at(next.cursor);
-                        out.mutated = true;
-                    }
-                    out.consumed = true;
-                }
+                Key::Z if cmd && !shift => history_step!(undo),
+                Key::Z if cmd && shift => history_step!(redo),
+                // Ctrl+Y is the Windows redo chord; egui's TextEdit path binds
+                // it too (`text_edit/builder.rs`), so the rope path matches.
+                //
+                // `!shift` for the same reason the two Z arms above carry their
+                // guards: without it Ctrl+SHIFT+Y also redid, so the arm claimed
+                // a chord it was never meant to own and consumed the event —
+                // making Ctrl+Shift+Y unavailable to anything else.
+                Key::Y if cmd && !shift => history_step!(redo),
                 _ => {}
             }
         }
         _ => {}
     }
-    // Most edits change length — derive `mutated` from that, OR'd with the
-    // explicit same-length flags set above.
+    // BACKSTOP ONLY — never the primary signal. Every arm that WRITES text sets
+    // `mutated` explicitly (via `writes_content!`, plus the two long-standing
+    // explicit sites: Ctrl+U case-toggle and undo/redo). This length delta
+    // catches the delete-class ops (backspace, delete, delete-line, outdent),
+    // which are the ops that can legitimately be NO-OPS — at a buffer edge, or
+    // outdenting a line with no leading whitespace — and so must report false
+    // when nothing happened.
+    //
+    // It must not be relied on for writes: a same-length replacement leaves the
+    // delta at zero, and treating that as "no change" is the false negative
+    // that silently discarded the user's edit.
     out.mutated = out.mutated || rope.len_chars() != len_before;
     // Bump the edit generation on any real content change so the
     // highlight cache (keyed on `edit_gen`) recomputes exactly once per edit —
@@ -1643,6 +2028,400 @@ mod tests {
         assert_eq!(r.to_string(), "ab\ncd\n", "each X removed");
     }
 
+    /// A key event with every modifier stated explicitly, so a test can press
+    /// the NEAR MISSES of a guarded chord and not just the chord itself.
+    fn key_mods(key: egui::Key, shift: bool, cmd: bool, alt: bool) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers {
+                shift,
+                command: cmd,
+                ctrl: cmd,
+                alt,
+                ..Default::default()
+            },
+        }
+    }
+
+    // ---- guard exactness: an arm must fire on its chord and NOTHING else ----
+    //
+    // Every guarded arm in `apply_event` is a CONJUNCTION (`alt && cmd`,
+    // `cmd && !shift && !alt`, `cmd && shift`). A conjunction that drifts into
+    // a disjunction still passes every test that only ever presses the RIGHT
+    // chord — the arm keeps working, it just also swallows chords that belong
+    // to the plain-arrow arms below it or to the app level. The only way to see
+    // that is to press the near misses, which is what these do.
+
+    #[test]
+    fn adding_a_caret_requires_alt_and_ctrl_together_not_either_alone() {
+        for key in [egui::Key::ArrowDown, egui::Key::ArrowUp] {
+            for (cmd, alt, what) in [(true, false, "Ctrl"), (false, true, "Alt")] {
+                let mut r = Rope::from_str("ab\ncd\nef\n");
+                let mut st = RopeEditorState::new();
+                st.edit = EditState::at(3); // middle line: both directions exist
+                apply_event(&mut r, &mut st, &key_mods(key, false, cmd, alt));
+                assert!(
+                    !st.is_multi(),
+                    "{what}+{key:?} alone must NOT add a caret — only Ctrl+Alt does"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ctrl_alt_up_adds_the_caret_on_the_line_above_not_below() {
+        let mut r = Rope::from_str("ab\ncd\nef\n");
+        let mut st = RopeEditorState::new();
+        st.edit = EditState::at(3); // line 1, col 0
+        apply_event(&mut r, &mut st, &alt_cmd_key(egui::Key::ArrowUp));
+        assert!(st.is_multi(), "a second caret was added");
+        // WHERE the caret landed is only observable by editing at both of them.
+        apply_event(&mut r, &mut st, &text_event("!"));
+        assert_eq!(
+            r.to_string(),
+            "!ab\n!cd\nef\n",
+            "Ctrl+Alt+Up must add the caret ABOVE (line 0), not below"
+        );
+    }
+
+    #[test]
+    fn ctrl_d_fires_on_exactly_ctrl_d_and_no_near_miss() {
+        // Ctrl+Shift+D is duplicate-line at the app level and Ctrl+Alt+D is
+        // unbound; both must fall through untouched, as must a bare D (which
+        // arrives as text, never as a rope-editor command).
+        for (shift, cmd, alt, what) in [
+            (false, false, false, "plain D"),
+            (true, false, false, "Shift+D"),
+            (true, true, false, "Ctrl+Shift+D"),
+            (false, true, true, "Ctrl+Alt+D"),
+        ] {
+            let mut r = Rope::from_str("foo bar foo");
+            let mut st = RopeEditorState::new();
+            st.edit = EditState::at(1);
+            let out = apply_event(&mut r, &mut st, &key_mods(egui::Key::D, shift, cmd, alt));
+            assert!(
+                !out.consumed,
+                "{what} must not be consumed by the rope path"
+            );
+            assert!(!st.edit.has_selection(), "{what} must not select the word");
+            assert!(!st.is_multi(), "{what} must not add an occurrence caret");
+        }
+    }
+
+    #[test]
+    fn tab_on_a_single_line_selection_replaces_it_instead_of_indenting_the_line() {
+        // The multi-line branch indents every selected LINE; the single-line
+        // branch replaces the SELECTION. Only the multi-line half was pinned,
+        // so the `multiline && extra.is_empty()` test could flip to `||` (or the
+        // line comparison to `==`) and still pass.
+        let mut r = Rope::from_str("ab cd\n");
+        let mut st = RopeEditorState::new();
+        st.edit = EditState {
+            anchor: 0,
+            cursor: 2, // "ab", entirely within line 0
+            goal_col: None,
+        };
+        apply_event(&mut r, &mut st, &key_ev(egui::Key::Tab, false, false));
+        assert_eq!(
+            r.to_string(),
+            "     cd\n",
+            "the SELECTION became four spaces; the line was not indented"
+        );
+    }
+
+    #[test]
+    fn delete_line_fires_on_exactly_ctrl_shift_k() {
+        for (shift, cmd, what) in [
+            (false, true, "Ctrl+K"),
+            (true, false, "Shift+K"),
+            (false, false, "plain K"),
+        ] {
+            let mut r = Rope::from_str("keep\ndrop\n");
+            let mut st = RopeEditorState::new();
+            st.edit = EditState::at(6); // on "drop"
+            let out = apply_event(&mut r, &mut st, &key_ev(egui::Key::K, shift, cmd));
+            assert!(!out.consumed, "{what} is not the delete-line chord");
+            assert_eq!(r.to_string(), "keep\ndrop\n", "{what} deleted a line");
+        }
+    }
+
+    #[test]
+    fn undo_and_redo_ignore_the_bare_keys() {
+        // Undo first, so a REDO is genuinely available: a stray redo then has a
+        // visible content effect instead of being a silent no-op that a
+        // content-only assertion would miss.
+        for (key, shift, what) in [
+            (egui::Key::Z, false, "plain Z"),
+            (egui::Key::Z, true, "Shift+Z"),
+            (egui::Key::Y, false, "plain Y"),
+            (egui::Key::Y, true, "Shift+Y"),
+        ] {
+            let mut r = Rope::from_str("");
+            let mut st = RopeEditorState::new();
+            for ch in ["a", "b", "c"] {
+                apply_event(&mut r, &mut st, &text_event(ch));
+            }
+            apply_event(&mut r, &mut st, &key_ev(egui::Key::Z, false, true));
+            assert_eq!(r.to_string(), "", "precondition: undone, a redo is queued");
+
+            let out = apply_event(&mut r, &mut st, &key_mods(key, shift, false, false));
+            assert!(!out.consumed, "{what} is not an undo/redo chord");
+            assert_eq!(r.to_string(), "", "{what} must not step history");
+        }
+    }
+
+    // ---- keyboard-parity wiring (plan: rope-path key parity) ----
+    //
+    // These drive `apply_event` — the real dispatch — rather than the
+    // `word_nav` / `page_nav` primitives, so they fail if a binding is removed
+    // from the match even while the underlying function still works.
+
+    /// 6 lines so a 20-row page (the headless [`DEFAULT_PAGE_ROWS`]) clamps.
+    fn paged_doc() -> Rope {
+        Rope::from_str("aaaa\nbb\ncccccc\nd\neeeee\nffff")
+    }
+
+    #[test]
+    fn ctrl_arrows_move_by_word_and_shift_extends() {
+        let mut r = Rope::from_str("alpha beta gamma");
+        let mut st = RopeEditorState::new();
+
+        apply_event(&mut r, &mut st, &key_ev(egui::Key::ArrowRight, false, true));
+        assert_eq!(st.edit.cursor, 5, "Ctrl+Right jumped a word, not a char");
+        assert!(!st.edit.has_selection());
+
+        apply_event(&mut r, &mut st, &key_ev(egui::Key::ArrowRight, true, true));
+        assert_eq!(st.edit.anchor, 5, "Ctrl+Shift+Right pinned the anchor");
+        assert!(st.edit.has_selection(), "and selected");
+
+        let mut st = RopeEditorState::new();
+        st.edit = EditState::at(11);
+        apply_event(&mut r, &mut st, &key_ev(egui::Key::ArrowLeft, false, true));
+        assert!(st.edit.cursor < 11, "Ctrl+Left jumped back");
+        assert!(!st.edit.has_selection());
+    }
+
+    #[test]
+    fn plain_arrows_still_move_by_one_char() {
+        // The guarded Ctrl arms are declared FIRST in the match; this pins that
+        // they did not shadow the unmodified arrows.
+        let mut r = Rope::from_str("alpha beta");
+        let mut st = RopeEditorState::new();
+        apply_event(
+            &mut r,
+            &mut st,
+            &key_ev(egui::Key::ArrowRight, false, false),
+        );
+        assert_eq!(st.edit.cursor, 1);
+    }
+
+    #[test]
+    fn ctrl_backspace_and_ctrl_delete_remove_a_word() {
+        let mut r = Rope::from_str("alpha beta");
+        let mut st = RopeEditorState::new();
+        st.edit = EditState::at(10);
+        apply_event(&mut r, &mut st, &key_ev(egui::Key::Backspace, false, true));
+        assert_eq!(r.to_string(), "alpha ");
+
+        let mut r = Rope::from_str("alpha beta");
+        let mut st = RopeEditorState::new();
+        apply_event(&mut r, &mut st, &key_ev(egui::Key::Delete, false, true));
+        assert_eq!(r.to_string(), " beta");
+    }
+
+    #[test]
+    fn ctrl_backspace_at_line_start_joins_the_previous_line() {
+        let mut r = Rope::from_str("alpha beta\ngamma");
+        let mut st = RopeEditorState::new();
+        st.edit = EditState::at(r.line_to_char(1));
+        apply_event(&mut r, &mut st, &key_ev(egui::Key::Backspace, false, true));
+        let after = r.to_string();
+        assert!(!after.contains('\n'), "the newline was consumed: {after:?}");
+        assert!(after.ends_with("gamma"));
+    }
+
+    #[test]
+    fn plain_backspace_still_removes_one_char() {
+        let mut r = Rope::from_str("alpha beta");
+        let mut st = RopeEditorState::new();
+        st.edit = EditState::at(10);
+        apply_event(&mut r, &mut st, &key_ev(egui::Key::Backspace, false, false));
+        assert_eq!(r.to_string(), "alpha bet");
+    }
+
+    #[test]
+    fn ctrl_word_delete_is_undoable() {
+        // The Ctrl arms must record a history checkpoint like their plain
+        // counterparts, or a word delete would be unrecoverable.
+        let mut r = Rope::from_str("alpha beta");
+        let mut st = RopeEditorState::new();
+        st.edit = EditState::at(10);
+        apply_event(&mut r, &mut st, &key_ev(egui::Key::Backspace, false, true));
+        assert_eq!(r.to_string(), "alpha ");
+        apply_event(&mut r, &mut st, &key_ev(egui::Key::Z, false, true));
+        assert_eq!(r.to_string(), "alpha beta", "Ctrl+Z restored the word");
+    }
+
+    #[test]
+    fn ctrl_home_and_ctrl_end_jump_to_the_document_ends() {
+        let mut r = paged_doc();
+        let end = r.len_chars();
+        let mut st = RopeEditorState::new();
+        st.edit = EditState::at(9);
+
+        apply_event(&mut r, &mut st, &key_ev(egui::Key::End, false, true));
+        assert_eq!(st.edit.cursor, end, "Ctrl+End -> document end");
+        apply_event(&mut r, &mut st, &key_ev(egui::Key::Home, false, true));
+        assert_eq!(st.edit.cursor, 0, "Ctrl+Home -> document start");
+        assert!(!st.edit.has_selection());
+
+        // Shift variants extend instead of collapsing.
+        st.edit = EditState::at(9);
+        apply_event(&mut r, &mut st, &key_ev(egui::Key::End, true, true));
+        assert_eq!(st.edit.anchor, 9);
+        assert_eq!(st.edit.cursor, end);
+    }
+
+    #[test]
+    fn plain_home_and_end_still_act_on_the_line() {
+        let mut r = paged_doc();
+        let mut st = RopeEditorState::new();
+        st.edit = EditState::at(9); // line 2 ("cccccc"), col 1
+        apply_event(&mut r, &mut st, &key_ev(egui::Key::Home, false, false));
+        assert_eq!(editing::line_col(&r, st.edit.cursor), (2, 0));
+        apply_event(&mut r, &mut st, &key_ev(egui::Key::End, false, false));
+        assert_eq!(editing::line_col(&r, st.edit.cursor), (2, 6));
+    }
+
+    #[test]
+    fn ctrl_y_redoes_like_ctrl_shift_z() {
+        let mut r = Rope::from_str("");
+        let mut st = RopeEditorState::new();
+        apply_event(&mut r, &mut st, &text_event("hi"));
+        assert_eq!(r.to_string(), "hi");
+        apply_event(&mut r, &mut st, &key_ev(egui::Key::Z, false, true));
+        assert_eq!(r.to_string(), "", "undone");
+        apply_event(&mut r, &mut st, &key_ev(egui::Key::Y, false, true));
+        assert_eq!(r.to_string(), "hi", "Ctrl+Y redid it");
+    }
+
+    #[test]
+    fn ctrl_shift_y_is_not_a_redo_and_is_left_unconsumed() {
+        // The Ctrl+Y arm carried no `!shift`, so Ctrl+SHIFT+Y redid too — a
+        // chord it was never meant to own, and one it CONSUMED, making it
+        // unavailable to anything else. The Z arms above draw the same line with
+        // `cmd && !shift` / `cmd && shift`; this is Y catching up.
+        //
+        // Asserting both halves matters: the buffer must not move, AND the event
+        // must come back unconsumed. A version that skipped the redo but still
+        // reported `consumed` would still be swallowing the chord.
+        let mut r = Rope::from_str("");
+        let mut st = RopeEditorState::new();
+        apply_event(&mut r, &mut st, &text_event("hi"));
+        apply_event(&mut r, &mut st, &key_ev(egui::Key::Z, false, true));
+        assert_eq!(r.to_string(), "", "precondition: undone, a redo is queued");
+
+        let out = apply_event(&mut r, &mut st, &key_ev(egui::Key::Y, true, true));
+        assert_eq!(
+            r.to_string(),
+            "",
+            "Ctrl+Shift+Y must not redo — the queued redo is still queued"
+        );
+        assert!(!out.consumed, "Ctrl+Shift+Y is not this editor's chord");
+
+        // …and the redo it declined is genuinely still available, so the test
+        // above cannot pass merely because the history was empty.
+        apply_event(&mut r, &mut st, &key_ev(egui::Key::Y, false, true));
+        assert_eq!(r.to_string(), "hi", "plain Ctrl+Y still redoes");
+    }
+
+    // ---- line_span (what a triple-click selects) ----
+
+    #[test]
+    fn line_span_covers_the_whole_line_including_its_newline() {
+        // The terminator is IN the span on purpose: triple-click then Cut has to
+        // remove the line, not leave a blank one. Asserting the sliced TEXT (not
+        // just the indices) is what makes an off-by-one visible as the wrong
+        // string rather than as two numbers that look plausible.
+        let r = Rope::from_str("alpha\nbeta\ngamma\n");
+        let slice = |(s, e): (usize, usize)| r.slice(s..e).to_string();
+        assert_eq!(slice(line_span(&r, 0)), "alpha\n", "from the line start");
+        assert_eq!(slice(line_span(&r, 3)), "alpha\n", "from mid-line");
+        assert_eq!(
+            slice(line_span(&r, 5)),
+            "alpha\n",
+            "from the newline itself"
+        );
+        assert_eq!(slice(line_span(&r, 6)), "beta\n", "the next line");
+    }
+
+    #[test]
+    fn line_span_of_a_final_line_without_a_newline_stops_at_the_end() {
+        // The last line of a buffer with no trailing newline has no terminator
+        // to include; the span must end at len_chars rather than run past it.
+        let r = Rope::from_str("alpha\nbeta");
+        assert_eq!(line_span(&r, 7), (6, 10));
+        assert_eq!(r.slice(6..10).to_string(), "beta");
+        // A cursor clamped to the very end still resolves.
+        assert_eq!(line_span(&r, 10), (6, 10));
+        // …and an empty rope is a single empty line, not a panic.
+        assert_eq!(line_span(&Rope::from_str(""), 0), (0, 0));
+    }
+
+    #[test]
+    fn page_down_and_page_up_move_the_caret() {
+        // DEFAULT_PAGE_ROWS (20) exceeds this 6-line doc, so one PageDown lands
+        // on the last line and one PageUp returns to the first — the clamping
+        // path, which is exactly the buffer-edge case.
+        let mut r = paged_doc();
+        let last = r.len_lines() - 1;
+        let mut st = RopeEditorState::new();
+
+        apply_event(&mut r, &mut st, &key_ev(egui::Key::PageDown, false, false));
+        assert_eq!(editing::line_col(&r, st.edit.cursor).0, last);
+        apply_event(&mut r, &mut st, &key_ev(egui::Key::PageUp, false, false));
+        assert_eq!(editing::line_col(&r, st.edit.cursor).0, 0);
+    }
+
+    #[test]
+    fn page_up_at_the_top_and_page_down_at_the_bottom_are_stable() {
+        let mut r = paged_doc();
+        let mut st = RopeEditorState::new();
+        apply_event(&mut r, &mut st, &key_ev(egui::Key::PageUp, false, false));
+        assert_eq!(st.edit.cursor, 0, "PageUp at the top stays at the top");
+
+        st.edit = EditState::at(r.len_chars());
+        apply_event(&mut r, &mut st, &key_ev(egui::Key::PageDown, false, false));
+        assert_eq!(
+            st.edit.cursor,
+            r.len_chars(),
+            "PageDown at the bottom stays at the bottom"
+        );
+    }
+
+    #[test]
+    fn shift_page_extends_the_selection() {
+        let mut r = paged_doc();
+        let mut st = RopeEditorState::new();
+        apply_event(&mut r, &mut st, &key_ev(egui::Key::PageDown, true, false));
+        assert_eq!(st.edit.anchor, 0, "anchor pinned");
+        assert!(st.edit.has_selection(), "Shift+PageDown selected");
+    }
+
+    #[test]
+    fn page_keys_are_consumed_and_do_not_mutate() {
+        let mut r = paged_doc();
+        let before = r.to_string();
+        let mut st = RopeEditorState::new();
+        let out = apply_event(&mut r, &mut st, &key_ev(egui::Key::PageDown, false, false));
+        assert!(out.consumed, "the host must not re-handle the key");
+        assert!(!out.mutated, "navigation is not an edit");
+        assert_eq!(r.to_string(), before);
+    }
+
     #[test]
     fn apply_event_auto_closes_brackets() {
         let mut r = Rope::from_str("");
@@ -1810,6 +2589,184 @@ mod tests {
         assert!(!out.mutated, "select-all must not flag a content change");
     }
 
+    /// A selection replaced by text of the SAME LENGTH is still a content
+    /// change. `mutated` was derived from `rope.len_chars() != len_before`, a
+    /// PROXY that is blind to exactly this case: `editing::insert` deletes the
+    /// selection then inserts, so replacing a 3-char selection with 3 chars
+    /// leaves the length identical and the flag false.
+    ///
+    /// `mutated` is what `show_editable` folds into `content_changed`, which is
+    /// what makes the app run `tab.text = rope.to_string()`. False here means
+    /// the rope holds the user's edit and RENDERS it while `tab.text` — what
+    /// gets saved, what `is_dirty()` compares, what the hot-exit backup writes —
+    /// still holds the pre-edit content.
+    ///
+    /// Every selection-replacing path goes through `editing::insert`, so all
+    /// three are asserted. Each is paired with a LENGTH-CHANGING control
+    /// through the identical call, so a regression that broke the whole flag
+    /// (rather than just the same-length case) cannot masquerade as this bug,
+    /// and a test that passed for an unrelated reason is ruled out.
+    #[test]
+    fn same_length_selection_replacement_flags_a_content_change() {
+        // Select [0,3) — "cat" — and replace it with an equal-length word.
+        let select_cat = |st: &mut RopeEditorState| {
+            st.edit = EditState {
+                anchor: 0,
+                cursor: 3,
+                goal_col: None,
+            };
+        };
+
+        for (label, event) in [
+            ("typed text", text_event("dog")),
+            ("paste", egui::Event::Paste("dog".to_string())),
+            (
+                "IME commit",
+                egui::Event::Ime(egui::ImeEvent::Commit("dog".to_string())),
+            ),
+        ] {
+            // --- control: a LENGTH-CHANGING replacement through the same call.
+            // If this ever fails, the harness is broken and the real assertion
+            // below would be vacuous.
+            let mut r = Rope::from_str("cat\n");
+            let mut st = RopeEditorState::new();
+            select_cat(&mut st);
+            let longer = match &event {
+                egui::Event::Text(_) => text_event("horse"),
+                egui::Event::Paste(_) => egui::Event::Paste("horse".to_string()),
+                _ => egui::Event::Ime(egui::ImeEvent::Commit("horse".to_string())),
+            };
+            let out = apply_event(&mut r, &mut st, &longer);
+            assert_eq!(r.to_string(), "horse\n", "{label}: control must edit");
+            assert!(
+                out.mutated,
+                "{label}: CONTROL — a length-CHANGING replacement must flag a \
+                 content change; if this fails the case below proves nothing"
+            );
+
+            // --- the defect: same length, same code path.
+            let mut r = Rope::from_str("cat\n");
+            let mut st = RopeEditorState::new();
+            select_cat(&mut st);
+            let out = apply_event(&mut r, &mut st, &event);
+            assert_eq!(
+                r.to_string(),
+                "dog\n",
+                "{label}: precondition — the buffer really was edited"
+            );
+            assert!(
+                out.mutated,
+                "{label}: a same-length selection replacement changed the buffer \
+                 but reported mutated == false — `tab.text` is never synced, so \
+                 the on-screen edit is absent from a save, from is_dirty(), and \
+                 from the hot-exit backup"
+            );
+        }
+    }
+
+    /// Enter and Tab replace a selection too, so they carry the identical
+    /// same-length blindness: Enter over a 1-char selection writes "\n", Tab
+    /// over a 4-char selection writes four spaces. Both leave `len_chars()`
+    /// unchanged.
+    ///
+    /// This is the guard against the fix being whack-a-mole — a future arm that
+    /// writes through the length heuristic instead of `writes_content!` fails
+    /// here.
+    #[test]
+    fn same_length_enter_and_tab_replacements_flag_a_content_change() {
+        // Enter over exactly one selected char: "a" -> "\n", length unchanged.
+        let mut r = Rope::from_str("abc");
+        let mut st = RopeEditorState::new();
+        st.edit = EditState {
+            anchor: 0,
+            cursor: 1,
+            goal_col: None,
+        };
+        let out = apply_event(&mut r, &mut st, &key_ev(egui::Key::Enter, false, false));
+        assert_eq!(r.to_string(), "\nbc", "precondition — Enter replaced it");
+        assert_eq!(r.len_chars(), 3, "precondition — the length did NOT change");
+        assert!(
+            out.mutated,
+            "Enter replacing a 1-char selection with a newline is a content \
+             change the length delta cannot see"
+        );
+
+        // Tab over exactly four selected chars: "abcd" -> "    ", unchanged.
+        let mut r = Rope::from_str("abcdef");
+        let mut st = RopeEditorState::new();
+        st.edit = EditState {
+            anchor: 0,
+            cursor: 4,
+            goal_col: None,
+        };
+        let out = apply_event(&mut r, &mut st, &key_ev(egui::Key::Tab, false, false));
+        assert_eq!(r.to_string(), "    ef", "precondition — Tab replaced it");
+        assert_eq!(r.len_chars(), 6, "precondition — the length did NOT change");
+        assert!(
+            out.mutated,
+            "Tab replacing a 4-char selection with an indent is a content change \
+             the length delta cannot see"
+        );
+    }
+
+    /// The backstop must still report NO change for a genuine no-op, or the
+    /// fix would have simply pinned `mutated` to true and made the flag
+    /// meaningless (every caret move syncing the whole buffer, and `is_dirty()`
+    /// true on an untouched file).
+    #[test]
+    fn genuine_no_ops_still_report_no_content_change() {
+        // Backspace at offset 0 with no selection removes nothing.
+        let mut r = Rope::from_str("abc");
+        let mut st = RopeEditorState::new();
+        st.edit = EditState::at(0);
+        let out = apply_event(&mut r, &mut st, &key_ev(egui::Key::Backspace, false, false));
+        assert_eq!(r.to_string(), "abc", "precondition — nothing was removed");
+        assert!(
+            !out.mutated,
+            "backspace at the start of the buffer changed nothing and must not \
+             report a content change"
+        );
+
+        // Shift+Tab on a line with no leading whitespace removes nothing.
+        let mut r = Rope::from_str("abc\n");
+        let mut st = RopeEditorState::new();
+        st.edit = EditState::at(1);
+        let out = apply_event(&mut r, &mut st, &key_ev(egui::Key::Tab, true, false));
+        assert_eq!(
+            r.to_string(),
+            "abc\n",
+            "precondition — nothing was outdented"
+        );
+        assert!(
+            !out.mutated,
+            "an outdent with nothing to remove must not report a content change"
+        );
+    }
+
+    /// The same blindness, one layer up: `edit_gen` is bumped only when
+    /// `mutated` is set, so a same-length replacement also failed to
+    /// invalidate every `edit_gen`-keyed cache (highlight, minimap,
+    /// spellcheck, change-bar).
+    #[test]
+    fn same_length_selection_replacement_bumps_the_edit_generation() {
+        let mut r = Rope::from_str("cat\n");
+        let mut st = RopeEditorState::new();
+        st.edit = EditState {
+            anchor: 0,
+            cursor: 3,
+            goal_col: None,
+        };
+        let before = st.edit_gen;
+        apply_event(&mut r, &mut st, &text_event("dog"));
+        assert_eq!(r.to_string(), "dog\n", "precondition — the buffer changed");
+        assert_ne!(
+            st.edit_gen, before,
+            "a same-length replacement must bump edit_gen — every cache keyed \
+             on it (highlight, minimap, spellcheck, change bar) otherwise keeps \
+             serving pre-edit content"
+        );
+    }
+
     /// IME composition: a `Commit` inserts the finalised text at the caret
     /// (CJK parity); `Preedit`/`Enable` are consumed but don't mutate (the OS
     /// candidate window shows the in-progress composition).
@@ -1963,6 +2920,66 @@ mod tests {
         });
     }
 
+    /// The painted pass actually FEEDS `state.page_rows` from the viewport.
+    ///
+    /// `page_rows_holds_one_row_back_and_never_returns_zero` pins the helper's
+    /// arithmetic; this pins that `show_editable` still calls it. Those are
+    /// different failures: the helper was once extracted and left with
+    /// production keeping its own inline copy, so a correct-and-tested helper
+    /// sat beside a live path that never used it.
+    ///
+    /// Asserted by RESPONSE rather than by recomputing the expected number with
+    /// the same helper — a test that calls the function under test to build its
+    /// own expectation proves only that the function equals itself. Taller lines
+    /// must fit FEWER rows in the same viewport, so a hard-coded `state.page_rows
+    /// = 10` (or a dropped assignment leaving the default) cannot satisfy this.
+    #[test]
+    fn a_painted_pass_drives_page_rows_from_the_viewport() {
+        fn rows_for_line_height(line_h: f32) -> usize {
+            let mut state = RopeEditorState::new();
+            // A sentinel no viewport could plausibly produce, so "still the
+            // default" and "never assigned" are both visible failures.
+            state.page_rows = usize::MAX;
+            let ctx = egui::Context::default();
+            // Fix the surface so the row count is a function of `line_h` alone.
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(800.0, 600.0),
+                )),
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let mut b = Buffer::Rope(Rope::from_str(&"line\n".repeat(400)));
+                    let _ = RopeEditor::new(&mut b, FontId::monospace(14.0), line_h)
+                        .show_editable(ui, &mut state);
+                });
+            });
+            state.page_rows
+        }
+
+        let tight = rows_for_line_height(12.0);
+        let loose = rows_for_line_height(48.0);
+
+        assert_ne!(
+            tight,
+            usize::MAX,
+            "the painted pass never assigned page_rows — the viewport wire is cut"
+        );
+        assert_ne!(loose, usize::MAX, "same, at the larger line height");
+        assert!(
+            tight > loose,
+            "taller lines must fit FEWER rows in the same 600px viewport, so the \
+             step has to be derived from the live geometry: got {tight} at 12px \
+             and {loose} at 48px"
+        );
+        assert!(
+            loose >= 1,
+            "even a coarse viewport must still step by at least one row"
+        );
+    }
+
     /// The whitespace-overlay path renders a buffer containing spaces + tabs
     /// without panicking and reports the rope branch (exercises
     /// `with_render_whitespace`).
@@ -1979,6 +2996,46 @@ mod tests {
                 assert_eq!(resp.buffer_mode, BufferModeSeen::Rope);
             });
         });
+    }
+
+    /// The PageUp/PageDown step, pinned at the boundaries the arithmetic can be
+    /// broken at.
+    ///
+    /// Inline in `show_editable` this was reachable only through a live painted
+    /// frame, so `/` could become `%` or `*` with nothing able to observe it
+    /// (ADR-0007 "egui-paint"). Extracting it only helps if the extracted
+    /// function is BOTH the one production calls and the one covered here — it
+    /// is called at the `state.page_rows` assignment, and these are its tests.
+    #[test]
+    fn page_rows_holds_one_row_back_and_never_returns_zero() {
+        // Exact fit: 10 rows of 20px in 200px -> 10 visible, 9 stepped (one row
+        // of context is deliberately retained). `floor` and the `- 1` are both
+        // load-bearing here: `%` would give 0 and `*` a huge number.
+        assert_eq!(page_rows_for_viewport(200.0, 20.0), 9);
+        // Partial trailing row is not counted: 9.5 rows -> 9 visible -> 8.
+        assert_eq!(page_rows_for_viewport(190.0, 20.0), 8);
+
+        // The floor of the useful range. Two rows visible -> step 1.
+        assert_eq!(page_rows_for_viewport(40.0, 20.0), 1);
+
+        // Degenerate viewports still MOVE the caret. Without the `.max(1)` these
+        // return 0 and PageDown does nothing forever — a silent dead key, which
+        // is worse than a wrong step size because nothing surfaces it.
+        assert_eq!(
+            page_rows_for_viewport(20.0, 20.0),
+            1,
+            "exactly one visible row must still step by one"
+        );
+        assert_eq!(
+            page_rows_for_viewport(5.0, 20.0),
+            1,
+            "a viewport shorter than a single row must still step by one"
+        );
+        assert_eq!(
+            page_rows_for_viewport(0.0, 20.0),
+            1,
+            "a zero-height viewport (first frame, collapsed pane) must still step"
+        );
     }
 
     #[test]
@@ -2257,5 +3314,435 @@ mod tests {
                 assert_eq!(resp.buffer_mode, BufferModeSeen::Rope);
             });
         });
+    }
+
+    // ---- injected (palette / context-menu) editor actions ----
+    //
+    // These drive the REAL `show_editable` render pass — the same call
+    // `frame_tick` makes — with the editor UNFOCUSED, and assert the OBSERVABLE
+    // outcome (rope contents, returned clipboard payload). An assertion that a
+    // request was merely *recorded* would not have caught the defect these
+    // guard: the host used to deliver clipboard actions by focusing a widget id
+    // that belongs to no widget, so nothing was ever applied.
+
+    /// Drive one `show_editable` pass over `buf`/`state` with a headless Ui.
+    /// The editor is NEVER focused here — that is the point: an injected action
+    /// must land regardless of focus.
+    fn run_editable(
+        buf: &mut Buffer,
+        state: &mut RopeEditorState,
+        raw: egui::RawInput,
+    ) -> Option<String> {
+        let ctx = egui::Context::default();
+        let mut clipboard = None;
+        let _ = ctx.run(raw, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let (_resp, cb) =
+                    RopeEditor::new(buf, FontId::monospace(14.0), 18.0).show_editable(ui, state);
+                clipboard = cb;
+            });
+        });
+        clipboard
+    }
+
+    /// Select `[a, b)` and queue `ev` for the next `show_editable` pass.
+    fn select_and_inject(state: &mut RopeEditorState, a: usize, b: usize, ev: egui::Event) {
+        state.edit.anchor = a;
+        state.edit.cursor = b;
+        state.edit.goal_col = None;
+        state.inject_event(ev);
+    }
+
+    #[test]
+    fn injected_copy_returns_the_selection_without_focus() {
+        let mut buf = Buffer::Rope(Rope::from_str("hello world"));
+        let mut st = RopeEditorState::new();
+        select_and_inject(&mut st, 0, 5, egui::Event::Copy);
+        let cb = run_editable(&mut buf, &mut st, egui::RawInput::default());
+        assert_eq!(
+            cb.as_deref(),
+            Some("hello"),
+            "an injected Copy must hand the selected text back for the host to \
+             write to the OS clipboard, even though the editor is not focused"
+        );
+        assert_eq!(
+            buf.as_rope().map(ropey::Rope::to_string).as_deref(),
+            Some("hello world"),
+            "copy must not mutate"
+        );
+        assert_eq!(st.injected_len(), 0, "the queue is drained by the pass");
+    }
+
+    #[test]
+    fn injected_cut_removes_the_selection_without_focus() {
+        let mut buf = Buffer::Rope(Rope::from_str("hello world"));
+        let mut st = RopeEditorState::new();
+        select_and_inject(&mut st, 0, 6, egui::Event::Cut);
+        let cb = run_editable(&mut buf, &mut st, egui::RawInput::default());
+        assert_eq!(cb.as_deref(), Some("hello "));
+        assert_eq!(
+            buf.as_rope().map(ropey::Rope::to_string).as_deref(),
+            Some("world"),
+            "an injected Cut must actually delete the selection from the rope"
+        );
+    }
+
+    #[test]
+    fn injected_paste_inserts_without_focus() {
+        let mut buf = Buffer::Rope(Rope::from_str("ac"));
+        let mut st = RopeEditorState::new();
+        select_and_inject(&mut st, 1, 1, egui::Event::Paste("b".to_string()));
+        run_editable(&mut buf, &mut st, egui::RawInput::default());
+        assert_eq!(
+            buf.as_rope().map(ropey::Rope::to_string).as_deref(),
+            Some("abc"),
+            "an injected Paste must insert at the caret"
+        );
+    }
+
+    #[test]
+    fn injected_undo_then_redo_round_trip_without_focus() {
+        let mut buf = Buffer::Rope(Rope::from_str(""));
+        let mut st = RopeEditorState::new();
+        // A real edit to undo: type through the same engine the editor uses.
+        if let Some(rope) = buf.as_rope_mut() {
+            for ch in ["a", "b", "c"] {
+                apply_event(rope, &mut st, &text_event(ch));
+            }
+        }
+        assert_eq!(
+            buf.as_rope().map(ropey::Rope::to_string).as_deref(),
+            Some("abc")
+        );
+        st.inject_event(key_ev(egui::Key::Z, false, true));
+        run_editable(&mut buf, &mut st, egui::RawInput::default());
+        assert_eq!(
+            buf.as_rope().map(ropey::Rope::to_string).as_deref(),
+            Some(""),
+            "an injected Ctrl+Z must undo the typing run"
+        );
+        st.inject_event(key_ev(egui::Key::Z, true, true));
+        run_editable(&mut buf, &mut st, egui::RawInput::default());
+        assert_eq!(
+            buf.as_rope().map(ropey::Rope::to_string).as_deref(),
+            Some("abc"),
+            "an injected Ctrl+Shift+Z must redo it"
+        );
+    }
+
+    /// The injected channel must NOT un-gate ordinary keyboard input: typing
+    /// still only reaches the FOCUSED editor. Without this, every rope editor
+    /// on screen would consume the same keystroke.
+    #[test]
+    fn ordinary_key_events_stay_focus_gated() {
+        let mut buf = Buffer::Rope(Rope::from_str("x"));
+        let mut st = RopeEditorState::new();
+        let raw = egui::RawInput {
+            events: vec![text_event("Z")],
+            ..Default::default()
+        };
+        run_editable(&mut buf, &mut st, raw);
+        assert_eq!(
+            buf.as_rope().map(ropey::Rope::to_string).as_deref(),
+            Some("x"),
+            "an UNFOCUSED rope editor must ignore typed input"
+        );
+    }
+
+    /// The narrow case `ordinary_key_events_stay_focus_gated` cannot reach: an
+    /// injected action OPENS the input phase for an unfocused editor, so the
+    /// focus-gate on `ui.input().events` has to hold INSIDE that branch too.
+    /// Without the inner gate, whatever the user is typing elsewhere is applied
+    /// to this editor as a side effect of a palette pick — every unfocused rope
+    /// editor would swallow the same keystroke.
+    #[test]
+    fn an_injected_action_does_not_admit_unfocused_typing() {
+        let mut buf = Buffer::Rope(Rope::from_str("hello world"));
+        let mut st = RopeEditorState::new();
+        select_and_inject(&mut st, 0, 5, egui::Event::Copy);
+        let raw = egui::RawInput {
+            events: vec![text_event("Z")],
+            ..Default::default()
+        };
+        let cb = run_editable(&mut buf, &mut st, raw);
+        assert_eq!(
+            cb.as_deref(),
+            Some("hello"),
+            "precondition: the injected Copy still lands while unfocused"
+        );
+        assert_eq!(
+            buf.as_rope().map(ropey::Rope::to_string).as_deref(),
+            Some("hello world"),
+            "an injected action must not admit the unfocused editor to the \
+             ordinary keyboard queue — the typed 'Z' must NOT replace the selection"
+        );
+    }
+
+    // ---- pointer: double-click = word, triple-click = line -----------------
+    //
+    // These drive the REAL `show_editable` pointer block on ONE persistent
+    // context. The context has to persist because egui's multi-click counter
+    // lives in its input state (`last_click_time` / `last_last_click_time`), so
+    // a fresh context per frame — which `drive_editable_frame` above uses —
+    // can never report anything but a single click.
+
+    /// One `show_editable` pass on the shared context `ctx`.
+    fn pointer_frame(
+        ctx: &egui::Context,
+        buf: &mut Buffer,
+        state: &mut RopeEditorState,
+        events: Vec<egui::Event>,
+    ) {
+        let raw = egui::RawInput {
+            events,
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(800.0, 600.0),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run(raw, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ =
+                    RopeEditor::new(buf, FontId::monospace(14.0), 18.0).show_editable(ui, state);
+            });
+        });
+    }
+
+    /// A press+release at `pos` in its own frame. Consecutive calls advance
+    /// egui's clock by one predicted frame (~16 ms), well inside the
+    /// double-click window, so click 2 counts as a double and click 3 as a
+    /// triple — exactly what a real user's clicks do.
+    fn pointer_click(
+        ctx: &egui::Context,
+        buf: &mut Buffer,
+        state: &mut RopeEditorState,
+        pos: egui::Pos2,
+    ) {
+        let m = egui::Modifiers::NONE;
+        pointer_frame(
+            ctx,
+            buf,
+            state,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: m,
+                },
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: m,
+                },
+            ],
+        );
+    }
+
+    /// The text currently selected in `state`.
+    fn selection_text(buf: &Buffer, state: &RopeEditorState) -> String {
+        let rope = buf.as_rope().expect("a rope buffer");
+        let sel = state.edit.selection();
+        rope.slice(sel).to_string()
+    }
+
+    /// A document whose first line is ONE word, so a click anywhere on that row
+    /// selects the same word regardless of the host's font metrics — the test
+    /// asserts a literal, not whatever the geometry happened to produce.
+    fn click_doc() -> Buffer {
+        Buffer::Rope(Rope::from_str("alphabetagammadelta\nsecond line\nthird\n"))
+    }
+
+    #[test]
+    fn a_single_click_still_only_places_the_caret() {
+        // The baseline the two tests below are read against: one click selects
+        // NOTHING. Without it, a double-click test could pass on an editor that
+        // selected the word on every click.
+        let ctx = egui::Context::default();
+        let mut buf = click_doc();
+        let mut st = RopeEditorState::new();
+        pointer_frame(&ctx, &mut buf, &mut st, Vec::new()); // paint once so the text geometry exists
+        pointer_click(&ctx, &mut buf, &mut st, egui::pos2(60.0, 18.0));
+        assert!(
+            !st.edit.has_selection(),
+            "a single click places a caret; it does not select"
+        );
+    }
+
+    #[test]
+    fn a_double_click_selects_the_word_under_the_pointer() {
+        let ctx = egui::Context::default();
+        let mut buf = click_doc();
+        let mut st = RopeEditorState::new();
+        pointer_frame(&ctx, &mut buf, &mut st, Vec::new());
+        let pos = egui::pos2(60.0, 18.0);
+        pointer_click(&ctx, &mut buf, &mut st, pos);
+        pointer_click(&ctx, &mut buf, &mut st, pos);
+        assert_eq!(
+            selection_text(&buf, &st),
+            "alphabetagammadelta",
+            "a double-click selects the whole word under the pointer"
+        );
+    }
+
+    #[test]
+    fn a_triple_click_selects_the_whole_line_including_its_newline() {
+        let ctx = egui::Context::default();
+        let mut buf = click_doc();
+        let mut st = RopeEditorState::new();
+        pointer_frame(&ctx, &mut buf, &mut st, Vec::new());
+        let pos = egui::pos2(60.0, 18.0);
+        pointer_click(&ctx, &mut buf, &mut st, pos);
+        pointer_click(&ctx, &mut buf, &mut st, pos);
+        pointer_click(&ctx, &mut buf, &mut st, pos);
+        assert_eq!(
+            selection_text(&buf, &st),
+            "alphabetagammadelta\n",
+            "a triple-click selects the line AND its terminator, so the \
+             follow-up Cut removes the line instead of blanking it"
+        );
+    }
+
+    #[test]
+    fn a_double_click_on_a_gap_selects_nothing_rather_than_the_next_word() {
+        // `word_bounds` returns (cursor, cursor) off a word. Clicking the blank
+        // area past the end of a short line must therefore collapse, not reach
+        // forward and grab a word the pointer was nowhere near.
+        let ctx = egui::Context::default();
+        let mut buf = Buffer::Rope(Rope::from_str("ab\nlonger second line\n"));
+        let mut st = RopeEditorState::new();
+        pointer_frame(&ctx, &mut buf, &mut st, Vec::new());
+        // Far right of the 2-char first row: the column clamps to the line's
+        // own length, so the offset lands at the end of "ab"… which IS a word
+        // boundary, so the word under the pointer is "ab" itself.
+        let pos = egui::pos2(600.0, 18.0);
+        pointer_click(&ctx, &mut buf, &mut st, pos);
+        pointer_click(&ctx, &mut buf, &mut st, pos);
+        assert_eq!(
+            selection_text(&buf, &st),
+            "ab",
+            "a double-click past the end of a line selects that line's last \
+             word, never a word from the line below"
+        );
+    }
+
+    #[test]
+    fn take_rope_action_request_round_trips_then_clears() {
+        let ctx = egui::Context::default();
+        assert_eq!(
+            take_rope_action_request(&ctx),
+            None,
+            "nothing pending on a fresh context"
+        );
+        ctx.data_mut(|d| d.insert_temp(rope_action_request_id(), RopeEditorAction::Paste));
+        assert_eq!(
+            take_rope_action_request(&ctx),
+            Some(RopeEditorAction::Paste),
+            "a published pick is handed to the host"
+        );
+        assert_eq!(
+            take_rope_action_request(&ctx),
+            None,
+            "taking it clears it — a pick must never be executed twice"
+        );
+    }
+
+    // ---- RopeRowGeom column <-> x (what a host hangs overlays off) ----
+
+    /// Build a `RopeRowGeom` for `line` with a deliberately non-zero, non-one
+    /// `text_left`. Both magnitudes matter: at `text_left == 0` a `*` reads the
+    /// same as a `+` for column 0, and at `text_left == 1` a `/` reads the same
+    /// as a `-`, so a lazy gutter offset would hide half the arithmetic.
+    fn row_geom(line: &str, text_left: f32) -> RopeRowGeom {
+        let ctx = egui::Context::default();
+        let font = egui::FontId::monospace(14.0);
+        let mut galley = None;
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                galley = Some(tab_geometry::layout_line(
+                    ui,
+                    line,
+                    font.clone(),
+                    egui::Color32::WHITE,
+                ));
+            });
+        });
+        RopeRowGeom {
+            row_left: text_left - 20.0,
+            text_left,
+            top: 0.0,
+            bottom: 14.0,
+            galley: galley.expect("a frame ran, so the galley was laid out"),
+        }
+    }
+
+    #[test]
+    fn col_x_offsets_the_galley_position_by_the_text_left_edge() {
+        const LEFT: f32 = 100.0;
+        let geom = row_geom("abcd", LEFT);
+
+        // Column 0 sits exactly on the text edge: this is what pins the whole
+        // body being replaced by a constant, and `+` becoming `*` (which would
+        // zero the offset out).
+        assert!(
+            (geom.col_x(0) - LEFT).abs() < 0.01,
+            "column 0 is the text left edge, got {}",
+            geom.col_x(0)
+        );
+
+        // A later column must be to the RIGHT of the edge by the galley's own
+        // advance — the half that catches `+` becoming `-`.
+        let x2 = geom.col_x(2);
+        assert!(
+            x2 > LEFT,
+            "column 2 must lie right of the text edge, got {x2} vs {LEFT}"
+        );
+        assert!(
+            (x2 - (LEFT + tab_geometry::col_to_rel_x(&geom.galley, 2))).abs() < 0.01,
+            "column 2 must be the edge plus the galley's own advance, got {x2}"
+        );
+    }
+
+    #[test]
+    fn col_at_x_inverts_col_x() {
+        const LEFT: f32 = 100.0;
+        let geom = row_geom("abcd", LEFT);
+        for col in 0..=4usize {
+            let round_tripped = geom.col_at_x(geom.col_x(col));
+            assert_eq!(
+                round_tripped, col,
+                "col_at_x(col_x({col})) must return {col}, got {round_tripped}"
+            );
+        }
+    }
+
+    /// `line_to_char(len_lines())` is the premise that makes the two
+    /// `line_span` boundary mutants equivalent (see the disposition note in
+    /// `.cargo/mutants.toml`). If ropey ever stops returning `len_chars` there,
+    /// the equivalence argument collapses and those pardons must be revisited —
+    /// so the premise is asserted rather than assumed.
+    #[test]
+    fn line_to_char_past_the_last_line_is_len_chars() {
+        for text in ["", "alpha", "alpha\n", "alpha\nbeta", "alpha\nbeta\n"] {
+            let r = Rope::from_str(text);
+            assert_eq!(
+                r.line_to_char(r.len_lines()),
+                r.len_chars(),
+                "ropey premise broken for {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn injected_len_reports_the_queue_depth() {
+        let mut st = RopeEditorState::new();
+        assert_eq!(st.injected_len(), 0, "a fresh state has an empty queue");
+        st.inject_event(text_event("a"));
+        assert_eq!(st.injected_len(), 1, "one injected event is one queued");
+        st.inject_event(text_event("b"));
+        assert_eq!(st.injected_len(), 2, "the queue accumulates");
     }
 }

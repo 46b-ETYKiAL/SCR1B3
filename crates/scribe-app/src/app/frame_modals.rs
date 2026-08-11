@@ -494,7 +494,12 @@ impl ScribeApp {
             }
             if want_open_folder {
                 if let Some(folder) = super::dialogs::pick_folder() {
-                    self.file_tree_root = Some(folder);
+                    // Same seam the palette and the recent-folders modal use.
+                    // A raw `file_tree_root` write here skipped the MRU record,
+                    // so the FIRST folder a new user ever opens — from the
+                    // first-run welcome screen — was the one guaranteed not to
+                    // appear under "Open recent folder".
+                    self.open_folder_root(folder);
                 }
                 self.welcome_open = false;
             }

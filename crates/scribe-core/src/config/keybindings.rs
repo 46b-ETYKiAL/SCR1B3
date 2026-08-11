@@ -114,6 +114,8 @@ pub struct Keybindings {
     pub open_file: String,
     /// Save the active file.
     pub save: String,
+    /// Save the active file under a new name (Save As…).
+    pub save_as: String,
     /// Open the in-buffer find bar.
     pub find: String,
     /// Open project-wide find (find in files).
@@ -136,6 +138,27 @@ pub struct Keybindings {
     pub next_tab: String,
     /// Cycle to the previous tab.
     pub prev_tab: String,
+    /// Activate tab 1 by index. The nine `goto_tab_*` bindings are separate
+    /// actions (not one parameterised action) because a keymap binds ONE combo
+    /// to ONE action — the same shape VS Code / Sublime use for their
+    /// open-editor-at-index commands, and the only shape `entries` can express.
+    pub goto_tab_1: String,
+    /// Activate tab 2 by index.
+    pub goto_tab_2: String,
+    /// Activate tab 3 by index.
+    pub goto_tab_3: String,
+    /// Activate tab 4 by index.
+    pub goto_tab_4: String,
+    /// Activate tab 5 by index.
+    pub goto_tab_5: String,
+    /// Activate tab 6 by index.
+    pub goto_tab_6: String,
+    /// Activate tab 7 by index.
+    pub goto_tab_7: String,
+    /// Activate tab 8 by index.
+    pub goto_tab_8: String,
+    /// Activate tab 9 by index.
+    pub goto_tab_9: String,
     /// Reopen the most recently closed tab.
     pub reopen_tab: String,
     /// Toggle the multi-note grid.
@@ -153,6 +176,13 @@ pub struct Keybindings {
     /// Toggle the minimap.
     pub toggle_minimap: String,
     /// Toggle the markdown live-preview panel.
+    ///
+    /// NOT `mod+shift+v`, and that is a correctness constraint rather than taste:
+    /// the windowing layer eats every `command`+V press as Paste — Shift and Alt
+    /// are not excluded from its test — so a `mod+shift+v` binding here is
+    /// unmatchable in the shipped app. `app::keymap::swallowed_chord_messages`
+    /// is the check that says so; this crate cannot make it, because the swallow
+    /// lives in the UI layer, not in the combo grammar.
     pub toggle_md_preview: String,
     /// Fold every region in the active buffer.
     pub fold_all: String,
@@ -185,10 +215,23 @@ impl Default for Keybindings {
         // Each combo is the EXACT chord SCR1B3 currently hard-wires in
         // `app::keyboard_input` — reproducing today's behaviour with zero change.
         // `mod` = the platform command modifier (Ctrl / Cmd).
+        //
+        // `save_as` and `goto_tab_1..9` are the exception: they had NO chord at
+        // all before (Save As was toolbar-only; there was no by-index tab
+        // switch), so their defaults are the cross-editor conventions
+        // (Ctrl+Shift+S, Ctrl+1..9) rather than a reproduction of a previous
+        // hard-wiring. They are additive — no existing chord changed meaning.
+        //
+        // `toggle_md_preview` is the other exception, and a corrective one: it
+        // shipped as `mod+shift+v`, which the windowing layer eats as Paste
+        // (Shift is not excluded from its test), so the shortcut never fired in
+        // the shipped app. Moving it to `mod+e` — the same chord Obsidian uses
+        // for edit/preview — is what makes it reachable at all.
         Keybindings {
             new_file: "mod+n".into(),
             open_file: "mod+o".into(),
             save: "mod+s".into(),
+            save_as: "mod+shift+s".into(),
             find: "mod+f".into(),
             find_in_files: "mod+shift+f".into(),
             replace: "mod+h".into(),
@@ -200,6 +243,15 @@ impl Default for Keybindings {
             close_tab: "mod+w".into(),
             next_tab: "mod+tab".into(),
             prev_tab: "mod+shift+tab".into(),
+            goto_tab_1: "mod+num1".into(),
+            goto_tab_2: "mod+num2".into(),
+            goto_tab_3: "mod+num3".into(),
+            goto_tab_4: "mod+num4".into(),
+            goto_tab_5: "mod+num5".into(),
+            goto_tab_6: "mod+num6".into(),
+            goto_tab_7: "mod+num7".into(),
+            goto_tab_8: "mod+num8".into(),
+            goto_tab_9: "mod+num9".into(),
             reopen_tab: "mod+shift+r".into(),
             toggle_grid: "mod+backslash".into(),
             toggle_comment: "mod+slash".into(),
@@ -208,7 +260,7 @@ impl Default for Keybindings {
             toggle_zen: "mod+period".into(),
             cycle_theme: "mod+shift+t".into(),
             toggle_minimap: "mod+shift+m".into(),
-            toggle_md_preview: "mod+shift+v".into(),
+            toggle_md_preview: "mod+e".into(),
             fold_all: "mod+shift+openbracket".into(),
             expand_all: "mod+shift+closebracket".into(),
             increase_font: "mod+equals".into(),
@@ -271,11 +323,12 @@ impl Keybindings {
     /// Every (action-name, combo) pair, in a stable declaration order. The single
     /// source of truth both [`Keybindings::validate`] and any UI iteration key off,
     /// so a new binding is covered by adding ONE line here.
-    pub fn entries(&self) -> [(&'static str, &str); 35] {
+    pub fn entries(&self) -> [(&'static str, &str); 45] {
         [
             ("new_file", &self.new_file),
             ("open_file", &self.open_file),
             ("save", &self.save),
+            ("save_as", &self.save_as),
             ("find", &self.find),
             ("find_in_files", &self.find_in_files),
             ("replace", &self.replace),
@@ -287,6 +340,15 @@ impl Keybindings {
             ("close_tab", &self.close_tab),
             ("next_tab", &self.next_tab),
             ("prev_tab", &self.prev_tab),
+            ("goto_tab_1", &self.goto_tab_1),
+            ("goto_tab_2", &self.goto_tab_2),
+            ("goto_tab_3", &self.goto_tab_3),
+            ("goto_tab_4", &self.goto_tab_4),
+            ("goto_tab_5", &self.goto_tab_5),
+            ("goto_tab_6", &self.goto_tab_6),
+            ("goto_tab_7", &self.goto_tab_7),
+            ("goto_tab_8", &self.goto_tab_8),
+            ("goto_tab_9", &self.goto_tab_9),
             ("reopen_tab", &self.reopen_tab),
             ("toggle_grid", &self.toggle_grid),
             ("toggle_comment", &self.toggle_comment),
@@ -309,6 +371,91 @@ impl Keybindings {
             ("next_bookmark", &self.next_bookmark),
             ("prev_bookmark", &self.prev_bookmark),
         ]
+    }
+
+    /// Every (action-name, MUTABLE combo) pair, in the SAME declaration order as
+    /// [`Keybindings::entries`].
+    ///
+    /// The write half of `entries`, and the reason the settings UI can render one
+    /// row per binding generically instead of hand-listing every field (a list that
+    /// would silently fall behind the schema). `entries_mut_matches_entries` pins
+    /// the two orders together, so a binding added to one and not the other fails
+    /// the suite rather than becoming a row the user can never edit.
+    pub fn entries_mut(&mut self) -> [(&'static str, &mut String); 45] {
+        [
+            ("new_file", &mut self.new_file),
+            ("open_file", &mut self.open_file),
+            ("save", &mut self.save),
+            ("save_as", &mut self.save_as),
+            ("find", &mut self.find),
+            ("find_in_files", &mut self.find_in_files),
+            ("replace", &mut self.replace),
+            ("command_palette", &mut self.command_palette),
+            ("fuzzy_finder", &mut self.fuzzy_finder),
+            ("goto_line", &mut self.goto_line),
+            ("goto_symbol", &mut self.goto_symbol),
+            ("recent_files", &mut self.recent_files),
+            ("close_tab", &mut self.close_tab),
+            ("next_tab", &mut self.next_tab),
+            ("prev_tab", &mut self.prev_tab),
+            ("goto_tab_1", &mut self.goto_tab_1),
+            ("goto_tab_2", &mut self.goto_tab_2),
+            ("goto_tab_3", &mut self.goto_tab_3),
+            ("goto_tab_4", &mut self.goto_tab_4),
+            ("goto_tab_5", &mut self.goto_tab_5),
+            ("goto_tab_6", &mut self.goto_tab_6),
+            ("goto_tab_7", &mut self.goto_tab_7),
+            ("goto_tab_8", &mut self.goto_tab_8),
+            ("goto_tab_9", &mut self.goto_tab_9),
+            ("reopen_tab", &mut self.reopen_tab),
+            ("toggle_grid", &mut self.toggle_grid),
+            ("toggle_comment", &mut self.toggle_comment),
+            ("jump_bracket", &mut self.jump_bracket),
+            ("toggle_fullscreen", &mut self.toggle_fullscreen),
+            ("toggle_zen", &mut self.toggle_zen),
+            ("cycle_theme", &mut self.cycle_theme),
+            ("toggle_minimap", &mut self.toggle_minimap),
+            ("toggle_md_preview", &mut self.toggle_md_preview),
+            ("fold_all", &mut self.fold_all),
+            ("expand_all", &mut self.expand_all),
+            ("increase_font", &mut self.increase_font),
+            ("decrease_font", &mut self.decrease_font),
+            ("reset_font", &mut self.reset_font),
+            ("move_line_up", &mut self.move_line_up),
+            ("move_line_down", &mut self.move_line_down),
+            ("duplicate_line", &mut self.duplicate_line),
+            ("join_lines", &mut self.join_lines),
+            ("toggle_bookmark", &mut self.toggle_bookmark),
+            ("next_bookmark", &mut self.next_bookmark),
+            ("prev_bookmark", &mut self.prev_bookmark),
+        ]
+    }
+
+    /// The combo currently bound to `action`, or `None` when `action` is not a
+    /// binding in this schema.
+    pub fn get(&self, action: &str) -> Option<&str> {
+        self.entries()
+            .into_iter()
+            .find(|(name, _)| *name == action)
+            .map(|(_, combo)| combo)
+    }
+
+    /// Bind `action` to `combo`. Returns `false` (changing nothing) when `action`
+    /// is not a binding in this schema, so a caller can never silently write a
+    /// rebind into a field that does not exist.
+    pub fn set(&mut self, action: &str, combo: &str) -> bool {
+        match self
+            .entries_mut()
+            .into_iter()
+            .find(|(name, _)| *name == action)
+        {
+            Some((_, slot)) => {
+                slot.clear();
+                slot.push_str(combo);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Detect keybinding issues: blank bindings, unparseable combos (both make an
@@ -375,6 +522,71 @@ mod tests {
             "the default keymap must be conflict-free: {:?}",
             Keybindings::default().validate()
         );
+    }
+
+    #[test]
+    fn entries_mut_matches_entries() {
+        // The read and write halves must agree on NAMES and ORDER, or a settings
+        // row renders one action's label over another action's combo. Compare the
+        // full (name, value) projection: a mis-paired field (e.g. `("save", &mut
+        // self.find)`) changes the value at that index and fails here.
+        let mut kb = Keybindings::default();
+        let read: Vec<(String, String)> = kb
+            .entries()
+            .iter()
+            .map(|(n, c)| ((*n).to_string(), (*c).to_string()))
+            .collect();
+        let write: Vec<(String, String)> = kb
+            .entries_mut()
+            .into_iter()
+            .map(|(n, c)| (n.to_string(), c.clone()))
+            .collect();
+        assert_eq!(read, write, "entries_mut must mirror entries");
+    }
+
+    #[test]
+    fn set_writes_the_binding_that_get_reads_back() {
+        // The round-trip the settings UI depends on: whatever `set` writes for an
+        // action is what `get` (and therefore `entries`, and therefore the input
+        // layer) reads for that action — and no OTHER binding moves.
+        let mut kb = Keybindings::default();
+        let untouched = kb.find.clone();
+        assert!(kb.set("save", "mod+alt+k"), "'save' is a real binding");
+        assert_eq!(kb.get("save"), Some("mod+alt+k"));
+        assert_eq!(kb.save, "mod+alt+k", "the field itself is what changed");
+        assert_eq!(kb.find, untouched, "no other binding may move");
+        // Rebinding twice replaces, never appends.
+        assert!(kb.set("save", "mod+q"));
+        assert_eq!(kb.get("save"), Some("mod+q"));
+        // Unbinding is a legitimate write.
+        assert!(kb.set("save", ""));
+        assert_eq!(kb.get("save"), Some(""));
+    }
+
+    #[test]
+    fn set_and_get_reject_an_action_that_is_not_in_the_schema() {
+        // A typo'd action name must NOT silently write into some other field (or
+        // report success); it is a no-op that says so.
+        let mut kb = Keybindings::default();
+        let before = kb.clone();
+        assert!(!kb.set("sav", "mod+k"), "a typo is not a binding");
+        assert_eq!(kb, before, "a rejected set must change nothing");
+        assert_eq!(kb.get("sav"), None);
+        assert_eq!(kb.get(""), None);
+    }
+
+    #[test]
+    fn get_reads_every_binding_in_the_schema() {
+        // `get` must resolve for EVERY action, not just the first — a `find` that
+        // stopped scanning early would leave later rows uneditable.
+        let kb = Keybindings::default();
+        for (action, combo) in kb.entries() {
+            assert_eq!(
+                kb.get(action),
+                Some(combo),
+                "get('{action}') must read that binding"
+            );
+        }
     }
 
     #[test]
@@ -547,6 +759,11 @@ mod tests {
         // nothing for a user who never edits the section. Pinning them here means
         // a default edit is a deliberate, reviewed change to muscle memory.
         //
+        // `save_as` + `goto_tab_1..9` are pinned here too, but they reproduce no
+        // previous hard-wiring — they had no chord at all. Their pins are the
+        // cross-editor conventions they were GIVEN, so a later drift is still a
+        // reviewed change.
+        //
         // NOTE this test compares STRINGS only — it passed for as long as the
         // section was unwired entirely. `app::keymap` pins what each default
         // RESOLVES to, and `app::e2e::input_rebound_keybinding_replaces_the_
@@ -556,6 +773,7 @@ mod tests {
         assert_eq!(kb.new_file, "mod+n"); // Ctrl+N
         assert_eq!(kb.open_file, "mod+o"); // Ctrl+O (!shift)
         assert_eq!(kb.save, "mod+s"); // Ctrl+S
+        assert_eq!(kb.save_as, "mod+shift+s"); // Ctrl+Shift+S (NEW — no prior chord)
         assert_eq!(kb.find, "mod+f"); // Ctrl+F (!shift)
         assert_eq!(kb.find_in_files, "mod+shift+f"); // Ctrl+Shift+F
         assert_eq!(kb.replace, "mod+h"); // Ctrl+H
@@ -569,7 +787,19 @@ mod tests {
         assert_eq!(kb.next_tab, "mod+tab"); // Ctrl+Tab
         assert_eq!(kb.prev_tab, "mod+shift+tab"); // Ctrl+Shift+Tab
         assert_eq!(kb.reopen_tab, "mod+shift+r"); // Ctrl+Shift+R
-                                                  // View / toggles.
+                                                  // By-index tab switching (NEW — no prior chord). Pinned per index so a
+                                                  // transposition (goto_tab_3 bound to Ctrl+7) fails here rather than
+                                                  // silently sending the user to the wrong tab.
+        assert_eq!(kb.goto_tab_1, "mod+num1"); // Ctrl+1
+        assert_eq!(kb.goto_tab_2, "mod+num2"); // Ctrl+2
+        assert_eq!(kb.goto_tab_3, "mod+num3"); // Ctrl+3
+        assert_eq!(kb.goto_tab_4, "mod+num4"); // Ctrl+4
+        assert_eq!(kb.goto_tab_5, "mod+num5"); // Ctrl+5
+        assert_eq!(kb.goto_tab_6, "mod+num6"); // Ctrl+6
+        assert_eq!(kb.goto_tab_7, "mod+num7"); // Ctrl+7
+        assert_eq!(kb.goto_tab_8, "mod+num8"); // Ctrl+8
+        assert_eq!(kb.goto_tab_9, "mod+num9"); // Ctrl+9
+                                               // View / toggles.
         assert_eq!(kb.toggle_grid, "mod+backslash"); // Ctrl+\
         assert_eq!(kb.toggle_comment, "mod+slash"); // Ctrl+/
         assert_eq!(kb.jump_bracket, "mod+m"); // Ctrl+M (!shift)
@@ -577,7 +807,11 @@ mod tests {
         assert_eq!(kb.toggle_zen, "mod+period"); // Ctrl+.
         assert_eq!(kb.cycle_theme, "mod+shift+t"); // Ctrl+Shift+T
         assert_eq!(kb.toggle_minimap, "mod+shift+m"); // Ctrl+Shift+M
-        assert_eq!(kb.toggle_md_preview, "mod+shift+v"); // Ctrl+Shift+V
+                                                      // Ctrl+E — deliberately NOT Ctrl+Shift+V, which the windowing layer
+                                                      // swallows as Paste. `app::keymap` owns the check that proves it (this
+                                                      // crate has no view of the UI layer); the pin here is what stops the
+                                                      // dead chord being restored by muscle memory.
+        assert_eq!(kb.toggle_md_preview, "mod+e");
         assert_eq!(kb.fold_all, "mod+shift+openbracket"); // Ctrl+Shift+[
         assert_eq!(kb.expand_all, "mod+shift+closebracket"); // Ctrl+Shift+]
                                                              // Font.

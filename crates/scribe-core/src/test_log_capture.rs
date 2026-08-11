@@ -111,6 +111,35 @@ where
 /// Run `f` with a capturing subscriber installed for the current thread, handing
 /// it the [`CapturedLogs`] handle to assert against.
 pub(crate) fn with_captured_logs<R>(f: impl FnOnce(&CapturedLogs) -> R) -> R {
+    // ROOT CAUSE of the intermittent `backup_corrupt_config_logs_error_*` flake: in
+    // a test binary no GLOBAL default subscriber is ever installed (`main.rs`
+    // installs one, but that never runs under `cargo test`). `tracing` caches each
+    // callsite's `Interest` the FIRST time it is hit; with no subscriber present
+    // that interest is cached as `never` — permanently, process-wide, across every
+    // thread. A thread-local `with_default` does NOT rebuild that cache. So if any
+    // non-capturing test hits the `backup_corrupt_config` `error!` callsite before a
+    // capturing test does, the callsite is disabled forever and the capture silently
+    // misses its line — order-dependent, parallel-only, passes-in-isolation. The
+    // sibling `scribe-app/src/log_capture.rs` already carried this fix; the core
+    // harness never got it.
+    //
+    // Fix: install a permanent, SILENT, TRACE-level global default once. It emits
+    // nothing (a bare registry + LevelFilter, no fmt layer) but keeps every
+    // callsite's interest ENABLED so the per-capture thread-local layer below always
+    // receives events. The serial lock then keeps concurrent captures from
+    // interleaving on the shared interest cache; poison is recovered so a panic
+    // under capture does not cascade.
+    static GLOBAL_INIT: std::sync::Once = std::sync::Once::new();
+    GLOBAL_INIT.call_once(|| {
+        let _ = tracing::subscriber::set_global_default(
+            tracing_subscriber::registry().with(tracing_subscriber::filter::LevelFilter::TRACE),
+        );
+    });
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
     let logs = CapturedLogs::default();
     let layer = CaptureLayer { logs: logs.clone() };
     let subscriber = tracing_subscriber::registry().with(layer);

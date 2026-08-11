@@ -35,8 +35,21 @@ jobs:
       - name: Harden the runner (egress block)
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
         with:
-          # Block-mode egress firewall. dependency-review-action only reaches
-          # the GitHub dependency-graph API; checkout reaches github.com.
+          # Block-mode egress firewall. With `show-openssf-scorecard: false`
+          # below, dependency-review-action reaches ONLY the GitHub
+          # dependency-graph API; checkout reaches github.com.
+          #
+          # This comment used to assert that unconditionally, and it was wrong
+          # in a way that cost a red gate: the action's scorecard feature is ON
+          # by default and calls api.deps.dev and api.securityscorecards.dev,
+          # both of which this allowlist blocks at the OS. The failure surfaced
+          # as an undici "fetch failed" — NOT as the checkout or merge-ref
+          # error it reads like — and only on PRs that actually change a
+          # dependency manifest, because a PR with no manifest change performs
+          # zero scorecard lookups. The first head to touch Cargo.lock was the
+          # first to go red. Turning the feature off is what makes this
+          # allowlist honest; do not widen it back without re-enabling the
+          # feature that needs it.
           egress-policy: block
           disable-sudo: true
           allowed-endpoints: >
@@ -51,4 +64,13 @@ jobs:
           fail-on-severity: high
           # deny.toml is the authoritative license gate — see header.
           license-check: false
+          # OFF, and load-bearing rather than a preference: this input DEFAULTS
+          # TO TRUE, and the scorecard lookup calls api.deps.dev +
+          # api.securityscorecards.dev, which the harden-runner egress block
+          # above denies. Left on, every PR that changes Cargo.lock fails the
+          # gate on a network error that looks nothing like its cause. The
+          # OpenSSF signal is also not what this gate is FOR — it is a PR-time
+          # vulnerability diff, and cargo-deny/deny.toml remains the
+          # authoritative supply-chain gate over the whole tree.
+          show-openssf-scorecard: false
           comment-summary-in-pr: on-failure

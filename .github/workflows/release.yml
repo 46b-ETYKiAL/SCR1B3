@@ -19,7 +19,44 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # --------------------------------------------------------------------------
+  # License-delivery gate. Runs BEFORE anything is built so a release can never
+  # publish an artifact that omits the license texts it is legally required to
+  # carry. The shipped binary embeds 22 OFL-1.1 / Apache-2.0 typefaces plus a
+  # third-party word list; OFL-1.1 s2 requires the license to accompany every
+  # copy, and until this gate existed the primary .tar.gz held only the binary.
+  #
+  # This asserts over the packaging manifest (this workflow) and the repo tree
+  # -- it builds nothing, so it is seconds, not minutes. Every build job gates
+  # on it via `needs:`.
+  # --------------------------------------------------------------------------
+  license-delivery:
+    name: License delivery (fonts must ship their licenses)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install PyYAML
+        run: python3 -m pip install --user --disable-pip-version-check pyyaml
+      - name: Verify every artifact path stages its license texts
+        run: python3 packaging/verify_license_delivery.py
+      - name: Verify the collector itself produces a complete license set
+        run: |
+          set -euo pipefail
+          sh packaging/collect-licenses.sh "${PWD}" /tmp/license-probe
+          echo "--- staged tree ---"
+          find /tmp/license-probe -type f | sort
+          n=$(find /tmp/license-probe/licenses/fonts -type f | wc -l)
+          [ "$n" -gt 0 ] || { echo "::error::no font licenses staged"; exit 1; }
+          test -s /tmp/license-probe/licenses/dictionaries/en_US-PROVENANCE.txt
+          echo "font license files staged: $n"
+
   build:
+    needs: license-delivery
     name: build ${{ matrix.target }}
     permissions:
       contents: read
@@ -33,6 +70,17 @@ jobs:
             target: x86_64-pc-windows-msvc
           - os: macos-latest
             target: aarch64-apple-darwin
+          # Intel macOS. SCR1B3 previously shipped NO x86_64 macOS build at all,
+          # so every Intel Mac was unserved — `packaging/install.sh` resolves
+          # `scr1b3-x86_64-apple-darwin.tar.gz` on such a host and 404'd, and the
+          # in-app updater reported "no build for your platform". It is
+          # CROSS-BUILT on the Apple-Silicon runner via the universal Apple
+          # toolchain (rustup adds the target; Apple's clang emits a native
+          # x86_64 Mach-O) rather than on the scarce, queue-starved `macos-13`
+          # Intel runner. This is the identical mechanism the sibling C0PL4ND
+          # release matrix already uses for this exact triple.
+          - os: macos-latest
+            target: x86_64-apple-darwin
     runs-on: ${{ matrix.os }}
     steps:
       - name: Harden the runner (egress audit)
@@ -113,44 +161,99 @@ jobs:
           # NOTICE-file convention and the OFL/UFL §3 redistribution clause for
           # the bundled fonts. Generated only on Linux because output is
           # platform-independent (avoids 3× redundant runs).
-          cargo install cargo-about --locked --version "^0.6" || true
-          cargo about init --no-handlebars 2>/dev/null || true
-          cargo about generate about.hbs --output-file THIRD-PARTY-LICENSES-RUST.html 2>/dev/null \
-            || cargo about generate --format json --output-file THIRD-PARTY-LICENSES-RUST.json \
-            || echo "cargo-about generate skipped (config not yet committed)"
+          set -euo pipefail
+          # No error swallowing. This step previously ran
+          #   cargo about init --no-handlebars 2>/dev/null || true
+          #   cargo about generate about.hbs ... 2>/dev/null || ... || echo "skipped"
+          # with `about.hbs` never committed, so it ALWAYS failed, the failure
+          # was hidden, and no inventory was ever published -- while
+          # THIRD-PARTY-LICENSES.md told readers one was generated at release
+          # time. The template now lives at packaging/about.hbs (tracked) and
+          # any failure here fails the release, which is the correct behaviour
+          # for a legal-compliance artifact.
+          cargo install cargo-about --locked --version "^0.6"
+          cargo about generate packaging/about.hbs \
+            --output-file THIRD-PARTY-LICENSES-RUST.html
+          # A zero-byte file would upload "successfully" and satisfy nobody.
+          [ -s THIRD-PARTY-LICENSES-RUST.html ] \
+            || { echo "::error::cargo-about produced an empty inventory"; exit 1; }
+          echo "generated THIRD-PARTY-LICENSES-RUST.html ($(wc -c < THIRD-PARTY-LICENSES-RUST.html) bytes)"
       - name: Upload third-party license inventory
         if: runner.os == 'Linux'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: third-party-licenses-rust
-          path: |
-            THIRD-PARTY-LICENSES-RUST.html
-            THIRD-PARTY-LICENSES-RUST.json
-          if-no-files-found: warn
+          path: THIRD-PARTY-LICENSES-RUST.html
+          # `warn` would let a missing inventory pass silently -- the exact
+          # failure mode this change exists to remove. The `release` job
+          # publishes every downloaded artifact, so this file becomes a release
+          # asset; if it is absent, the release is incomplete and must fail.
+          if-no-files-found: error
       - name: Package + checksum
         shell: bash
         run: |
+          set -euo pipefail
           mkdir -p dist
           bin="scr1b3"
           [ "${{ runner.os }}" = "Windows" ] && bin="scr1b3.exe"
-          cp "target/${{ matrix.target }}/release/$bin" "dist/" 2>/dev/null || true
+
+          # Assemble the archive contents in a staging dir OUTSIDE `dist/`.
+          # `dist/*` is uploaded verbatim as the job's artifact, so staging in
+          # place would publish loose LICENSE/licenses/ files as stray release
+          # assets. The staging dir keeps `dist/` to exactly the two intended
+          # assets: the tarball and its .sha256 sidecar.
+          stage=pkg-stage
+          rm -rf "$stage"; mkdir -p "$stage"
+          cp "target/${{ matrix.target }}/release/$bin" "$stage/"
+
+          # License delivery is MANDATORY. The binary embeds 22 OFL-1.1 /
+          # Apache-2.0 typefaces plus a third-party word list; OFL-1.1 s2
+          # requires the license text to accompany every copy. This tarball
+          # previously contained ONLY the binary -- not even LICENSE-MIT.
+          # The collector exits non-zero (failing the job) if any license is
+          # missing, so an unlicensed archive can never be produced.
+          sh packaging/collect-licenses.sh "${PWD}" "$stage"
+
+          # Explicit member list: the binary stays at the archive root (the
+          # .deb / AppImage / .app jobs extract it by bare name), and the
+          # license tree rides alongside it. Naming members explicitly means a
+          # future edit cannot silently drop the licenses.
+          tar -czf "dist/scr1b3-${{ matrix.target }}.tar.gz" -C "$stage" \
+            "$bin" LICENSE-MIT THIRD-PARTY-LICENSES.md licenses
+          echo "--- archive contents ---"
+          tar -tzf "dist/scr1b3-${{ matrix.target }}.tar.gz"
+
           cd dist
-          tar -czf "scr1b3-${{ matrix.target }}.tar.gz" "$bin" 2>/dev/null || true
-          # Drop the raw binary now that it's archived: it is NOT a release asset
-          # and, being named just `scr1b3`/`scr1b3.exe`, the linux + macOS copies
-          # would collide as same-named assets and fail the upload. Only the
-          # target-prefixed `scr1b3-<target>.{tar.gz,sha256}` ship from this job;
-          # the Windows installer .exe is built by the `windows-installer` job.
-          rm -f "$bin"
           # The checksum sidecar MUST be named `<asset>.sha256` —
-          # `scr1b3-<target>.tar.gz.sha256` — to match the in-app updater
-          # (`build_release_info` looks for `{asset}.sha256`) and the signature
-          # convention (`<asset>.tar.gz.minisig`). The old `scr1b3-<target>.sha256`
-          # name (without the `.tar.gz` infix) is why every auto-update wrongly
-          # reported "no build for your platform": the updater found the tarball +
-          # its `.minisig` but never the mis-named sha, so `find()` returned None.
+          # `scr1b3-<target>.tar.gz.sha256` — because the `release` job
+          # concatenates every one of these into the single published
+          # `SHA256SUMS` manifest, and each line's filename field must be the
+          # exact published asset name. (The per-artifact `.sha256` itself is
+          # pruned before upload; it is a build-internal intermediate now.)
+          #
+          # This was previously
+          #   if command -v sha256sum >/dev/null; then ... 2>/dev/null || true; fi
+          # — a DOUBLE silent-skip: stock macOS ships `shasum`, not `sha256sum`,
+          # so on the macOS leg the guard was false and the checksum was skipped
+          # with no error, and even on Linux a failure was swallowed by
+          # `|| true`. A skipped checksum silently dropped that platform's line
+          # from SHA256SUMS, and `packaging/install.sh` refuses to install an
+          # asset it cannot find a checksum for. Handle BOTH tool names and fail
+          # LOUDLY when neither exists.
+          if command -v sha256sum >/dev/null 2>&1; then
+            SHACMD="sha256sum"
+          elif command -v shasum >/dev/null 2>&1; then
+            SHACMD="shasum -a 256"
+          else
+            echo "::error::no sha256 tool on this runner (need sha256sum or shasum) — refusing to publish an unchecksummed artifact"
+            exit 1
+          fi
           tgz="scr1b3-${{ matrix.target }}.tar.gz"
-          if command -v sha256sum >/dev/null; then sha256sum "$tgz" > "$tgz.sha256" 2>/dev/null || true; fi
+          $SHACMD "$tgz" > "$tgz.sha256"
+          # A zero-byte sidecar would satisfy `[ -f ]` downstream and produce an
+          # empty SHA256SUMS line. Assert real content.
+          [ -s "$tgz.sha256" ] || { echo "::error::checksum for $tgz is empty"; exit 1; }
+          cat "$tgz.sha256"
       - name: Upload artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -213,10 +316,14 @@ jobs:
           tar -xzf "$tgz" -C payload
           [ -f payload/scr1b3.exe ] || { echo "::error::scr1b3.exe not found in tarball"; exit 1; }
           if [ -d app/assets ]; then cp -r app/assets payload/assets; fi
-          for f in LICENSE-MIT LICENSE-APACHE README.md; do
-            [ -f "app/$f" ] && cp "app/$f" payload/ || true
-          done
+          # License delivery is MANDATORY, not the previous best-effort
+          # `[ -f … ] && cp … || true` (which silently shipped nothing when a
+          # file was absent, and never carried a single font license text).
+          # The collector fails the job if any bundled font's license is
+          # missing — OFL-1.1 s2 requires it to accompany every copy.
+          sh app/packaging/collect-licenses.sh app payload
           find payload -maxdepth 2 | head -40
+          echo "font license files in payload: $(find payload/licenses/fonts -type f | wc -l)"
       - name: Build native installer (.exe)
         shell: bash
         env:
@@ -246,6 +353,222 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: scr1b3-windows-installer
+          path: dist/*
+          if-no-files-found: error
+
+  windows-msi:
+    # The MSI. `crates/scribe-app/wix/main.wxs` was already compiled, ICE-validated
+    # and dark-verified by ci.yml's `msi-build` job — but ONLY there, so the
+    # package was built, proven and then thrown away: release.yml had no MSI step
+    # and no release has ever carried one. This job publishes it.
+    #
+    # It CONSUMES the `build` job's artifact instead of rebuilding, which is the
+    # one decision here that matters. ci.yml's job runs its own `cargo build`
+    # because it is a compile-check with no release artifact in scope; a release
+    # MUST NOT do that, because the `build` job's binary is not reproducible from
+    # a plain `cargo build`:
+    #   * `Embed release public key` patches the REAL minisign pubkey into
+    #     verify.rs before compiling. A freshly-built exe keeps the fail-closed
+    #     placeholder, so an MSI-installed SCR1B3 would reject EVERY update it is
+    #     ever offered — a silent, permanent auto-update outage for MSI users only.
+    #   * `cargo auditable` embeds the scannable dependency SBOM.
+    #   * Windows RUSTFLAGS add `-C control-flow-guard` plus --remap-path-prefix.
+    # Rebuilding would ship an exe that is unsigned-key, un-auditable and
+    # un-hardened relative to the .tar.gz of the same release. So: same bytes,
+    # one build, three wrappers (tar.gz, native CRT .exe, .msi).
+    name: Windows installer (.msi)
+    needs: build
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    env:
+      # WiX 3.x is required (main.wxs uses the wix/2006/wi namespace, which WiX
+      # 4/5 do not accept). Pinned to a release asset + SHA-256 rather than
+      # relying on whatever the runner image happens to preinstall, so a runner
+      # image change cannot silently swap the compiler under the gate. Kept
+      # byte-identical to ci.yml's msi-build job — if one moves, move both.
+      WIX_URL: "https://github.com/wixtoolset/wix3/releases/download/wix3141rtm/wix314-binaries.zip"
+      WIX_SHA256: "6ac824e1642d6f7277d0ed7ea09411a508f6116ba6fae0aa5f2c7daa2ff43d31"
+      REGISTRY_ROW_FLOOR: "300"
+    steps:
+      - name: Harden the runner (egress audit)
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Download Windows binary artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: scr1b3-x86_64-pc-windows-msvc
+          path: winbin
+      - name: Assemble payload (binary + licenses)
+        shell: bash
+        # License delivery is MANDATORY here for exactly the reason it is in the
+        # native-CRT installer job. SCR1B3 include_bytes!-embeds 22 typefaces
+        # (21 OFL-1.1 + Syncopate Apache-2.0) and include_str!-embeds a word
+        # list; OFL-1.1 s2 requires the license text to accompany EVERY copy,
+        # and a font compiled into the .exe cannot serve its own license. The
+        # MSI previously carried ONE file - scr1b3.exe - so an MSI install put
+        # 22 fonts on disk with the license text nowhere. That is the same
+        # breach the .deb/.AppImage/.dmg once had.
+        #
+        # The collector exits non-zero (failing the job) when any bundled font
+        # has no license text, so an unlicensed MSI cannot be produced. It is
+        # staged into its OWN directory rather than into payload/ so `heat` can
+        # harvest the license tree without also re-harvesting scr1b3.exe, which
+        # main.wxs already declares.
+        run: |
+          set -euo pipefail
+          tgz="$(find winbin -name '*.tar.gz' | head -1)"
+          [ -n "$tgz" ] || { echo "::error::no windows tarball under winbin/"; exit 1; }
+          mkdir -p payload
+          tar -xzf "$tgz" -C payload
+          [ -f payload/scr1b3.exe ] || { echo "::error::scr1b3.exe not found in tarball"; exit 1; }
+          ls -la payload/scr1b3.exe
+          sh packaging/collect-licenses.sh "${PWD}" licstage
+          n=$(find licstage/licenses/fonts -type f | wc -l)
+          echo "font license files staged: $n"
+          [ "$n" -gt 0 ] || { echo "::error::no font licenses staged"; exit 1; }
+      - name: Install WiX 3.14 (pinned + checksum-verified)
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -sSLf -o wix314-binaries.zip "$WIX_URL"
+          # Verify BEFORE extracting: an unverified archive is never unpacked.
+          echo "${WIX_SHA256}  wix314-binaries.zip" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/wix"
+          if command -v unzip >/dev/null 2>&1; then
+            unzip -q -o wix314-binaries.zip -d "$RUNNER_TEMP/wix"
+          elif command -v 7z >/dev/null 2>&1; then
+            7z x -y -o"$RUNNER_TEMP/wix" wix314-binaries.zip > /dev/null
+          else
+            echo "::error::no archive extractor available (tried unzip, 7z)"
+            exit 1
+          fi
+          for t in candle.exe light.exe dark.exe heat.exe; do
+            [ -f "$RUNNER_TEMP/wix/$t" ] || { echo "::error::WiX archive did not contain $t"; exit 1; }
+          done
+      - name: Compile the installer source (candle)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # No Rust toolchain in this job (it builds nothing), so the version comes
+          # from Cargo.toml the same way the macOS installer job reads it. The
+          # workspace root carries the real number and scribe-app inherits it via
+          # `version.workspace = true`.
+          VER="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+          # WiX requires x.x.x.x with each field <= 65534, so a non-numeric or
+          # empty version must stop here rather than reach candle as garbage.
+          echo "$VER" | grep -qE '^[0-9]+(\.[0-9]+){1,3}$' \
+            || { echo "::error::could not resolve a numeric version (got '$VER')"; exit 1; }
+          echo "installer version = $VER"
+          BIN_DIR="$(pwd -W)/payload"
+          LIC_DIR="$(pwd -W)/licstage"
+          # Harvest the staged license tree into a WiX fragment. Generated,
+          # not hand-authored: a hand-written list of 22 font directories
+          # rots the moment a font is added or dropped, and the whole point
+          # of the collector is that the set is dynamic. The XSL adds the
+          # RemoveFolder rows heat never emits -- without them `light` fails
+          # with one LGHT0204/ICE64 per harvested directory, because SCR1B3
+          # installs into the user profile. Authoring the rows keeps ICE64
+          # ENFORCED instead of suppressing it -- the same trade main.wxs
+          # already documents for APPLICATIONFOLDER / ProgramsFolder.
+          "$RUNNER_TEMP/wix/heat.exe" dir "$LIC_DIR" -nologo \
+            -cg LicenseComponents -dr APPLICATIONFOLDER \
+            -ag -srd -sfrag -var var.LicenseStageDir \
+            -t crates/scribe-app/wix/license-harvest.xsl \
+            -out licenses.wxs
+          # Non-vacuity: a harvest that produced nothing would compile and
+          # link perfectly and ship an MSI with no license texts at all --
+          # the exact silent under-delivery this step exists to prevent.
+          harvested=$(grep -c '<File ' licenses.wxs || true)
+          echo "harvested license files: $harvested"
+          [ "$harvested" -ge 25 ] || { echo "::error::heat harvested only $harvested license file(s); expected >= 25 (22 fonts + top-level docs)"; exit 1; }
+          "$RUNNER_TEMP/wix/candle.exe" -nologo -arch x64 \
+            -dVersion="$VER" -dCargoTargetBinDir="$BIN_DIR" -dLicenseStageDir="$LIC_DIR" \
+            -out main.wixobj crates/scribe-app/wix/main.wxs
+          [ -s main.wixobj ] || { echo "::error::candle reported success but produced no .wixobj"; exit 1; }
+          "$RUNNER_TEMP/wix/candle.exe" -nologo -arch x64 \
+            -dLicenseStageDir="$LIC_DIR" \
+            -out licenses.wixobj licenses.wxs
+          [ -s licenses.wixobj ] || { echo "::error::candle produced no .wixobj for the license fragment"; exit 1; }
+      - name: Link the installer (light, with ICE validation)
+        shell: bash
+        # ICE validation stays ON, and exactly the same two ICEs are suppressed
+        # as in ci.yml's msi-build job — see that job for the full rationale.
+        # Both suppressions were re-confirmed empirically, not assumed:
+        #   * with NO -sice flags, light exits 204 on ICE38 (load-bearing);
+        #   * with only ICE38 suppressed, ICE91 is warning LGHT1076 and light
+        #     exits 0 (kept for intent/-wx safety, not because it is needed);
+        #   * ICE64 does not appear at all — main.wxs's RemoveFolder rows resolve
+        #     it, so it stays ENFORCED rather than suppressed.
+        # Do NOT widen this list to make an edit pass.
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/wix/light.exe" -nologo \
+            -ext WixUIExtension -ext WixUtilExtension \
+            -sice:ICE38 -sice:ICE91 \
+            -out scr1b3-installer.msi main.wixobj licenses.wixobj
+          [ -f scr1b3-installer.msi ] || { echo "::error::light reported success but produced no .msi"; exit 1; }
+          sz=$(wc -c < scr1b3-installer.msi)
+          echo "MSI size = $sz bytes"
+          [ "$sz" -gt 100000 ] || { echo "::error::MSI is implausibly small ($sz bytes)"; exit 1; }
+      - name: Assert the compiled MSI carries the registry table the app expects
+        shell: bash
+        # Same read-it-back-out-of-the-package assertion ci.yml makes, kept here
+        # so the artifact that is actually PUBLISHED is the one verified.
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/wix/dark.exe" -nologo scr1b3-installer.msi -out decompiled.wxs
+          [ -s decompiled.wxs ] || { echo "::error::dark produced no output"; exit 1; }
+          built=$(grep -c '<RegistryValue' decompiled.wxs || true)
+          src=$(grep -c '<RegistryValue' crates/scribe-app/wix/main.wxs || true)
+          echo "RegistryValue rows: source=$src compiled=$built"
+          if [ "$built" -lt "$REGISTRY_ROW_FLOOR" ]; then
+            echo "::error::the compiled MSI carries only $built RegistryValue rows (floor $REGISTRY_ROW_FLOOR) -- the registry table did not make it into the package."
+            exit 1
+          fi
+          if [ "$built" -ne "$src" ]; then
+            echo "::error::registry rows differ between source ($src) and compiled MSI ($built) -- rows were dropped or merged during the build."
+            exit 1
+          fi
+          # License delivery, asserted against the BUILT package rather than
+          # the staging directory. A staged tree only proves the collector
+          # ran; the File table is what proves the texts actually SHIP. The
+          # MSI carried exactly one File row (scr1b3.exe) before the license
+          # components existed, so this is the check that would have caught
+          # it.
+          licfiles=$(grep -cE '<File [^>]*Name="(OFL|LICENSE|UFL)[^"]*"' decompiled.wxs || true)
+          echo "license files in the compiled MSI: $licfiles"
+          [ "$licfiles" -ge 22 ] || { echo "::error::the compiled MSI carries only $licfiles font license file(s) (expected >= 22) -- OFL-1.1 s2 requires the text to accompany every copy."; exit 1; }
+          for doc in LICENSE-MIT THIRD-PARTY-LICENSES.md; do
+            grep -q "Name=\"$doc\"" decompiled.wxs || { echo "::error::the compiled MSI does not carry $doc"; exit 1; }
+          done
+      - name: Name + checksum the release asset
+        shell: bash
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          TAG="${REF_NAME//\//-}"
+          mv scr1b3-installer.msi "dist/scr1b3-${TAG}-x86_64.msi"
+          cd dist
+          # Unconditional, exactly like the native-CRT installer job above. This
+          # deliberately does NOT copy the `build` job's
+          # `if command -v sha256sum >/dev/null; then ... || true; fi` form: that
+          # guard silently skips the checksum on any runner without sha256sum,
+          # and a missing .sha256 makes packaging/install.sh refuse to install.
+          # This job only ever runs on windows-latest, where Git-Bash always
+          # provides sha256sum, so a failure here is a real failure.
+          for m in *.msi; do sha256sum "$m" > "$m.sha256"; done
+          ls -la; cat *.sha256
+      - name: Upload MSI artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: scr1b3-windows-msi
           path: dist/*
           if-no-files-found: error
 
@@ -298,9 +621,16 @@ jobs:
           rm -rf "$deb"
           mkdir -p "$deb/usr/bin" "$deb/usr/share/applications" \
                    "$deb/usr/share/icons/hicolor" "$deb/DEBIAN"
-          tar -xzf "$tgz" -C "$deb/usr/bin"
+          # Extract ONLY the binary: the tarball also carries the license tree,
+          # which belongs in /usr/share/doc, not /usr/bin.
+          tar -xzf "$tgz" -C "$deb/usr/bin" scr1b3
           [ -f "$deb/usr/bin/scr1b3" ] || { echo "::error::scr1b3 not in tarball"; exit 1; }
           chmod 0755 "$deb/usr/bin/scr1b3"
+          # License texts at the Debian-standard location. Mandatory: the
+          # collector fails the job if any bundled font's license is missing
+          # (OFL-1.1 s2 — the license must accompany every copy).
+          mkdir -p "$deb/usr/share/doc/scr1b3"
+          sh app/packaging/collect-licenses.sh app "$deb/usr/share/doc/scr1b3"
           install -m0644 app/packaging/linux/scr1b3.desktop "$deb/usr/share/applications/scr1b3.desktop"
           cp -r app/assets/icons/hicolor/. "$deb/usr/share/icons/hicolor/"
           # Control file: reuse the committed template, substitute the real
@@ -321,8 +651,12 @@ jobs:
           appdir=AppDir
           rm -rf "$appdir"
           mkdir -p "$appdir/usr/bin" "$appdir/usr/share/applications" "$appdir/usr/share/icons/hicolor"
-          tar -xzf "$tgz" -C "$appdir/usr/bin"
+          # Extract ONLY the binary (see the .deb note above).
+          tar -xzf "$tgz" -C "$appdir/usr/bin" scr1b3
           chmod 0755 "$appdir/usr/bin/scr1b3"
+          # License texts inside the AppImage (OFL-1.1 s2). Mandatory.
+          mkdir -p "$appdir/usr/share/doc/scr1b3"
+          sh app/packaging/collect-licenses.sh app "$appdir/usr/share/doc/scr1b3"
           install -m0644 app/packaging/linux/scr1b3.desktop "$appdir/usr/share/applications/scr1b3.desktop"
           install -m0644 app/packaging/linux/scr1b3.desktop "$appdir/scr1b3.desktop"            # top-level (required)
           cp -r app/assets/icons/hicolor/. "$appdir/usr/share/icons/hicolor/"
@@ -353,13 +687,27 @@ jobs:
           if-no-files-found: error
 
   macos-installer:
-    # Builds the macOS first-install artifacts from the compiled aarch64 binary:
-    # a proper SCR1B3.app bundle and a compressed .dmg. First-install only (not
-    # an auto-update target). The .icns is generated on the runner from the
-    # 1024px master PNG via iconutil (preinstalled) — no committed binary icon.
-    name: macOS installer (.app + .dmg)
+    # Builds the macOS first-install artifacts from the compiled binary: a proper
+    # SCR1B3.app bundle and a compressed .dmg. First-install only (not an
+    # auto-update target). The .icns is generated on the runner from the 1024px
+    # master PNG via iconutil (preinstalled) — no committed binary icon.
+    #
+    # Matrixed over BOTH macOS arches. It previously produced an aarch64 .dmg
+    # only, so an Intel Mac user had no installer at all; the Intel leg consumes
+    # the x86_64-apple-darwin tarball the build matrix now produces. Per-arch
+    # .dmg (rather than one `lipo` universal bundle) keeps the naming aligned
+    # with the tarballs and keeps each leg independently reproducible.
+    name: macOS installer (.app + .dmg, ${{ matrix.arch }})
     needs: build
     runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: aarch64
+            target: aarch64-apple-darwin
+          - arch: x86_64
+            target: x86_64-apple-darwin
     permissions:
       contents: read
     steps:
@@ -375,7 +723,7 @@ jobs:
       - name: Download macOS binary artifact
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: scr1b3-aarch64-apple-darwin
+          name: scr1b3-${{ matrix.target }}
           path: macbin
       - name: Build .app bundle + .dmg
         shell: bash
@@ -393,8 +741,13 @@ jobs:
           appbundle="SCR1B3.app"
           rm -rf "$appbundle"
           mkdir -p "$appbundle/Contents/MacOS" "$appbundle/Contents/Resources"
-          tar -xzf "$tgz" -C "$appbundle/Contents/MacOS"
+          # Extract ONLY the binary; licenses go in Contents/Resources, which is
+          # where a .app bundle is expected to carry them.
+          tar -xzf "$tgz" -C "$appbundle/Contents/MacOS" scr1b3
           chmod 0755 "$appbundle/Contents/MacOS/scr1b3"
+          # License texts inside the bundle (OFL-1.1 s2). Mandatory: the
+          # collector fails the job rather than shipping a breach.
+          sh app/packaging/collect-licenses.sh app "$appbundle/Contents/Resources/licenses"
           # Info.plist: reuse the committed template, substitute the real version
           # into the two 0.1.0 placeholders (CFBundleVersion + ShortVersionString).
           sed -E "s|<string>0\.1\.0</string>|<string>${VER}</string>|g" \
@@ -414,7 +767,7 @@ jobs:
           rm -rf "$stage"; mkdir -p "$stage"
           cp -R "$appbundle" "$stage/"
           ln -s /Applications "$stage/Applications"
-          dmg="dist/scr1b3-${TAG}-aarch64.dmg"
+          dmg="dist/scr1b3-${TAG}-${{ matrix.arch }}.dmg"
           hdiutil create -volname "SCR1B3" -srcfolder "$stage" -ov -format UDZO "$dmg"
 
           # ---- checksum (macOS ships `shasum`, not `sha256sum`) --------------
@@ -424,12 +777,12 @@ jobs:
       - name: Upload macOS installer
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: scr1b3-macos-installer
+          name: scr1b3-macos-installer-${{ matrix.arch }}
           path: dist/*
           if-no-files-found: error
 
   release:
-    needs: [build, windows-installer, linux-installers, macos-installer]
+    needs: [build, windows-installer, windows-msi, linux-installers, macos-installer]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
     permissions:
@@ -460,6 +813,58 @@ jobs:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: dist
+      # Aggregate every per-artifact `.sha256` into ONE published `SHA256SUMS`
+      # manifest, mirroring the sibling C0PL4ND release. Generated BEFORE the
+      # signing step so the existing sign loop produces `SHA256SUMS.minisig` and
+      # the fail-closed self-verify gate checks it like any other asset.
+      #
+      # Why: the release previously published FOUR files per artifact — X,
+      # X.minisig, X.sha256 and X.sha256.minisig — i.e. a signature over a
+      # checksum whose artifact is already independently signed. That
+      # quadruplication was 28 of the 31 published assets and added no security
+      # (nothing in this repo, the installer, or the updater ever fetched a
+      # `.sha256.minisig`). One SIGNED aggregate manifest is strictly stronger
+      # than N UNSIGNED per-artifact sidecars: `packaging/install.sh` now
+      # verifies SHA256SUMS against the embedded key before reading a digest
+      # out of it, so the checksum comparison is finally an authenticity
+      # control rather than a corruption check.
+      #
+      # Each producing job runs its checksum tool from INSIDE its `dist/`, so
+      # every `.sha256` line already carries the BARE published asset name —
+      # exactly what a consumer greps for.
+      - name: Aggregate checksums (SHA256SUMS)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t shas < <(find dist -type f -name '*.sha256' | sort)
+          if [ "${#shas[@]}" -eq 0 ]; then
+            echo "::error::no .sha256 sidecars found under dist/ — refusing to publish a release with no checksum manifest"
+            exit 1
+          fi
+          # NOT `cat *.sha256 > SHA256SUMS 2>/dev/null || true` — that form
+          # publishes an EMPTY manifest when the glob misses, and an empty
+          # SHA256SUMS still satisfies a `[ -f ]` guard downstream while making
+          # every consumer's lookup fail.
+          # `tr -d '\r'` is defence-in-depth against a CRLF-writing producer. The
+          # sibling C0PL4ND release shipped a SHA256SUMS whose two Windows lines
+          # ended in a stray CR (a PowerShell `Out-File`), which silently breaks
+          # every exact-name lookup a consumer does. SCR1B3 generates all of its
+          # sidecars from bash today, but the aggregate is load-bearing enough to
+          # normalise unconditionally.
+          cat "${shas[@]}" | tr -d '\r' | sort -u > dist/SHA256SUMS
+          lines=$(grep -c . dist/SHA256SUMS || true)
+          [ "$lines" -eq "${#shas[@]}" ] || {
+            echo "::error::SHA256SUMS has $lines line(s) from ${#shas[@]} sidecar(s) — malformed or duplicated"; exit 1; }
+          # Every published archive/installer MUST have a line. A silently
+          # skipped checksum on one platform is exactly the defect this asserts
+          # away (stock macOS has `shasum`, not `sha256sum`).
+          missing=0
+          while IFS= read -r a; do
+            base=$(basename "$a")
+            grep -qE "[ *]${base}\$" dist/SHA256SUMS || { echo "::error::no SHA256SUMS entry for $base"; missing=1; }
+          done < <(find dist -type f \( -name '*.tar.gz' -o -name '*.exe' -o -name '*.msi' -o -name '*.deb' -o -name '*.AppImage' -o -name '*.dmg' \))
+          [ "$missing" -eq 0 ] || exit 1
+          echo "----- dist/SHA256SUMS -----"; cat dist/SHA256SUMS
       # Generate the Tier-1 signed-manifest payload (latest.json) BEFORE the
       # signing step, so the existing sign loop produces `latest.json.minisig`
       # and the fail-closed self-verify gate checks it like any other asset. The
@@ -542,7 +947,22 @@ jobs:
               "product": "scr1b3",
               "version": ver,
               "release_index": release_index,
-              "minimum_version": "0.4.0",
+              # Raised to 0.4.63 (the first sidecar-tolerant updater —
+              # `sidecar_urls` returning an EMPTY url for an absent sidecar
+              # instead of a hard Err) BECAUSE this release stops publishing the
+              # per-artifact `.sha256`. A client BELOW this floor is a pre-0.4.63
+              # updater that still REQUIRES that sidecar; the floor check in
+              # `resolve_update` runs BEFORE sidecar resolution, so such a client
+              # is told "a fresh install is required" — a graceful message —
+              # instead of the cryptic "missing its .sha256 sidecar" refusal it
+              # would otherwise hit. v0.4.63+ clients verify via the signed
+              # manifest SHA-256 and auto-update seamlessly.
+              #
+              # This floor MUST NOT be raised without a matching
+              # `crates/scribe-core/src/update/net.rs` change, and it must name
+              # the FIRST version whose updater tolerates the absent sidecar —
+              # never a later one, which would strand clients needlessly.
+              "minimum_version": "0.4.63",
               "published_utc": now.strftime(fmt),
               "valid_until_utc": (now + datetime.timedelta(days=14)).strftime(fmt),
               "assets": assets,
@@ -565,7 +985,7 @@ jobs:
       - name: Attest build provenance (SLSA)
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
-          subject-path: "dist/**/*.tar.gz, dist/**/*.exe, dist/**/*.deb, dist/**/*.AppImage, dist/**/*.dmg, dist/latest.json"
+          subject-path: "dist/**/*.tar.gz, dist/**/*.exe, dist/**/*.msi, dist/**/*.deb, dist/**/*.AppImage, dist/**/*.dmg, dist/latest.json, dist/SHA256SUMS"
       # Sign every release asset with minisign (via rsign2 — the same tool the
       # key was generated with; its signatures verify against the embedded key
       # through the app's `minisign-verify` crate). The passwordless secret key
@@ -582,7 +1002,28 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "${MINISIGN_SECRET_KEY:-}" ]; then
-            echo "::warning::MINISIGN_SECRET_KEY not set — shipping checksummed but UNSIGNED artifacts (auto-update will reject them). See packaging/signing.md."
+            # This early return skips the signing AND the fail-closed self-verify
+            # gate below it, in one move — so with the secret unprovisioned the
+            # whole gate was unreachable and the release published artifacts the
+            # in-app updater is built to REJECT, green. It is now ref-sensitive:
+            # `require-signing-key.sh` EXITS 1 on a stable tag (hard failure), and
+            # 0 for a prerelease tag or a non-tag ref (warning + unsigned, the
+            # pre-existing behaviour, deliberately unchanged for non-tags).
+            # It lives in a script so the gate can be executed — and therefore
+            # shown to fail — by a test; an unfalsifiable gate is the defect.
+            #
+            # `src/` prefix, NOT a bare `packaging/…`: this job checks the repo
+            # out with `path: src` and declares no `working-directory:`/
+            # `defaults:`, so $PWD is $GITHUB_WORKSPACE and the tree is one level
+            # down — the same reason the self-verify below reads
+            # `src/crates/scribe-core/…`. Bare, `sh` exits 127 on a missing file
+            # under `set -e`, so a PRERELEASE tag with no key HARD-FAILED
+            # (the opposite of the documented warn-and-continue) and a stable tag
+            # failed before its ::error:: could print — the right outcome for the
+            # wrong reason. Pinned by
+            # `the_release_signing_step_calls_the_key_guard_before_returning_early`,
+            # which now asserts this prefix against the job's checkout `path:`.
+            sh src/packaging/require-signing-key.sh
             exit 0
           fi
           cargo install rsign2 --locked --version "^0.6"
@@ -648,6 +1089,40 @@ jobs:
           fi
           rm -f rsign.pub
           echo "release gate GREEN: $assets verified vs embedded key (crypto+identity+digest+parity+tamper)."
+      # De-clutter the published asset list. The sign + fail-closed self-verify
+      # gate above is UNCHANGED — it still signs and verifies EVERY staged file,
+      # including each per-artifact `.sha256`, so the hardening (coverage,
+      # crypto, identity, digest cross-check, count parity, tamper) is fully
+      # intact. We only drop, AFTER the gate and BEFORE upload, the sidecars the
+      # published set no longer needs:
+      #
+      #   * `<asset>.sha256`         — superseded by the SIGNED aggregate SHA256SUMS
+      #   * `<asset>.sha256.minisig` — a signature over a checksum whose artifact
+      #                                is already independently signed; nothing in
+      #                                this repo, `packaging/install.sh`, or the
+      #                                in-app updater has ever fetched one
+      #
+      # Every artifact KEEPS its own `<asset>.minisig` (the installer and the
+      # updater both bind to it), and `latest.json` / `SHA256SUMS` keep theirs.
+      # Net effect: ~31 published assets drop to ~17 with ZERO builds removed.
+      - name: Prune superseded checksum sidecars before publish
+        shell: bash
+        run: |
+          set -euo pipefail
+          before=$(find dist -type f | wc -l | tr -d ' ')
+          find dist -type f \( -name '*.sha256' -o -name '*.sha256.minisig' \) -delete
+          after=$(find dist -type f | wc -l | tr -d ' ')
+          echo "pruned $((before - after)) sidecar(s); ${after} asset(s) will be published"
+          # Guard: the SIGNED aggregate manifests MUST survive the prune, and so
+          # must every artifact's own signature. A prune that ate them would
+          # strand both the installer and the in-app updater.
+          for keep in latest.json latest.json.minisig SHA256SUMS SHA256SUMS.minisig; do
+            [ -f "dist/$keep" ] || { echo "::error::prune removed required $keep"; exit 1; }
+          done
+          n_art=$(find dist -type f \( -name '*.tar.gz' -o -name '*.exe' -o -name '*.msi' -o -name '*.deb' -o -name '*.AppImage' -o -name '*.dmg' \) | wc -l | tr -d ' ')
+          n_sig=$(find dist -type f \( -name '*.tar.gz.minisig' -o -name '*.exe.minisig' -o -name '*.msi.minisig' -o -name '*.deb.minisig' -o -name '*.AppImage.minisig' -o -name '*.dmg.minisig' \) | wc -l | tr -d ' ')
+          [ "$n_art" -eq "$n_sig" ] || { echo "::error::artifact/signature parity broken after prune ($n_art artifacts, $n_sig signatures)"; exit 1; }
+          find dist -type f | sort
       - name: Create GitHub Release
         # `gh release` ships on every GitHub-hosted runner, so no third-party
         # action is needed (zizmor superfluous-actions). The default GITHUB_TOKEN

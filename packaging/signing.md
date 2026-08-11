@@ -31,8 +31,17 @@ For each release artifact (`scr1b3-<target>.tar.gz`, the Windows
 ```sh
 echo "$MINISIGN_SECRET_KEY" > scr1b3.key
 minisign -S -s scr1b3.key -m <asset>        # -> <asset>.minisig
-sha256sum <asset> > <asset>.sha256
 ```
+
+Checksums are published as ONE aggregate manifest, not as a per-artifact
+sidecar. The build steps still write a per-artifact `<asset>.sha256` as a
+build-internal intermediate; the release job concatenates them into
+`dist/SHA256SUMS` **before** the sign loop (so `SHA256SUMS.minisig` is produced
+like any other signature) and then prunes every `*.sha256` /
+`*.sha256.minisig` before upload. A published release therefore carries
+`SHA256SUMS` + `SHA256SUMS.minisig` and one `.minisig` per artifact — from
+v0.4.63 on. The aggregate is SIGNED, whereas the per-artifact sidecar never
+was, so this strengthens the checksum path rather than relaxing it.
 
 The job emits `dist/latest.json` ahead of the loop — a deterministic,
 key-sorted manifest listing, per platform, each asset's `{asset_name, url,
@@ -49,8 +58,12 @@ other asset, producing `latest.json.minisig`.
    `select_best` / `select_update` / `build_release_info` flow was **removed** so
    an attacker who strips the manifest cannot downgrade to a weaker path).
 2. The resolved archive download is **pinned to the manifest's SIGNED `sha256`**.
-   The standalone `.sha256` sidecar is kept only as defense-in-depth and **must
-   AGREE** with the signed digest (a disagreement fails closed).
+   A standalone `.sha256` sidecar, **when a release still publishes one**, is
+   defense-in-depth only and **must AGREE** with the signed digest (a
+   disagreement fails closed). Releases from v0.4.63 on publish the signed
+   aggregate `SHA256SUMS` instead, so the sidecar is absent and the signed
+   pinned digest — the stronger of the two — stands alone. The `.minisig`
+   remains **mandatory**: an artifact with no signature is refused.
 3. The archive is then checksum- + minisign-verified
    (`update::verify::verify_artifact` against `EMBEDDED_PUBLIC_KEYS`) and only
    then applied. The manifest additionally enforces the freeze beacon
@@ -66,7 +79,7 @@ The signing flow above is **automated**, gated on the secrets/vars being set:
 
 | Secret / var | Kind | Purpose |
 |---|---|---|
-| `MINISIGN_SECRET_KEY` | secret | The **passwordless** ed25519 secret key (generate with `rsign generate -W`, or `minisign -G -W`). Present → the release job installs rsign2 and signs every asset (`*.minisig`). Absent → the job logs a `::warning::` and ships checksummed-but-**unsigned** artifacts (the in-app updater then rejects them — fail-closed). The CI signs with rsign2, the same tool used to generate the key; the app verifies with the `minisign-verify` crate (interoperable). |
+| `MINISIGN_SECRET_KEY` | secret | The **passwordless** ed25519 secret key (generate with `rsign generate -W`, or `minisign -G -W`). Present → the release job installs rsign2, signs every asset (`*.minisig`), and runs its fail-closed self-verify gate. Absent → `packaging/require-signing-key.sh` decides, by ref: a **stable tag** (`v0.4.63`) **FAILS the release** (`::error::`, exit 1) — an unsigned stable release is one no deployed client can auto-update to, because the updater is fail-closed; a **prerelease tag** (`v0.4.63-rc.1`) or a **non-tag** ref logs a `::warning::` and ships checksummed-but-**unsigned** artifacts. The CI signs with rsign2, the same tool used to generate the key; the app verifies with the `minisign-verify` crate (interoperable). |
 | `SCR1B3_MINISIGN_PUBLIC_KEY` | var (optional) | The PUBLIC key box-form. When set, the build job swaps it into `EMBEDDED_PUBLIC_KEY` at build time — an alternative to committing the key into `verify.rs` by hand. When unset, whatever is committed in `verify.rs` is used. |
 
 The real public key is committed in `crates/scribe-core/src/update/verify.rs` (`EMBEDDED_PUBLIC_KEY` — a public value). A maintainer activates signed auto-updates by adding the `MINISIGN_SECRET_KEY` secret; the matching public key is already embedded. Until the secret is set, releases are unsigned and the updater is inert by design — never insecure. (Use a passwordless key so the non-interactive CI sign needs no password secret.)

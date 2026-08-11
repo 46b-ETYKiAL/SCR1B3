@@ -4,7 +4,11 @@
 //! `OpenWithProgids` + `Capabilities` + `RegisteredApplications` (making SCR1B3 a
 //! first-class choice) and deep-link the user to the Default Apps UI to confirm.
 
-use super::windows_entries::{registry_entries, RegEntry};
+use super::windows_entries::{
+    append_cleanup_note, delete_error_is_benign, notify_shell_after_registration, registry_entries,
+    summarize, unregister_entries, FailedWrite, RegDelete, RegEntry, APP_NAME, APP_ROOT,
+    CLASS_ROOT,
+};
 use super::RegisterReport;
 use scribe_core::config::ClaimType;
 use std::os::windows::process::CommandExt;
@@ -45,6 +49,35 @@ pub(crate) fn apply_entry(e: &RegEntry) -> Result<(), String> {
     }
 }
 
+/// Apply one [`RegDelete`] via `reg.exe delete` under `HKCU`.
+///
+/// An ALREADY-ABSENT key or value is success: `reg.exe` exits non-zero for it,
+/// but "there was nothing to remove" is exactly the outcome an unregister wants,
+/// and treating it as an error would make every clean run report hundreds of
+/// bogus failures and stop the startup stamp ever being written.
+pub(crate) fn apply_delete(d: &RegDelete) -> Result<(), String> {
+    let full_key = format!("HKCU\\{}", d.key);
+    let mut cmd = Command::new("reg");
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    cmd.arg("delete").arg(&full_key);
+    if let Some(name) = &d.name {
+        cmd.args(["/v", name.as_str()]);
+    }
+    cmd.arg("/f");
+    let out = cmd
+        .output()
+        .map_err(|err| format!("reg.exe unavailable: {err}"))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    if delete_error_is_benign(&err) {
+        Ok(())
+    } else {
+        Err(err)
+    }
+}
+
 /// Apply every entry registering `types` under the given roots. Factored out so
 /// the `#[ignore]` integration test can target a throwaway subtree instead of
 /// real `Software\Classes`.
@@ -61,43 +94,88 @@ pub(crate) fn register_under(
     app_name: &str,
 ) -> RegisterReport {
     let entries = registry_entries(types, exe, class_root, app_root, app_name);
-    let mut failed = Vec::new();
+    let mut failures: Vec<FailedWrite> = Vec::new();
     for e in &entries {
         if let Err(err) = apply_entry(e) {
-            failed.push((e.key.clone(), err));
+            failures.push(FailedWrite {
+                claim: e.claim,
+                key: e.key.clone(),
+                err,
+            });
         }
     }
-    let registered = if failed.is_empty() {
-        types.iter().map(|t| t.key().to_string()).collect()
-    } else {
-        Vec::new()
-    };
-    RegisterReport {
-        registered,
-        failed,
-        needs_user_action: true,
-        message: "SCR1B3 is registered. Windows requires you to pick it in the \
-                  Default Apps window — choose SCR1B3 for each file type. (Windows \
-                  doesn't let an app change the default for you.)"
-            .into(),
+
+    // Registration is a DESIRED-STATE sync, not an append. Removals run AFTER
+    // the writes so an interrupted run leaves SCR1B3 over-registered (harmless,
+    // and self-heals next launch) rather than half-unregistered.
+    let mut cleanup_failures: Vec<(String, String)> = Vec::new();
+    for d in unregister_entries(types, exe, class_root, app_root) {
+        if let Err(err) = apply_delete(&d) {
+            cleanup_failures.push((d.key.clone(), err));
+        }
     }
+
+    // The message + the registered set are DERIVED from what actually landed —
+    // never a hardcoded success string (see `summarize`). Cleanup failures are
+    // deliberately NOT folded into `summarize`: a stale entry we could not
+    // remove does not mean the claim failed to register, and pretending it did
+    // would under-report a registration that actually landed. They are appended
+    // to the message and listed in `failed` so nothing is hidden.
+    let outcome = summarize(types, &failures);
+    let message = append_cleanup_note(outcome.message, cleanup_failures.len());
+    let mut failed: Vec<(String, String)> = failures.into_iter().map(|f| (f.key, f.err)).collect();
+    failed.extend(cleanup_failures);
+    let report = RegisterReport {
+        // Only ask the user to finish in the Default Apps UI if something
+        // actually registered; sending them there after a total failure would
+        // show them an app that isn't listed.
+        needs_user_action: !outcome.registered.is_empty(),
+        registered: outcome.registered,
+        failed,
+        message,
+    };
+
+    // Writing the keys does not make the shell LOOK at them. Until the shell is
+    // told, Explorer can keep serving the previous icon and "Open with" entry
+    // for a type SCR1B3 has just claimed. Deep-linking the user to the Default
+    // Apps window (the `register` path below) happened to force that re-read as
+    // a side effect; the SILENT startup refresh never opens that window, so it
+    // got no re-read at all. Notify here so both paths converge — and only when
+    // a claim actually landed, so a failed or empty pass broadcasts nothing.
+    // Fire-and-forget: nothing here can observe whether the shell acted. The
+    // notifier is passed in rather than reached for inside the seam so the seam
+    // stays testable with a local sink (see its doc).
+    notify_shell_after_registration(
+        &report.registered,
+        scribe_win32_chrome::notify_assoc_changed,
+    );
+
+    report
 }
 
-pub fn register(types: &[ClaimType]) -> RegisterReport {
+/// Register without opening the Default Apps window. Used by the startup
+/// re-registration, which must refresh the stale exe path silently — popping a
+/// Settings window on every launch after an update would be hostile.
+pub fn register_silent(types: &[ClaimType]) -> RegisterReport {
     let Some(exe) = current_exe_string() else {
         return RegisterReport {
+            failed: vec![(
+                "current_exe".into(),
+                "the running program path is unavailable".into(),
+            )],
             message: "Couldn't find the SCR1B3 program path to register.".into(),
             ..Default::default()
         };
     };
-    let report = register_under(
-        types,
-        &exe,
-        "Software\\Classes",
-        "Software\\SCR1B3",
-        "SCR1B3",
-    );
-    if report.failed.is_empty() {
+    register_under(types, &exe, CLASS_ROOT, APP_ROOT, APP_NAME)
+}
+
+pub fn register(types: &[ClaimType]) -> RegisterReport {
+    let report = register_silent(types);
+    // Deep-link only when there is something for the user to pick. `registered`
+    // is the honest signal (a shared-key failure empties it), so this no longer
+    // opens the window after a registration that did not land.
+    if !report.registered.is_empty() {
         open_default_apps_ui();
     }
     report

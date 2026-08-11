@@ -275,6 +275,115 @@ fn toggle_minimap_flips_the_setting_and_persists_it() {
         .exists());
 }
 
+// ---- CycleTheme: the palette must REPAINT, not only persist ----
+//
+// `self.theme` — the struct the window actually paints from — is assigned in
+// exactly ONE place in the crate: `reapply_theme` (theme_visuals.rs). The
+// palette's `BuiltinCommand::CycleTheme` arm wrote `config.appearance.theme`
+// and saved it without ever reaching that assignment, so the theme persisted
+// to disk while the window kept rendering the previous one until restart. The
+// keyboard shortcut, which called `reapply_theme`, worked.
+//
+// Nothing downstream rescued it: the visuals watcher keys on
+// `visuals_signature()`, which hashes `self.theme.name` (unmoved), and
+// `reload_config_from_disk` early-returns on `cfg == self.config` because
+// `save_config` had just written that config.
+//
+// Every pre-existing CycleTheme test asserts `config.appearance.theme` — which
+// was correct the whole time. That is exactly why three of them passed over
+// this. These assert `app.theme.name`.
+
+/// Like [`app`], but with OS-theme following OFF so `effective_theme_name`
+/// cannot substitute `ghost-paper` / `wired-noir` for the cycled name — the
+/// assertions below are about the palette wire, not the OS-follow branch.
+fn painted_theme_app() -> (ScribeApp, egui::Context) {
+    let mut cfg = Config::default();
+    cfg.editor.first_run_completed = true;
+    cfg.appearance.follow_os_theme = false;
+    (ScribeApp::new_test(cfg), egui::Context::default())
+}
+
+#[test]
+fn palette_cycle_theme_repaints_the_window_not_only_the_config() {
+    let (mut app, ctx) = painted_theme_app();
+    assert_eq!(
+        app.theme.name, app.config.appearance.theme,
+        "precondition — the painted theme starts in step with the config"
+    );
+    let before = app.theme.name.clone();
+
+    // The real palette wire: a builtin selected in the palette arrives as
+    // `DeferredFlags::run_builtin`.
+    let mut f = flags();
+    f.run_builtin = Some(BuiltinCommand::CycleTheme);
+    apply_flags(&mut app, &ctx, f);
+
+    assert_ne!(
+        app.theme.name, before,
+        "the palette entry left the window painting the OLD theme — it wrote \
+         the config and never reached the one place `self.theme` is assigned"
+    );
+    assert_eq!(
+        app.theme.name, app.config.appearance.theme,
+        "the painted theme must be the one that was persisted"
+    );
+}
+
+#[test]
+fn execute_builtin_stages_the_theme_change_and_the_frame_drain_applies_it() {
+    // `execute_builtin` takes no `ctx`, so it can only STAGE the repaint; the
+    // every-frame `drain_pending_editor_action` is the catch-all that applies
+    // it for the dispatch sites that are not the deferred-action path.
+    let (mut app, ctx) = painted_theme_app();
+    let before = app.theme.name.clone();
+
+    app.execute_builtin(BuiltinCommand::CycleTheme);
+    assert_ne!(
+        app.config.appearance.theme, before,
+        "the config advances immediately"
+    );
+    assert_eq!(
+        app.theme.name, before,
+        "but the painted theme cannot change without a ctx"
+    );
+
+    app.drain_pending_editor_action(&ctx);
+    assert_eq!(
+        app.theme.name, app.config.appearance.theme,
+        "the drain applies the staged repaint"
+    );
+}
+
+#[test]
+fn keyboard_and_palette_cycle_theme_land_on_the_same_painted_theme() {
+    // The drift this defect was: both surfaces agreed on the config and
+    // disagreed on what the window showed.
+    let (mut kbd, kctx) = painted_theme_app();
+    apply(
+        &mut kbd,
+        &kctx,
+        &mut Pending {
+            cycle_theme: true,
+            ..Default::default()
+        },
+    );
+
+    let (mut pal, pctx) = painted_theme_app();
+    let mut f = flags();
+    f.run_builtin = Some(BuiltinCommand::CycleTheme);
+    apply_flags(&mut pal, &pctx, f);
+
+    assert_eq!(
+        kbd.config.appearance.theme, pal.config.appearance.theme,
+        "both surfaces persist the same theme"
+    );
+    assert_eq!(
+        kbd.theme.name, pal.theme.name,
+        "and both must PAINT it — this is the assertion the drift hid from"
+    );
+    assert_eq!(pal.theme.name, pal.config.appearance.theme);
+}
+
 #[test]
 fn cycle_theme_advances_to_the_next_builtin_and_persists_it() {
     let (mut app, ctx) = app();
@@ -297,6 +406,66 @@ fn cycle_theme_advances_to_the_next_builtin_and_persists_it() {
         app.config.appearance.theme
     );
     assert!(app.status.contains("theme:"));
+}
+
+// ---- CycleTheme under the SHIPPED DEFAULT config ----
+//
+// `AppearanceConfig::default()` ships `follow_os_theme = true`. With it on and
+// a light OS, `effective_theme_name` returns "ghost-paper" UNCONDITIONALLY, so
+// Cycle Theme advanced `config.appearance.theme`, persisted it, repainted the
+// IDENTICAL theme, and the status bar named a theme the window was not
+// showing. Every test above pins `follow_os_theme = false` (see
+// `painted_theme_app`) — which is exactly why they could not see this.
+//
+// The fix: an explicit cycle takes ownership of the theme and turns the
+// automatic mode off, so the command the user invoked is the one that paints.
+
+#[test]
+fn cycle_theme_is_honest_under_the_default_config_on_a_light_os() {
+    let mut cfg = Config::default();
+    cfg.editor.first_run_completed = true;
+    assert!(
+        cfg.appearance.follow_os_theme,
+        "precondition — the SHIPPED default follows the OS theme; if this flips, \
+         this test is guarding nothing"
+    );
+    let mut app = ScribeApp::new_test(cfg);
+    let ctx = egui::Context::default();
+    ctx.set_theme(egui::Theme::Light);
+    // Paint once so `self.theme` holds the OS-resolved theme, as it does at
+    // startup on a light desktop.
+    app.reapply_theme(&ctx);
+    let before = app.theme.name.clone();
+    assert_eq!(
+        before, "ghost-paper",
+        "precondition — a light OS resolves to the bundled light theme"
+    );
+
+    apply(
+        &mut app,
+        &ctx,
+        &mut Pending {
+            cycle_theme: true,
+            ..Default::default()
+        },
+    );
+
+    assert_ne!(
+        app.theme.name, before,
+        "Cycle Theme repainted the IDENTICAL theme: the OS-follow branch \
+         substituted `ghost-paper` for whatever was cycled to"
+    );
+    assert_eq!(
+        app.theme.name, app.config.appearance.theme,
+        "the painted theme must be the one that was persisted"
+    );
+    assert!(
+        app.status.contains(&app.theme.name),
+        "the status bar must name the theme that is actually painted, got {:?} \
+         while painting {:?}",
+        app.status,
+        app.theme.name
+    );
 }
 
 #[test]
@@ -864,20 +1033,12 @@ fn bookmark_navigation_says_so_when_there_are_none() {
 // so the button does nothing at all.
 //
 // These read the GLOBAL `Config::config_file_path()` (not the instance dir), so
-// the env redirect has to be exclusive: cargo runs tests in parallel.
-static CFG_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-fn with_config_dir<T>(dir: &Path, body: impl FnOnce() -> T) -> T {
-    let _guard = CFG_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    let prev = std::env::var_os("SCR1B3_CONFIG_DIR");
-    std::env::set_var("SCR1B3_CONFIG_DIR", dir);
-    let out = body();
-    match prev {
-        Some(v) => std::env::set_var("SCR1B3_CONFIG_DIR", v),
-        None => std::env::remove_var("SCR1B3_CONFIG_DIR"),
-    }
-    out
-}
+// the env redirect has to be exclusive against EVERY other module that mutates
+// the same process-global var — hence the crate-wide lock in
+// `crate::test_config_env` rather than a local one. This module's copy was
+// additionally named `CFG_ENV_LOCK` rather than the name the other three used,
+// so a grep for the common name did not even reveal it existed.
+use crate::test_config_env::with_config_dir;
 
 fn cfg_temp_dir(tag: &str) -> PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};

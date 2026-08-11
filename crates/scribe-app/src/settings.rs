@@ -26,6 +26,7 @@ const CATEGORIES: &[&str] = &[
     "Window",
     "Toolbar",
     "Editor",
+    "Keyboard",
     "Spellcheck",
     "Plugins",
     "Default app",
@@ -147,8 +148,35 @@ fn section_visible(selected: &str, q: &str, category: &str, labels: &[&str]) -> 
 }
 
 /// Whether an individual row should render given the active search query.
-fn row_visible(q: &str, label: &str) -> bool {
+///
+/// `pub(crate)` because the Keyboard page (`app::settings_keys`) filters its 35
+/// binding rows with the SAME predicate — a second copy would drift and make the
+/// search behave differently on one page.
+pub(crate) fn row_visible(q: &str, label: &str) -> bool {
     q.is_empty() || label.to_lowercase().contains(q)
+}
+
+/// The side effects EVERY explicit theme pick in Settings carries.
+///
+/// `#88/#106` — a new theme clears both background overrides, so the theme that
+/// was picked shows its OWN backgrounds instead of the previous theme's pinned
+/// colours.
+///
+/// And the pick TAKES OWNERSHIP: `follow_os_theme` yields. With it on — the
+/// SHIPPED DEFAULT — `appearance.theme` is not authoritative:
+/// `effective_theme_name` returns `ghost-paper` unconditionally on a light OS,
+/// and on a dark OS substitutes `wired-noir` whenever the picked name is a light
+/// theme. So a pick advanced the config, persisted it, repainted the IDENTICAL
+/// theme, and left the picker naming a theme the window was not showing — the
+/// same lie the Cycle Theme command was fixed for.
+///
+/// The "Follow OS dark/light" checkbox sits directly beneath the picker, which
+/// is why this is the right place for the trade: the user SEES it untick where
+/// they made the choice, and re-ticking it is the one-click way back.
+fn take_theme_ownership(config: &mut Config) {
+    config.appearance.background_override = None;
+    config.appearance.note_background_override = None;
+    config.appearance.follow_os_theme = false;
 }
 
 /// F-037 — a per-setting "restore default" affordance. Renders a small ↺
@@ -629,11 +657,9 @@ fn render_sections(
                     let step = |config: &mut Config, delta: isize| {
                         let next = step_theme_index(names, &config.appearance.theme, delta);
                         config.appearance.theme = names[next].to_string();
-                        // #88/#106 — switching theme resets BOTH the app and note
-                        // background overrides to the new theme (parity with the
-                        // dropdown path below).
-                        config.appearance.background_override = None;
-                        config.appearance.note_background_override = None;
+                        // Parity with the dropdown path below — the arrows are
+                        // the same explicit pick by another control.
+                        take_theme_ownership(config);
                     };
                     if ui
                         .add(egui::Button::new(egui_phosphor::thin::CARET_LEFT))
@@ -651,16 +677,15 @@ fn render_sections(
                         .selected_text(config.appearance.theme.clone())
                         .show_ui(ui, |ui| {
                             for name in names {
-                                if ui
+                                let picked = ui
                                     .selectable_value(
                                         &mut config.appearance.theme,
                                         (*name).to_string(),
                                         *name,
                                     )
-                                    .changed()
-                                {
-                                    config.appearance.background_override = None;
-                                    config.appearance.note_background_override = None;
+                                    .changed();
+                                if picked {
+                                    take_theme_ownership(config);
                                     changed = true;
                                 }
                             }
@@ -692,8 +717,10 @@ fn render_sections(
                     )
                     .changed();
                 if name_changed {
-                    config.appearance.background_override = None;
-                    config.appearance.note_background_override = None;
+                    // Naming a user theme is as explicit a pick as choosing a
+                    // built-in, and the OS-follow substitution silences it just
+                    // as completely — so it takes ownership on the same terms.
+                    take_theme_ownership(config);
                     changed = true;
                 }
                 ui.end_row();
@@ -2279,6 +2306,27 @@ fn render_sections(
         space(ui);
     }
 
+    // ---- Keyboard ----
+    //
+    // Delegated to `app::settings_keys`: the page reads the same token <-> key
+    // table and action consts the LIVE matcher uses, which are `pub(in
+    // crate::app)`. Rendering it there (rather than copying those tables here)
+    // is what guarantees the chord Settings shows is the chord the editor fires.
+    // Its own row labels feed `section_visible`, so a cross-category search for
+    // "duplicate line" surfaces this page.
+    {
+        let key_labels = crate::app::settings_keys::labels();
+        if section_visible(sel, q, "Keyboard", &key_labels) {
+            head(
+                ui,
+                "Keyboard",
+                "Every rebindable shortcut. Click a chord, press the keys you want.",
+            );
+            changed |= crate::app::settings_keys::show(ui, config, q);
+            space(ui);
+        }
+    }
+
     // ---- Spellcheck ----
     if section_visible(
         sel,
@@ -2741,7 +2789,10 @@ fn render_sections(
             "Choose which kinds of file SCR1B3 should handle.",
         );
 
-        // Checklist bound to the persisted claim set (empty ⇒ all selected).
+        // Checklist bound to the persisted claim set. The stored value is
+        // `Option<Vec<_>>`: UNSET means "all" (the first-run default), whereas an
+        // explicitly EMPTY selection means "none". Collapsing those two states was
+        // the bug where unticking every box silently re-ticked them next frame.
         let mut selected = config.integration.claimed_types();
         for ct in ClaimType::ALL {
             let mut on = selected.contains(&ct);
@@ -2753,13 +2804,11 @@ fn render_sections(
                 } else {
                     selected.retain(|c| *c != ct);
                 }
-                // Persist the EXPLICIT selection (resolved order) so a later load
-                // reflects exactly what the user picked.
-                config.integration.claimed_types = ClaimType::ALL
-                    .into_iter()
-                    .filter(|c| selected.contains(c))
-                    .map(|c| c.key().to_string())
-                    .collect();
+                // Persist the EXPLICIT selection so a later load reflects exactly
+                // what the user picked. `set_claimed_types` always records `Some`,
+                // so clearing every box stays cleared instead of resolving back to
+                // the unset-means-all default.
+                config.integration.set_claimed_types(&selected);
                 changed = true;
             }
         }
@@ -4039,285 +4088,20 @@ mod deep_link {
     }
 }
 
-#[cfg(test)]
-mod wiring_guard {
-    //! Proof that every control exposed in the Settings window is actually
-    //! WIRED to runtime behavior — i.e. its config field is read by code outside
-    //! `settings.rs` (the UI) and `config.rs` (the definition). A "dead" control
-    //! is one nothing reads; this guard catches them and prevents new ones.
-    //!
-    //! `KNOWN_DEAD` lists controls audited as not-yet-wired; as later phases wire
-    //! them, remove them here and the guard then REQUIRES a consumer.
-    use std::fs;
-    use std::path::Path;
-
-    /// All runtime source (scribe-app + scribe-core) minus the settings UI and
-    /// the config definition, concatenated for substring consumer-scanning.
-    fn runtime_source() -> String {
-        let manifest = env!("CARGO_MANIFEST_DIR");
-        let mut out = String::new();
-        for dir in [
-            format!("{manifest}/src"),
-            format!("{manifest}/../scribe-core/src"),
-        ] {
-            collect(Path::new(&dir), &mut out);
-        }
-        out
-    }
-    fn collect(dir: &Path, out: &mut String) {
-        let Ok(rd) = fs::read_dir(dir) else { return };
-        for e in rd.flatten() {
-            let p = e.path();
-            if p.is_dir() {
-                collect(&p, out);
-            } else if p.extension().is_some_and(|x| x == "rs") {
-                let name = p.file_name().unwrap().to_string_lossy().to_string();
-                if name == "settings.rs" || name == "config.rs" {
-                    continue;
-                }
-                if let Ok(c) = fs::read_to_string(&p) {
-                    out.push_str(&c);
-                }
-            }
-        }
-    }
-
-    /// A field is consumed if its `section.field` access (or a documented
-    /// method alias that reads it) appears in runtime source.
-    fn consumed(src: &str, field: &str) -> bool {
-        if src.contains(field) {
-            return true;
-        }
-        // Fields read only through a config method (the literal `section.field`
-        // never appears at the call site).
-        match field {
-            "window.transparency_enabled" => src.contains("effective_translucent"),
-            "toolbar.button_size_px" => src.contains("clamped_button_size"),
-            "toolbar.button_spacing_px" => src.contains("clamped_button_spacing"),
-            "toolbar.icon_size_px" => src.contains("clamped_icon_size"),
-            "motion.intensity" => src.contains("clamped_intensity"),
-            "motion.flicker_strength" => src.contains("clamped_flicker_strength"),
-            "motion.mesh_density" => src.contains("clamped_mesh_density"),
-            "motion.mesh_brightness" => {
-                src.contains("mesh_link_alpha") || src.contains("mesh_dot_alpha")
-            }
-            "motion.flicker_speed" => src.contains("clamped_flicker_speed"),
-            "motion.vhs_speed" => src.contains("clamped_vhs_speed"),
-            "motion.mesh_drift_speed" => src.contains("clamped_mesh_drift_speed"),
-            "motion.mesh_color" => src.contains("resolved_mesh_color"),
-            "ui_scale" => src.contains("effective_ui_scale"),
-            "editor.caret_width" => src.contains("clamped_caret_width"),
-            _ => false,
-        }
-    }
-
-    /// Every Settings-exposed config field that MUST have a runtime consumer.
-    const WIRED: &[&str] = &[
-        "appearance.theme",
-        "appearance.frameless",
-        "appearance.toolbar_in_titlebar",
-        "appearance.toolbar_icons",
-        "appearance.jp_glyph_labels",
-        "appearance.background_override",
-        "appearance.note_background_override",
-        "appearance.link_backgrounds",
-        "fonts.editor_size",
-        "fonts.line_height",
-        "fonts.editor_family",
-        "fonts.ui_family",
-        "editor.note_theme",
-        "editor.tab_width",
-        "editor.insert_spaces",
-        "editor.show_line_numbers",
-        "editor.show_change_bar",
-        "editor.word_wrap",
-        "editor.show_minimap",
-        "editor.render_whitespace",
-        "editor.snippets_enabled",
-        "editor.current_line_highlight",
-        "editor.indent_guides",
-        "editor.bracket_match",
-        "editor.highlight_selection_occurrences",
-        "editor.highlight_trailing_whitespace",
-        "editor.smooth_scroll",
-        "editor.caret_style",
-        "editor.caret_width",
-        "editor.scrollbar_style",
-        "editor.tab_bar_position",
-        "editor.side_tabs_rotated",
-        "editor.side_tabs_wrap_two_lines",
-        "editor.restore_session",
-        "editor.grid_enabled",
-        "editor.experimental_rope_editor",
-        "editor.session_backup",
-        "editor.auto_save",
-        "editor.trim_trailing_whitespace_on_save",
-        "editor.final_newline_on_save",
-        "editor.restore_cursor_position",
-        "window.always_on_top",
-        "window.transparency_enabled",
-        "window.opacity",
-        "window.tint",
-        "window.tint_strength",
-        "spellcheck.enabled",
-        "spellcheck.language",
-        "spellcheck.check_comments",
-        "spellcheck.check_strings",
-        "spellcheck.check_identifiers",
-        "spellcheck.custom_dict_path",
-        "plugins.enabled",
-        "toolbar.button_size_px",
-        "toolbar.button_spacing_px",
-        "toolbar.icon_size_px",
-        "appearance.follow_os_theme",
-        "updates.mode",
-        "updates.check_interval_hours",
-        "motion.enabled",
-        "motion.intensity",
-        "motion.cursor_blink",
-        "motion.crt_scanlines",
-        "motion.scanline_darkness",
-        "motion.wired_ambient",
-        "motion.mesh_density",
-        "motion.mesh_brightness",
-        "motion.vhs_tracking",
-        "motion.vhs_speed",
-        "motion.flicker",
-        "motion.flicker_strength",
-        "motion.flicker_speed",
-        "motion.mesh_drift_speed",
-        "motion.mesh_color",
-        "motion.caret_trail",
-        "motion.caret_trail_intensity",
-        "motion.boot_glitch",
-        "ui_scale",
-    ];
-
-    /// Controls audited as DEAD (no runtime consumer yet). Shrinks as phases wire
-    /// them; an entry here that gains a consumer fails the guard (move it to WIRED).
-    /// Now EMPTY: every Settings-exposed control has a runtime consumer. Controls
-    /// that could not be made to work (egui-impossible font-family/ligatures, the
-    /// bespoke motion catalog, OS reduced-motion / battery gates) were removed
-    /// rather than left as dead toggles, so there is nothing left to track here.
-    const KNOWN_DEAD: &[&str] = &[];
-
-    #[test]
-    fn every_wired_setting_has_a_runtime_consumer() {
-        let src = runtime_source();
-        for &field in WIRED {
-            assert!(
-                consumed(&src, field),
-                "DEAD CONTROL: `{field}` is exposed in Settings but no runtime code reads it",
-            );
-        }
-    }
-
-    #[test]
-    fn known_dead_controls_are_still_dead() {
-        let src = runtime_source();
-        for &field in KNOWN_DEAD {
-            assert!(
-                !consumed(&src, field),
-                "`{field}` now has a consumer -- wire-up done; remove it from KNOWN_DEAD and add to WIRED",
-            );
-        }
-    }
-
-    /// Runtime source EXCLUDING the config module (and the settings UI), for the
-    /// section-level guard below.
-    ///
-    /// `runtime_source` deliberately keeps `scribe-core/src/config/**` in scope —
-    /// the dotted `section.field` probes it uses never appear in the struct
-    /// definitions, so their presence still proves a real consumer. A SECTION
-    /// probe (`.keybindings`) is not so lucky: it matches the field declaration
-    /// in `config/mod.rs`, which would make an entirely unread section look
-    /// consumed. Dropping the config module is what makes the guard honest.
-    fn runtime_source_outside_config() -> String {
-        let manifest = env!("CARGO_MANIFEST_DIR");
-        let mut out = String::new();
-        for dir in [
-            format!("{manifest}/src"),
-            format!("{manifest}/../scribe-core/src"),
-        ] {
-            collect_outside_config(Path::new(&dir), &mut out);
-        }
-        out
-    }
-
-    fn collect_outside_config(dir: &Path, out: &mut String) {
-        let Ok(rd) = fs::read_dir(dir) else { return };
-        for e in rd.flatten() {
-            let p = e.path();
-            if p.is_dir() {
-                // The config module DEFINES the sections; it cannot be evidence
-                // that anything CONSUMES them.
-                if p.file_name().is_some_and(|n| n == "config") {
-                    continue;
-                }
-                collect_outside_config(&p, out);
-            } else if p.extension().is_some_and(|x| x == "rs") {
-                let name = p.file_name().unwrap().to_string_lossy().to_string();
-                if name == "settings.rs" || name == "config.rs" {
-                    continue;
-                }
-                if let Ok(c) = fs::read_to_string(&p) {
-                    out.push_str(&c);
-                }
-            }
-        }
-    }
-
-    /// Every top-level key a user can write in `scr1b3.toml`, each of which MUST
-    /// be read by runtime code outside the config module.
-    ///
-    /// `schema_version` is deliberately absent: it is migration metadata, and its
-    /// only legitimate consumer (`Config::migrate`) lives inside the config module
-    /// by design.
-    const WIRED_SECTIONS: &[&str] = &[
-        "editor",
-        "appearance",
-        "fonts",
-        "window",
-        "updates",
-        "spellcheck",
-        "plugins",
-        "toolbar",
-        "motion",
-        "scroll",
-        "reporting",
-        "integration",
-        "keybindings",
-        "ui_scale",
-    ];
-
-    /// The section-level companion to `every_wired_setting_has_a_runtime_consumer`.
-    ///
-    /// That guard only audits controls exposed in the Settings WINDOW, so a config
-    /// surface with no Settings UI is invisible to it. `[keybindings]` shipped that
-    /// way: 35 rebindable actions that parsed, validated, and were read by nothing,
-    /// while every Settings-exposed control was correctly wired and the guard stayed
-    /// green. This checks the other axis — a whole section that nothing consumes.
-    #[test]
-    fn every_config_section_has_a_runtime_consumer() {
-        let src = runtime_source_outside_config();
-        for &section in WIRED_SECTIONS {
-            // A section is consumed if its field access appears, or — for one read
-            // only through a config METHOD — if that method does. `ui_scale` is
-            // reached via `Config::effective_ui_scale` (the clamp/NaN guard), so
-            // the literal `.ui_scale` never appears at the call site.
-            let consumed = src.contains(&format!(".{section}"))
-                || match section {
-                    "ui_scale" => src.contains("effective_ui_scale"),
-                    _ => false,
-                };
-            assert!(
-                consumed,
-                "DEAD CONFIG SECTION: `[{section}]` can be written in scr1b3.toml but no \
-                 runtime code outside the config module reads it — it is a false promise",
-            );
-        }
-    }
-}
+// The Settings wiring guard — the proof that every control exposed here and
+// every `scr1b3.toml` section is actually consumed by runtime code — now lives
+// in `crates/scribe-app/tests/settings_wiring_guard.rs`.
+//
+// It moved because the version that lived here could not fail. Its consumer test
+// was `src.contains(field)` over the raw concatenation of every `.rs` file, so a
+// field named in a doc comment, in a string literal, or in any of the 55
+// test-only files and 184 `#[cfg(test)]` modules read as "wired". `KNOWN_DEAD`
+// was empty, so nothing exercised the negative path either. The replacement
+// strips comments, literals and test code before probing, and ships the
+// falsification tests that prove it reports a control nothing reads.
+//
+// It is an integration test now so that the WIRED list it audits lives outside
+// the `src/` tree it scans, instead of being excluded from the corpus by name.
 
 /// Visual-QA for the update-status pane. We cannot "see" the rendered UI, so we
 /// drive it through the `egui_kittest` harness and assert the layout invariants
@@ -4598,6 +4382,7 @@ mod pane_render {
             ("Toolbar", "Quick-access toolbar"),
             ("Motion", "Motion"),
             ("Editor", "Editor"),
+            ("Keyboard", "Keyboard"),
             ("Spellcheck", "Spellcheck (offline)"),
             ("Plugins", "Plugins"),
             ("Updates", "Updates"),

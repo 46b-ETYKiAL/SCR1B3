@@ -1075,7 +1075,9 @@ mod tests {
     fn url_detection() {
         assert!(looks_like_url("https://example.com"));
         assert!(looks_like_url("http://a.b/c?d=1"));
-        assert!(looks_like_url("mailto:x@y.com"));
+        // RFC 2606 reserved documentation domain — a public repo must not carry
+        // anything that reads as a real mailbox.
+        assert!(looks_like_url("mailto:x@example.com"));
         assert!(!looks_like_url("not a url"));
         assert!(!looks_like_url("https://a b.com")); // whitespace
         assert!(!looks_like_url("ftp://host"));

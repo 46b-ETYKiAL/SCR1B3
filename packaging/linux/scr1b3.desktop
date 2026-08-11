@@ -7,6 +7,6 @@ Exec=scr1b3 %F
 Icon=scr1b3
 Terminal=false
 Categories=Development;TextEditor;Utility;
-MimeType=text/plain;text/markdown;application/json;text/x-csrc;text/x-c++src;text/x-chdr;text/x-rust;text/x-python;application/javascript;text/x-go;text/x-java-source;application/x-shellscript;application/toml;text/x-yaml;application/xml;text/css;text/html;text/x-lua;application/sql;
+MimeType=text/plain;text/markdown;application/json;application/toml;application/yaml;text/x-yaml;application/xml;text/xml;text/csv;text/tab-separated-values;text/x-csrc;text/x-c++src;text/x-chdr;text/x-rust;text/x-python;application/javascript;application/typescript;text/x-go;text/x-java-source;text/x-php;text/x-ruby;application/x-shellscript;application/x-perl;text/css;text/html;text/x-lua;application/sql;
 Keywords=editor;code;text;notepad;
 StartupWMClass=scr1b3

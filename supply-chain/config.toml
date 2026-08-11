@@ -279,6 +279,11 @@ version = "0.5.0"
 criteria = "safe-to-run"
 notes = "criterion dev-bench dependency tree (dev-only, never shipped)"
 
+[[exemptions.crossbeam-channel]]
+version = "0.5.16"
+criteria = "safe-to-deploy"
+notes = "tray-icon (Windows system tray) dependency tree; Tauri-org OSS, MIT OR Apache-2.0, no network"
+
 [[exemptions.crossbeam-utils]]
 version = "0.8.21"
 criteria = "safe-to-deploy"
@@ -306,6 +311,11 @@ criteria = "safe-to-deploy"
 [[exemptions.directories]]
 version = "6.0.0"
 criteria = "safe-to-deploy"
+
+[[exemptions.dirs]]
+version = "6.0.0"
+criteria = "safe-to-deploy"
+notes = "tray-icon (Windows system tray) dependency tree; Tauri-org OSS, MIT OR Apache-2.0, no network"
 
 [[exemptions.dirs-sys]]
 version = "0.3.7"
@@ -689,6 +699,11 @@ criteria = "safe-to-deploy"
 version = "0.3.99"
 criteria = "safe-to-deploy"
 
+[[exemptions.keyboard-types]]
+version = "0.7.0"
+criteria = "safe-to-deploy"
+notes = "tray-icon (Windows system tray) dependency tree; Tauri-org OSS, MIT OR Apache-2.0, no network"
+
 [[exemptions.khronos-egl]]
 version = "6.0.0"
 criteria = "safe-to-deploy"
@@ -792,6 +807,11 @@ criteria = "safe-to-deploy"
 [[exemptions.moxcms]]
 version = "0.8.1"
 criteria = "safe-to-deploy"
+
+[[exemptions.muda]]
+version = "0.19.3"
+criteria = "safe-to-deploy"
+notes = "tray-icon (Windows system tray) dependency tree; Tauri-org OSS, MIT OR Apache-2.0, no network"
 
 [[exemptions.naga]]
 version = "29.0.4"
@@ -1487,6 +1507,11 @@ criteria = "safe-to-deploy"
 [[exemptions.tracing-subscriber]]
 version = "0.3.23"
 criteria = "safe-to-deploy"
+
+[[exemptions.tray-icon]]
+version = "0.24.2"
+criteria = "safe-to-deploy"
+notes = "tray-icon (Windows system tray) dependency tree; Tauri-org OSS, MIT OR Apache-2.0, no network"
 
 [[exemptions.tree-sitter]]
 version = "0.24.7"

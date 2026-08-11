@@ -210,6 +210,10 @@ fn parse_diagnostics_handles_zero_one_and_many() {
             uri: "file:///y.rs".into(),
             line: 0,
             character: 0,
+            // No `end` on the wire here, so the span collapses onto its start
+            // (see `parse_publish_diagnostics`) rather than onto (0, 0).
+            end_line: 0,
+            end_character: 0,
             severity: 1,
             message: "err".into()
         }

@@ -611,13 +611,15 @@ mod tests {
         }
     }
 
-    use std::sync::Mutex;
-    static CONFIG_DIR_LOCK: Mutex<()> = Mutex::new(());
-
-    /// Acquire the config-dir lock, tolerating a prior test's panic that
-    /// poisoned it (the data is `()`; a poisoned lock carries no broken state).
+    /// Acquire the CRATE-WIDE config-dir lock.
+    ///
+    /// This module used to own a private `CONFIG_DIR_LOCK`, which excluded only
+    /// these tests. `SCR1B3_CONFIG_DIR` is per-PROCESS and several other modules
+    /// in this same test binary redirect it too, so a private mutex was
+    /// exclusion in name only. `ConfigDirGuard` still handles the restore-on-drop;
+    /// only the lock it runs under changed.
     fn lock_config_dir() -> std::sync::MutexGuard<'static, ()> {
-        CONFIG_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+        crate::test_config_env::config_dir_env_guard()
     }
 
     #[test]

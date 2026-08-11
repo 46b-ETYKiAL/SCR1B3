@@ -27,6 +27,10 @@ use scribe_core::{Config, Document};
 use std::path::{Path, PathBuf};
 
 mod commands;
+/// Note-capture commands: clipboard-image attachments, rename-with-link-refactor,
+/// and dated daily notes. Declared here beside `commands` because it implements
+/// three of that registry's entries.
+mod note_capture;
 // Re-export the command/shortcut/toolbar registries + their pure lookup helpers
 // so existing call sites (`crate::app::BUILTIN_COMMANDS`, `super::*`, …) resolve
 // unchanged after the WU-1 extraction.
@@ -118,8 +122,7 @@ fn tab_index_after_move(src: usize, target: usize, idx: usize) -> usize {
 /// [`crate::updater`] and `scribe_core::update::net`); it sends no identifiers
 /// and no telemetry. Same host as the installer's `ARPHELPLINK` so it is
 /// auditable against the wix manifest.
-pub(crate) const RELEASES_URL: &str =
-    "https://github.com/46b-ETYKiAL/Itasha.Corp_S4F3-SCR1B3/releases";
+pub(crate) const RELEASES_URL: &str = "https://github.com/46b-ETYKiAL/SCR1B3/releases";
 
 /// Current wall-clock time in unix seconds, saturating to 0 before the epoch
 /// (a backwards-set clock yields 0 rather than panicking).
@@ -461,14 +464,77 @@ impl EditorTab {
     }
 
     /// Replace the editable text from an EXTERNAL source (reload, plugin,
-    /// find-replace, sort-lines) and invalidate the experimental rope cache so
-    /// the next frame rebuilds the persistent rope from the new content. The
-    /// rope editor itself writes `text` directly (it owns the rope) and must
-    /// NOT go through here, or it would discard its own live buffer.
+    /// find-replace, sort-lines, the line/comment commands) and invalidate
+    /// EVERY cache derived from the old content: the persistent rope buffer
+    /// (`rope_buf`, rebuilt next frame) and the rope editor's editing state
+    /// (`rope_state` — undo history + carets, see `invalidate_rope_state`).
+    /// `edit_gen` is bumped, which is what invalidates the gen-keyed
+    /// minimap / spellcheck / change-bar (`change_gen`) caches.
+    ///
+    /// EVERY external mutation of `text` MUST go through here. Writing
+    /// `tabs[i].text` directly leaves a stale `rope_buf` alive, and on the
+    /// rope path (`use_rope_editor`) the next content edit writes that stale
+    /// rope back over `text` — silently destroying the user's edit.
+    ///
+    /// The rope editor itself writes `text` directly (it owns the rope) and
+    /// must NOT go through here, or it would discard its own live buffer.
     fn set_text(&mut self, new: String) {
         self.text = new;
+        self.note_text_mutated();
+    }
+
+    /// The same invalidation `set_text` performs, for the few callers that
+    /// must splice `text` IN PLACE rather than replace it wholesale
+    /// (`accept_completion`'s `replace_range`, the multi-cursor replay's
+    /// `apply_edit` loop). Those callers cannot hand `set_text` an owned
+    /// `String` without cloning the whole buffer, but they owe the buffer the
+    /// identical invalidation — a bare `edit_gen` bump refreshes the gen-keyed
+    /// caches while leaving a stale `rope_buf`/`rope_state` alive, which is the
+    /// write-back data loss `set_text` exists to prevent.
+    ///
+    /// Keeping ONE implementation (`set_text` delegates here) is the point:
+    /// two hand-maintained invalidation lists drift, and the drift is silent.
+    fn note_text_mutated(&mut self) {
         self.rope_buf = None;
+        self.invalidate_rope_state();
         self.edit_gen = self.edit_gen.wrapping_add(1);
+    }
+
+    /// Invalidate the rope editor's per-tab editing state after `text` was
+    /// replaced from an EXTERNAL source.
+    ///
+    /// `rope_state` is derived from the buffer: its `History` holds snapshots
+    /// of the PREVIOUS content and its caret/selection are offsets into it.
+    /// Clearing `rope_buf` alone (so the rope is rebuilt from the new `text`)
+    /// left that state behind, so the first Undo after a command-palette or
+    /// find-replace edit restored a buffer the user never had — silent data
+    /// loss — and a caret past the new end pointed out of range.
+    ///
+    /// The history is dropped (those snapshots describe content that no longer
+    /// exists, so a no-op Undo is the only honest outcome) along with any
+    /// secondary carets, whose offsets a wholesale replacement invalidates.
+    /// The primary caret is kept, clamped into the new text, so an in-place
+    /// command (comment-toggle, move/duplicate/join line) does not throw the
+    /// user back to the top of the file.
+    ///
+    /// A tab whose `rope_state` is still `None` is left alone — the rope
+    /// editor has not claimed it yet, and the next frame creates the state
+    /// fresh from the new content.
+    fn invalidate_rope_state(&mut self) {
+        let Some(prev) = self.rope_state.as_ref() else {
+            return;
+        };
+        let cursor = prev.edit.cursor;
+        // `chars().count()` is O(n); skip it for the common caret-at-origin
+        // case so a large-buffer replacement pays nothing extra.
+        let clamped = if cursor == 0 {
+            0
+        } else {
+            cursor.min(self.text.chars().count())
+        };
+        let mut fresh = scribe_render::RopeEditorState::new();
+        fresh.edit = scribe_core::editing::EditState::at(clamped);
+        self.rope_state = Some(fresh);
     }
 
     /// Change-bar: record the current text as the saved baseline (called after
@@ -584,12 +650,24 @@ pub struct ScribeApp {
     /// (the T19.1 root cause). On the first close request we hide + cancel, then
     /// issue the real Close on the next frame.
     closing: bool,
+    /// Unsaved-changes close guard: set when a close request arrived while at
+    /// least one tab held unsaved edits. While set, the confirm modal renders and
+    /// the two-phase close is NOT started — closing used to hide-and-destroy
+    /// unconditionally, silently discarding every dirty buffer. Cleared by any of
+    /// Save / Discard / Cancel.
+    close_confirm_open: bool,
     /// Wave-5: project-wide find ("find in files") results pane. Opened with
     /// Ctrl+Shift+F; searches the open folder (`file_tree_root`) via the same
     /// regex engine as the in-buffer find bar.
     find_in_files_open: bool,
     find_in_files_query: String,
     find_in_files_regex: bool,
+    /// Project-search match-case / whole-word toggles. `run_find_in_files`
+    /// previously hard-coded `case_sensitive: false, whole_word: false` next to
+    /// the live `regex` flag, so the panel could not express two of the three
+    /// modes the engine already supported. Session state, like the find bar's.
+    find_in_files_case_sensitive: bool,
+    find_in_files_whole_word: bool,
     find_in_files_results: Vec<crate::find_in_files::FileMatch>,
     find_in_files_error: Option<String>,
     focus_find_in_files: bool,
@@ -658,6 +736,27 @@ pub struct ScribeApp {
     /// One-shot focus request for the replace field when the user opens
     /// the bar via Ctrl+H specifically (as opposed to Ctrl+F).
     focus_replace: bool,
+    /// Find-bar matching mode toggles. These are the SINGLE source of the
+    /// `scribe_core::search::Query` flags for every find-bar-owned surface —
+    /// the highlight/counter scan (`find_matches_active`), navigation, and
+    /// both Replace buttons (`replace_in_active`) all build their query from
+    /// [`Self::find_query_flags`], so a toggle moves all of them together.
+    /// Before this existed the bar hard-coded `..Default::default()` (literal,
+    /// case-insensitive, not whole-word) and the README's "full regex" claim
+    /// was unreachable from the UI.
+    ///
+    /// Session state, deliberately not persisted to config: a sticky
+    /// case-sensitive/regex mode across restarts is a well-known footgun (the
+    /// next search silently behaves differently than the user remembers).
+    find_regex: bool,
+    find_case_sensitive: bool,
+    find_whole_word: bool,
+    /// The find bar's inline error line: `Some(msg)` when the current query is
+    /// an invalid regex. Set by [`Self::find_matches_active`] (hence the
+    /// interior mutability — it runs behind `&self` on the render path) and
+    /// rendered under the query field. A bad pattern must show THIS instead of
+    /// silently degrading to a substring search or panicking.
+    find_error: std::cell::RefCell<Option<String>>,
     /// F-038 from docs/audits/overlooked-surfaces-2026-05-29.md: persistent
     /// banner rendered above the editor whenever the config file failed to
     /// parse on launch. Offers "Open config" / "Restore default" / "Dismiss"
@@ -665,6 +764,17 @@ pub struct ScribeApp {
     config_error_banner: Option<String>,
     status: String,
     toast: Option<String>,
+    /// Note-app (PKM) index of the configured vault: one [`notes_ui::NoteDoc`] per
+    /// markdown note, holding its title, tags, `[[wiki-links]]` and body. Rebuilt
+    /// by `notes_ensure_index` when the vault path changes; empty until a vault is
+    /// configured. `note_index_root` records which vault the index was built for so
+    /// a path change triggers a rescan.
+    note_index: Vec<notes_ui::NoteDoc>,
+    note_index_root: Option<std::path::PathBuf>,
+    /// Whether the note-list side pane is shown (toggled by its command/keybind).
+    notes_pane_open: bool,
+    /// The note-list filter query (`tag:` / `path:` / `title:` / quoted / -negation).
+    notes_filter: String,
     /// Plugin/mod host (Rhai easy-mode); loaded from the plugins dir on start.
     plugins: PluginHost,
     /// #R6 — ids of discovered plugins held back at load because the user has
@@ -707,6 +817,19 @@ pub struct ScribeApp {
     pending_jump_bracket: bool,
     pending_insert_datetime: bool,
     pending_dup_selection: bool,
+    /// Set by `execute_builtin(CycleTheme)`, drained by
+    /// [`Self::drain_pending_theme_reapply`] once a `ctx` is in hand.
+    ///
+    /// `reapply_theme` is the ONLY place `self.theme` is ever assigned
+    /// (`theme_visuals.rs`), and it needs a `ctx`. `execute_builtin` has none,
+    /// so the palette entry could only write `config.appearance.theme` and
+    /// save it — leaving the window painting the OLD theme until restart. The
+    /// visuals watcher cannot rescue that: `visuals_signature()` hashes
+    /// `self.theme.name`, which has not moved, and `reload_config_from_disk`
+    /// early-returns because `save_config` just wrote the config it compares
+    /// against. Hence a pending flag rather than a second theme-assignment
+    /// site — one writer, both surfaces.
+    pending_theme_reapply: bool,
     /// P0-1 — toggle the GFM task checkbox on the caret / selection lines.
     pending_toggle_task: bool,
     /// P0-4 — wrap the selection in this inline marker (`**`, `*`, `` ` ``,
@@ -716,6 +839,11 @@ pub struct ScribeApp {
     pending_case: Option<u8>,
     /// P2-1 — format the markdown pipe table under the caret.
     pending_format_table: bool,
+    /// Text a command produced that must land AT THE CARET — currently the
+    /// markdown link for a pasted image attachment, whose file is already on
+    /// disk by the time this is set. Drained by `drain_pending_editor_action`
+    /// on the next frame, where the caret is reachable.
+    pending_insert_text: Option<String>,
     /// F-013 from docs/audits/overlooked-surfaces-2026-05-29.md: when true,
     /// the welcome modal renders this frame. Auto-opened on first launch
     /// (when `config.editor.first_run_completed` is false); reachable
@@ -915,6 +1043,15 @@ pub struct ScribeApp {
     /// Selection length in characters, if the cursor range is non-empty.
     /// Drives the status-bar segment "(N chars selected)". Closes F-024.
     last_selection_chars: usize,
+    /// Root of the single-instance hand-off queue, for the process that OWNS
+    /// the instance lock. `None` for `new_test` and for a launch that could not
+    /// take the lock (an unguarded fall-through must not also drain, or two
+    /// windows would race to open the same forwarded file).
+    handoff_root: Option<PathBuf>,
+    /// Frame number at which the hand-off queue was last drained, throttled the
+    /// same way as the external-disk poll — a `read_dir` on every frame of an
+    /// idle editor is pure waste.
+    last_handoff_poll_frame: u64,
 }
 
 /// State for the open completion popup.
@@ -933,8 +1070,25 @@ impl ScribeApp {
         config: Config,
         config_err: Option<String>,
         cli_paths: Vec<String>,
+        cli_jump: Option<(usize, Option<usize>)>,
+        handoff_root: Option<PathBuf>,
     ) -> Self {
         let mut app = Self::build(config, config_err, cli_paths, true);
+        // Single-instance hand-off: this process owns the lock, so later launches
+        // will drop their arguments into `handoff_root` instead of starting their
+        // own window. `ui` drains the queue; the watcher below is what makes that
+        // work while the window is minimized and egui has stopped repainting.
+        app.handoff_root = handoff_root;
+        app.spawn_handoff_watcher(&cc.egui_ctx);
+        // Windows system-tray icon (single-click minimize/restore, right-click
+        // menu). Best-effort: a shell without a notification area logs and
+        // leaves no tray. No-op off Windows.
+        crate::tray::init(&cc.egui_ctx);
+        // Apply a `PATH:LINE[:COLUMN]` jump target (from `scr1b3 file:42:10`) to
+        // the first opened tab, so the editor opens scrolled to the requested
+        // line rather than at line 1. Runs after `build` (which opened the CLI
+        // tabs) so the first tab exists to jump within.
+        app.apply_cli_jump(cli_jump);
         // W1TN3SS opt-in crash reporting: drain the local spool of any reports
         // captured by a prior session's panic hook. PRODUCTION-only — `new_test`
         // never calls this, so a unit test that builds the app never touches the
@@ -1106,13 +1260,18 @@ impl ScribeApp {
         // force, so any keymap complaint would be about bindings that aren't live.
         // Grammar problems (blank / unparseable / colliding) come from core;
         // unknown-key problems can only be known once the chord is resolved
-        // against the UI layer's key table, so `keymap` contributes those.
+        // against the UI layer's key table, and a chord the windowing layer eats
+        // as Cut/Copy/Paste is invisible to both — so `keymap` contributes those
+        // two.
         let keybinding_issues: Vec<String> = config
             .keybindings
             .validate()
             .iter()
             .map(|i| i.message())
             .chain(keymap::Keymap::unknown_key_messages(&config.keybindings))
+            .chain(keymap::Keymap::swallowed_chord_messages(
+                &config.keybindings,
+            ))
             .collect();
         for issue in &keybinding_issues {
             tracing::warn!("keybinding problem: {issue}");
@@ -1225,9 +1384,12 @@ impl ScribeApp {
             applied_note_theme: String::new(),
             want_close: false,
             closing: false,
+            close_confirm_open: false,
             find_in_files_open: false,
             find_in_files_query: String::new(),
             find_in_files_regex: false,
+            find_in_files_case_sensitive: false,
+            find_in_files_whole_word: false,
             find_in_files_results: Vec::new(),
             find_in_files_error: None,
             focus_find_in_files: false,
@@ -1249,6 +1411,10 @@ impl ScribeApp {
             find_last_query: String::new(),
             replace_query: String::new(),
             focus_replace: false,
+            find_regex: false,
+            find_case_sensitive: false,
+            find_whole_word: false,
+            find_error: std::cell::RefCell::new(None),
             config_error_banner,
             status: format!(
                 "{} — {}",
@@ -1256,6 +1422,12 @@ impl ScribeApp {
                 scribe_core::PRODUCT_TAGLINE
             ),
             toast,
+            // Note-app index is empty until a vault is configured; `notes_ensure_index`
+            // fills it lazily on the first frame the pane is shown.
+            note_index: Vec::new(),
+            note_index_root: None,
+            notes_pane_open: false,
+            notes_filter: String::new(),
             plugins,
             pending_plugins,
             plugin_cmds,
@@ -1272,10 +1444,12 @@ impl ScribeApp {
             pending_jump_bracket: false,
             pending_insert_datetime: false,
             pending_dup_selection: false,
+            pending_theme_reapply: false,
             pending_toggle_task: false,
             pending_wrap_marker: None,
             pending_case: None,
             pending_format_table: false,
+            pending_insert_text: None,
             welcome_open: welcome_on_launch,
             fuzzy_open: false,
             fuzzy_query: String::new(),
@@ -1332,6 +1506,11 @@ impl ScribeApp {
             grid_close_queue: Vec::new(),
             last_cursor_line_col: None,
             last_selection_chars: 0,
+            // Set by `new` for the production launch that owns the instance
+            // lock; `new_test` leaves it `None` so a headless test never
+            // touches (or drains) the real user's hand-off queue.
+            handoff_root: None,
+            last_handoff_poll_frame: u64::MAX,
         };
 
         app
@@ -1457,9 +1636,21 @@ impl ScribeApp {
         }
         match EditorTab::from_path(path.clone()) {
             Ok(t) => {
+                // Binary-file advisory: the buffer is still decoded lossily so the
+                // user can inspect it, but a NUL / high control-byte ratio means the
+                // display is likely mojibake — warn rather than silently rendering
+                // garbage (which is what opening a `.exe` did before the sniff).
+                let binary = t.doc.looks_binary();
                 self.tabs.push(t);
                 self.active = self.tabs.len() - 1;
-                self.status = format!("opened {}", path.display());
+                if binary {
+                    self.toast = Some(format!(
+                        "{} looks like a binary file — the text shown may be garbled.",
+                        path.display()
+                    ));
+                } else {
+                    self.status = format!("opened {}", path.display());
+                }
                 // F-021 — restore the prior per-file scroll position
                 // (best-effort; the picker accepts a 1-frame lag).
                 let key = path.display().to_string();
@@ -1928,6 +2119,117 @@ pub(crate) const NOTE_THEMES: &[&str] = &[
     "Catppuccin Latte",
 ];
 
+/// How many frames must elapse between hand-off queue polls. At ~60 fps this is
+/// ~4 Hz — a forwarded file appears effectively instantly, and an idle editor
+/// does not pay a `read_dir` on every frame. Mirrors [`DISK_POLL_INTERVAL_FRAMES`].
+const HANDOFF_POLL_INTERVAL_FRAMES: u64 = 15;
+
+impl ScribeApp {
+    /// Wake this (primary) process when a secondary launch queues a request.
+    ///
+    /// Necessary because the queue is drained from the frame loop, and a
+    /// minimized or fully-idle window is not repainting: without a wake, opening
+    /// a file from Explorer while SCR1B3 sits minimized would do nothing until
+    /// the user happened to touch the window. The thread only ever asks for a
+    /// repaint — all state changes stay on the frame thread.
+    fn spawn_handoff_watcher(&self, ctx: &egui::Context) {
+        let Some(root) = self.handoff_root.clone() else {
+            return;
+        };
+        let ctx = ctx.clone();
+        let spawned = std::thread::Builder::new()
+            .name("scr1b3-handoff".to_string())
+            .spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                if crate::single_instance::pending(&root) {
+                    ctx.request_repaint();
+                }
+            });
+        if let Err(e) = spawned {
+            // Not fatal: the queue is still drained on every painted frame, so a
+            // forwarded file arrives as soon as the window is touched. Log it —
+            // silently losing the wake would look like "the tray/Explorer open
+            // is flaky" with no trace.
+            tracing::warn!("hand-off watcher thread could not start: {e}");
+        }
+    }
+
+    /// Drain any launches forwarded by a secondary process, open what they
+    /// asked for, and raise this window.
+    ///
+    /// A raise happens for EVERY request, including one with no paths: a bare
+    /// second launch (double-clicking the icon or the taskbar tile) is the user
+    /// asking for the existing window, and answering it with nothing visible
+    /// would read as a dead application.
+    pub(super) fn poll_handoff_queue(&mut self, ctx: &egui::Context) {
+        let Some(root) = self.handoff_root.clone() else {
+            return;
+        };
+        let frame = ctx.cumulative_pass_nr();
+        if !should_poll_disk(
+            frame,
+            self.last_handoff_poll_frame,
+            HANDOFF_POLL_INTERVAL_FRAMES,
+        ) {
+            return;
+        }
+        self.last_handoff_poll_frame = frame;
+        let requests = crate::single_instance::drain(&root);
+        if requests.is_empty() {
+            return;
+        }
+        for request in requests {
+            self.apply_handoff_request(&request);
+        }
+        // Un-minimize BEFORE focusing — see `tray::restore_commands`.
+        for cmd in crate::tray::restore_commands() {
+            ctx.send_viewport_cmd(cmd);
+        }
+    }
+
+    /// Open one forwarded launch's files. An already-open path activates its
+    /// existing tab instead of opening a duplicate; the FIRST path becomes the
+    /// active tab, matching how a cold launch treats its command line.
+    pub(super) fn apply_handoff_request(&mut self, request: &crate::single_instance::Request) {
+        let mut first_opened: Option<usize> = None;
+        for raw in &request.paths {
+            let path = PathBuf::from(raw);
+            if let Some(idx) = self
+                .tabs
+                .iter()
+                .position(|t| t.doc.path() == Some(path.as_path()))
+            {
+                first_opened.get_or_insert(idx);
+                continue;
+            }
+            match EditorTab::from_path(path) {
+                Ok(tab) => {
+                    self.tabs.push(tab);
+                    first_opened.get_or_insert(self.tabs.len() - 1);
+                }
+                Err(e) => {
+                    self.toast = Some(format!("could not open {raw}: {e}"));
+                }
+            }
+        }
+        if let Some(idx) = first_opened {
+            self.active = idx;
+            self.status = format!("opened {} file(s) from a new launch", request.paths.len());
+            // `apply_cli_jump` is not reusable here: it forces `active = 0`,
+            // which is correct for a cold launch (the CLI files ARE tabs 0..n)
+            // and wrong for a hand-off landing after a session restore.
+            if let Some((line, col)) = request.jump {
+                if line > 0 {
+                    self.goto_line(line);
+                    if let Some(c) = col {
+                        self.status = format!("go to line {line}:{c}");
+                    }
+                }
+            }
+        }
+    }
+}
+
 impl eframe::App for ScribeApp {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         // Transparent for frameless rounded corners.
@@ -1981,6 +2283,10 @@ impl eframe::App for ScribeApp {
                 }
             }
         }
+        // Single-instance hand-off: pick up anything a later launch forwarded
+        // (and raise this window) BEFORE the frame is built, so the files it
+        // asked for are painted in the very frame the window comes forward.
+        self.poll_handoff_queue(&ctx);
         self.frame_tick(&ctx);
     }
 }
@@ -2045,6 +2351,9 @@ mod build_plugins;
 mod builtins;
 mod chrome;
 mod deferred_actions;
+/// Pure placement rules for the inline LSP-diagnostic overlay (squiggle spans,
+/// gutter marks, hover text). The painting itself lives in `frame_tick`.
+mod diagnostics_overlay;
 /// The single seam to the OS file dialogs — headless under `cfg(test)`.
 pub(crate) mod dialogs;
 mod drag_scroll;
@@ -2060,6 +2369,9 @@ mod keyboard_input;
 mod keymap;
 mod modals;
 mod multi_cursor_glue;
+/// One-entry, content-keyed cache for the preview header's note metrics.
+mod note_metrics;
+mod notes_ui;
 mod render_support;
 // Re-export the rendering & text-geometry leaf helpers so existing bare-name
 // call sites in mod.rs, the `use super::*` siblings (frame_tick, editor_overlays,
@@ -2072,7 +2384,12 @@ pub(crate) use render_support::{
     panel_fill, pick_bookmark, spawn_config_watcher, use_rope_editor,
 };
 mod session_io;
+// The Settings → Keyboard page. It lives under `app/` (not beside `settings.rs`)
+// because it reads `keymap`'s token <-> key table and action consts, which are
+// `pub(in crate::app)` — the same tables the live matcher uses, so Settings and
+// the editor can never disagree about what a chord means.
 mod session_persist;
+pub(crate) mod settings_keys;
 mod tab_strip_render;
 mod tabs;
 mod text_analysis;
@@ -2111,7 +2428,19 @@ mod restore_dedup_tests;
 mod find_nav_tests;
 
 #[cfg(test)]
+mod find_toggle_tests;
+
+#[cfg(test)]
+mod cli_jump_tests;
+
+#[cfg(test)]
 mod resize_tests;
+
+#[cfg(test)]
+mod chrome_tests;
+
+#[cfg(test)]
+mod notes_ui_tests;
 
 #[cfg(test)]
 mod save_session_tests;
@@ -2150,6 +2479,12 @@ mod session_io_tests;
 mod file_ops_tests;
 
 #[cfg(test)]
+mod folder_mru_tests;
+
+#[cfg(test)]
+mod binary_advisory_tests;
+
+#[cfg(test)]
 mod build_plugins_tests;
 
 #[cfg(test)]
@@ -2175,6 +2510,9 @@ mod tab_reorder_tests;
 
 #[cfg(test)]
 mod sidetab_drop_indicator_tests;
+
+#[cfg(test)]
+mod handoff_tests;
 
 #[cfg(test)]
 mod multi_file_open_tests;
@@ -2214,6 +2552,9 @@ mod find_in_files_tests;
 
 #[cfg(test)]
 mod grid_pane_tests;
+
+#[cfg(test)]
+mod grid_parity_tests;
 
 #[cfg(test)]
 mod filetree_tests;
@@ -2262,3 +2603,9 @@ mod error_message_tests;
 
 #[cfg(test)]
 mod tabbar_layout_tests;
+
+#[cfg(test)]
+mod close_guard_tests;
+
+#[cfg(test)]
+mod lsp_and_preview_wiring_tests;

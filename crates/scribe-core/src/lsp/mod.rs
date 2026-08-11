@@ -7,15 +7,46 @@
 //! gracefully (no crash).
 
 pub mod protocol;
+pub mod sync;
 
 pub use protocol::Diagnostic;
+pub use sync::{
+    byte_offset_of_position, utf16_position, ChangeDebouncer, ContentChange, LineIndex,
+    TextDocumentSyncKind,
+};
 
 use serde_json::{json, Value};
 use std::io::{BufReader, Write};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU8, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
+use std::sync::Arc;
 use std::thread::JoinHandle;
+use std::time::Instant;
+
+/// `sync_kind` slot value meaning "the server has not told us yet".
+///
+/// A real kind is 0/1/2, so `u8::MAX` cannot collide with one. Until the
+/// `initialize` result lands we fall back to FULL sync, which every server
+/// accepts: the spec says a content change with no `range` IS the whole
+/// document, so a full-document change is legal even for a server that will
+/// later declare `Incremental`.
+const SYNC_KIND_UNKNOWN: u8 = u8::MAX;
+
+/// The document this client has open, and the state needed to send a
+/// well-formed `didChange` for it.
+#[derive(Debug, Clone)]
+struct OpenDoc {
+    uri: String,
+    /// Monotonic per-document version. `didOpen` is 1; every `didChange`
+    /// increments. A server rejects a change whose version did not advance.
+    version: i64,
+    /// The text the server currently believes the document holds. An
+    /// incremental change's range is computed against THIS, not against
+    /// whatever the editor showed last frame — otherwise a dropped/debounced
+    /// intermediate state would silently desynchronise the two.
+    text: String,
+}
 
 /// One language server: the command to run + the languages it serves.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,6 +151,68 @@ fn run_writer_loop<W: Write>(mut stdin: W, rx: Receiver<Value>) {
     let _ = stdin.flush();
 }
 
+/// Drive the reader side: decode framed messages from the server, learn the
+/// declared document-sync kind from the `initialize` result, and forward every
+/// non-empty diagnostic batch to the UI.
+///
+/// Split out of the spawn closure (the same shape as [`run_writer_loop`]) so
+/// the whole decode → observe → forward path is exercised over an in-memory
+/// stream — the sync-kind capture in particular, which a real language server
+/// would otherwise be the only way to reach.
+///
+/// The sync kind is FIRST-WRITE-WINS: a server's `initialize` result is
+/// definitive, and a later message that happens to look like one (a
+/// `workspace/configuration` echo, a proxied second handshake) must not be able
+/// to retarget an in-flight document's change encoding.
+fn run_reader_loop<R: std::io::BufRead>(
+    mut reader: R,
+    tx: &Sender<Vec<Diagnostic>>,
+    sync_kind: &AtomicU8,
+) {
+    loop {
+        match protocol::read_message(&mut reader) {
+            Ok(Some(msg)) => {
+                if sync_kind.load(Ordering::Relaxed) == SYNC_KIND_UNKNOWN {
+                    if let Some(k) = TextDocumentSyncKind::from_initialize_result(&msg) {
+                        sync_kind.store(k.to_wire(), Ordering::Relaxed);
+                    }
+                }
+                let diags = protocol::parse_publish_diagnostics(&msg);
+                if !diags.is_empty() && tx.send(diags).is_err() {
+                    // UI dropped the receiver — ordinary teardown, not a
+                    // failure of the server. Debug, not warn.
+                    tracing::debug!(
+                        target: "scribe::lsp",
+                        "language-server reader stopped: diagnostics receiver dropped"
+                    );
+                    break;
+                }
+            }
+            // Clean EOF: the server closed stdout (exited / was reaped).
+            // Diagnostics will no longer update — a recoverable degrade.
+            Ok(None) => {
+                tracing::warn!(
+                    target: "scribe::lsp",
+                    reason = "eof",
+                    "language-server reader stopped: server closed the connection (diagnostics will no longer update)"
+                );
+                break;
+            }
+            // Malformed frame or broken pipe: the diagnostics stream dies
+            // here. Log the error KIND only (never frame/buffer content).
+            Err(e) => {
+                tracing::warn!(
+                    target: "scribe::lsp",
+                    reason = "read-error",
+                    error_kind = ?e.kind(),
+                    "language-server reader stopped: unreadable frame or broken pipe (diagnostics will no longer update)"
+                );
+                break;
+            }
+        }
+    }
+}
+
 /// A running LSP server connection. Diagnostics arrive on `diagnostics`.
 ///
 /// Outgoing messages are never written on the caller's (egui frame) thread:
@@ -138,6 +231,16 @@ pub struct LspClient {
     writer: Option<JoinHandle<()>>,
     next_id: AtomicI64,
     pub diagnostics: Receiver<Vec<Diagnostic>>,
+    /// The sync kind the server declared in its `initialize` result, written by
+    /// the reader thread (which is the only place that sees the result) and read
+    /// by [`LspClient::flush_pending_change`] on the frame thread.
+    /// [`SYNC_KIND_UNKNOWN`] until the handshake completes.
+    sync_kind: Arc<AtomicU8>,
+    /// The open document + the text the server last saw. `None` before
+    /// `did_open`.
+    open: Option<OpenDoc>,
+    /// Coalesces a burst of keystrokes into one `didChange`.
+    debouncer: ChangeDebouncer,
 }
 
 impl LspClient {
@@ -156,45 +259,13 @@ impl LspClient {
 
         let (tx, rx): (Sender<Vec<Diagnostic>>, Receiver<Vec<Diagnostic>>) =
             std::sync::mpsc::channel();
+        // Shared with the reader thread, which is the only place the
+        // `initialize` RESULT is ever seen. Written once (first result wins),
+        // read on the frame thread when building a `didChange`.
+        let sync_kind = Arc::new(AtomicU8::new(SYNC_KIND_UNKNOWN));
+        let reader_sync_kind = Arc::clone(&sync_kind);
         std::thread::spawn(move || {
-            let mut reader = BufReader::new(stdout);
-            loop {
-                match protocol::read_message(&mut reader) {
-                    Ok(Some(msg)) => {
-                        let diags = protocol::parse_publish_diagnostics(&msg);
-                        if !diags.is_empty() && tx.send(diags).is_err() {
-                            // UI dropped the receiver — ordinary teardown, not a
-                            // failure of the server. Debug, not warn.
-                            tracing::debug!(
-                                target: "scribe::lsp",
-                                "language-server reader stopped: diagnostics receiver dropped"
-                            );
-                            break;
-                        }
-                    }
-                    // Clean EOF: the server closed stdout (exited / was reaped).
-                    // Diagnostics will no longer update — a recoverable degrade.
-                    Ok(None) => {
-                        tracing::warn!(
-                            target: "scribe::lsp",
-                            reason = "eof",
-                            "language-server reader stopped: server closed the connection (diagnostics will no longer update)"
-                        );
-                        break;
-                    }
-                    // Malformed frame or broken pipe: the diagnostics stream dies
-                    // here. Log the error KIND only (never frame/buffer content).
-                    Err(e) => {
-                        tracing::warn!(
-                            target: "scribe::lsp",
-                            reason = "read-error",
-                            error_kind = ?e.kind(),
-                            "language-server reader stopped: unreadable frame or broken pipe (diagnostics will no longer update)"
-                        );
-                        break;
-                    }
-                }
-            }
+            run_reader_loop(BufReader::new(stdout), &tx, &reader_sync_kind);
         });
 
         // Writer thread: owns `stdin`, drains `out_rx` FIFO. Every outgoing
@@ -228,6 +299,9 @@ impl LspClient {
             writer: Some(writer),
             next_id,
             diagnostics: rx,
+            sync_kind,
+            open: None,
+            debouncer: ChangeDebouncer::new(),
         })
     }
 
@@ -237,12 +311,124 @@ impl LspClient {
     /// server's stdin pipe is full, this returns promptly — the writer thread,
     /// not the caller, owns the blocking `write_all`. An `Err` means the writer
     /// thread has gone (server died); the caller degrades gracefully.
+    ///
+    /// Records the opened document so subsequent [`note_change`](Self::note_change)
+    /// / [`flush_pending_change`](Self::flush_pending_change) calls can send a
+    /// correctly-versioned `didChange` against it.
     pub fn did_open(&mut self, uri: &str, language_id: &str, text: &str) -> std::io::Result<()> {
         let msg = protocol::notification(
             "textDocument/didOpen",
             did_open_params(uri, language_id, text),
         );
-        self.enqueue(msg)
+        let result = self.enqueue(msg);
+        // Record the document even if the enqueue failed: `open` describes what
+        // this client is FOR, and a later flush is a no-op anyway once the
+        // writer is gone (it returns the same broken-pipe error).
+        self.open = Some(OpenDoc {
+            uri: uri.to_string(),
+            version: 1,
+            text: text.to_string(),
+        });
+        self.debouncer = ChangeDebouncer::new();
+        result
+    }
+
+    /// The URI of the document this client has open, if any. The editor uses it
+    /// to make sure it only feeds changes for the buffer the server is actually
+    /// tracking — a tab switch must not send the new tab's text against the old
+    /// tab's URI.
+    pub fn open_uri(&self) -> Option<&str> {
+        self.open.as_ref().map(|o| o.uri.as_str())
+    }
+
+    /// The document-sync kind the server declared, or `None` while the
+    /// `initialize` result has not arrived (or the server declared nothing).
+    pub fn declared_sync_kind(&self) -> Option<TextDocumentSyncKind> {
+        TextDocumentSyncKind::from_wire(i64::from(self.sync_kind.load(Ordering::Relaxed)))
+    }
+
+    /// The sync kind actually used to build a change: the declared one, or FULL
+    /// while the handshake is still in flight. Full sync is the safe default —
+    /// a rangeless content change is defined by the spec to mean "this is the
+    /// whole document", which an incremental server also accepts.
+    fn effective_sync_kind(&self) -> TextDocumentSyncKind {
+        self.declared_sync_kind()
+            .unwrap_or(TextDocumentSyncKind::Full)
+    }
+
+    /// Record the buffer's current text. Cheap and safe to call every frame:
+    /// nothing is sent until the buffer has been quiet for
+    /// [`sync::DEBOUNCE`], so a keystroke cannot spam the server.
+    ///
+    /// Text the server already holds, with nothing queued, is not a change and
+    /// is ignored — otherwise merely OPENING a file would leave a permanently
+    /// pending no-op edit.
+    pub fn note_change(&mut self, text: &str, now: Instant) {
+        let Some(open) = self.open.as_ref() else {
+            return;
+        };
+        if !self.debouncer.is_pending() && open.text == text {
+            return;
+        }
+        self.debouncer.note(text, now);
+    }
+
+    /// Send the debounced `didChange` if one is due.
+    ///
+    /// Returns `Ok(true)` when a change was actually enqueued. Call once per
+    /// frame after [`note_change`](Self::note_change). Sends nothing when: no
+    /// document is open, the quiet window has not elapsed, the text is
+    /// unchanged since the server last saw it, or the server declared
+    /// `TextDocumentSyncKind::NoSync`.
+    pub fn flush_pending_change(&mut self, now: Instant) -> std::io::Result<bool> {
+        let Some(text) = self.debouncer.take_due(now) else {
+            return Ok(false);
+        };
+        let Some(open) = self.open.as_ref() else {
+            return Ok(false);
+        };
+        let changes = sync::content_changes(&open.text, &text, self.effective_sync_kind());
+        if changes.is_empty() {
+            // Unchanged, or the server wants no change notifications. Still
+            // adopt the text as the server's view so the next diff is computed
+            // from a truthful base.
+            if let Some(open) = self.open.as_mut() {
+                open.text = text;
+            }
+            return Ok(false);
+        }
+        let (uri, version) = {
+            let open = self.open.as_mut().expect("checked above");
+            open.version += 1;
+            (open.uri.clone(), open.version)
+        };
+        let msg = protocol::notification(
+            "textDocument/didChange",
+            protocol::did_change_params(&uri, version, &changes),
+        );
+        let result = self.enqueue(msg);
+        // The change is on the wire (or the writer is gone and nothing more
+        // will be); either way the server's view is now `text`.
+        if let Some(open) = self.open.as_mut() {
+            open.text = text;
+        }
+        result.map(|()| true)
+    }
+
+    /// The document version the server has been told about: `1` after
+    /// `didOpen`, incremented by every `didChange` that actually went out.
+    ///
+    /// This is the honest "did the server hear about my edit?" signal — it
+    /// advances only when a change was really built and enqueued, never merely
+    /// because an edit was noted. `None` before `did_open`.
+    pub fn document_version(&self) -> Option<i64> {
+        self.open.as_ref().map(|o| o.version)
+    }
+
+    /// True while an edit has been noted but the quiet window has not elapsed,
+    /// so nothing has gone to the server yet.
+    pub fn has_pending_change(&self) -> bool {
+        self.debouncer.is_pending()
     }
 
     /// Enqueue a framed message for the writer thread (FIFO, non-blocking).
@@ -683,6 +869,492 @@ mod tests {
         );
     }
 
+    // ---- reader loop: diagnostics forwarding + sync-kind capture ----
+    //
+    // Driven over an in-memory framed stream through the REAL `run_reader_loop`
+    // — the same idiom the writer tests use — so the handshake observation is
+    // exercised without needing a real language server on the host.
+
+    fn framed(msgs: &[Value]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        for m in msgs {
+            protocol::write_message(&mut buf, m).unwrap();
+        }
+        buf
+    }
+
+    /// Run the reader loop to EOF over `msgs`, returning the diagnostics it
+    /// forwarded and the sync kind it learned.
+    fn drive_reader(msgs: &[Value]) -> (Vec<Vec<Diagnostic>>, Option<TextDocumentSyncKind>) {
+        let bytes = framed(msgs);
+        let (tx, rx) = channel::<Vec<Diagnostic>>();
+        let kind = AtomicU8::new(SYNC_KIND_UNKNOWN);
+        run_reader_loop(BufReader::new(&bytes[..]), &tx, &kind);
+        drop(tx);
+        let batches: Vec<Vec<Diagnostic>> = rx.into_iter().collect();
+        (
+            batches,
+            TextDocumentSyncKind::from_wire(i64::from(kind.load(Ordering::Relaxed))),
+        )
+    }
+
+    fn diag_notification(line: u64, end_char: u64, message: &str) -> Value {
+        protocol::notification(
+            "textDocument/publishDiagnostics",
+            json!({
+                "uri": "file:///x.rs",
+                "diagnostics": [{
+                    "range": {"start": {"line": line, "character": 0},
+                              "end":   {"line": line, "character": end_char}},
+                    "severity": 1,
+                    "message": message,
+                }],
+            }),
+        )
+    }
+
+    #[test]
+    fn the_reader_learns_the_sync_kind_from_the_handshake_and_still_forwards_diagnostics() {
+        // Both jobs on one stream: without the sync-kind capture every server
+        // would be driven as FULL sync; without the forwarding the editor shows
+        // nothing.
+        let (batches, kind) = drive_reader(&[
+            json!({"jsonrpc": "2.0", "id": 1, "result": {"capabilities": {
+                "textDocumentSync": {"openClose": true, "change": 2}}}}),
+            diag_notification(7, 4, "mismatched types"),
+        ]);
+        assert_eq!(
+            kind,
+            Some(TextDocumentSyncKind::Incremental),
+            "the declared sync kind must be read off the initialize result"
+        );
+        assert_eq!(batches.len(), 1, "one diagnostic batch reached the UI");
+        assert_eq!(batches[0][0].message, "mismatched types");
+        assert_eq!((batches[0][0].line, batches[0][0].end_character), (7, 4));
+    }
+
+    #[test]
+    fn a_server_that_declares_nothing_leaves_the_sync_kind_unknown() {
+        let (_, kind) = drive_reader(&[
+            json!({"jsonrpc": "2.0", "id": 1, "result": {"capabilities": {}}}),
+            diag_notification(0, 1, "x"),
+        ]);
+        assert_eq!(
+            kind, None,
+            "an unspecified sync kind must stay unknown so the caller's FULL \
+             default applies — never be guessed at as Incremental"
+        );
+    }
+
+    #[test]
+    fn the_sync_kind_is_first_write_wins() {
+        // A later message that looks like a handshake result must not retarget
+        // the change encoding of a document already being edited.
+        let (_, kind) = drive_reader(&[
+            json!({"jsonrpc": "2.0", "id": 1, "result": {"capabilities": {"textDocumentSync": 2}}}),
+            json!({"jsonrpc": "2.0", "id": 9, "result": {"capabilities": {"textDocumentSync": 1}}}),
+        ]);
+        assert_eq!(
+            kind,
+            Some(TextDocumentSyncKind::Incremental),
+            "the FIRST declared kind wins; a later one must not overwrite it"
+        );
+    }
+
+    #[test]
+    fn the_reader_stops_cleanly_on_a_malformed_frame_without_losing_earlier_diagnostics() {
+        // Everything decoded BEFORE the bad frame must already be delivered.
+        let mut bytes = framed(&[diag_notification(1, 2, "first")]);
+        bytes.extend_from_slice(b"Content-Length: nonsense\r\n\r\n");
+        let (tx, rx) = channel::<Vec<Diagnostic>>();
+        let kind = AtomicU8::new(SYNC_KIND_UNKNOWN);
+        run_reader_loop(BufReader::new(&bytes[..]), &tx, &kind);
+        drop(tx);
+        let batches: Vec<_> = rx.into_iter().collect();
+        assert_eq!(batches.len(), 1, "the good frame was delivered");
+        assert_eq!(batches[0][0].message, "first");
+    }
+
+    // ---- didChange: what actually reaches the server ----
+    //
+    // These re-point a LIVE client's outgoing side at an in-memory sink driven
+    // by the REAL `run_writer_loop`, so the assertions are on the framed bytes
+    // the server would receive — not on an internal flag.
+
+    struct RecordingSink(Arc<Mutex<Vec<u8>>>);
+    impl Write for RecordingSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Run `f` against a live client whose outgoing messages are recorded, and
+    /// return the messages that reached the wire, decoded back from their
+    /// `Content-Length` frames.
+    fn wire_after(client: &mut LspClient, f: impl FnOnce(&mut LspClient)) -> Vec<Value> {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let (tx, rx) = channel::<Value>();
+        let sink = RecordingSink(written.clone());
+        let handle = std::thread::spawn(move || run_writer_loop(sink, rx));
+        // Swap in the recording writer; retire the child-stdin one.
+        let old_tx = client.outgoing.replace(tx);
+        drop(old_tx);
+        if let Some(old) = client.writer.replace(handle) {
+            let _ = old.join();
+        }
+
+        f(client);
+
+        // Close the recording writer and decode what it wrote.
+        drop(client.outgoing.take());
+        if let Some(h) = client.writer.take() {
+            let _ = h.join();
+        }
+        let bytes = written.lock().unwrap().clone();
+        let mut reader = BufReader::new(&bytes[..]);
+        let mut out = Vec::new();
+        while let Ok(Some(m)) = protocol::read_message(&mut reader) {
+            out.push(m);
+        }
+        out
+    }
+
+    /// A live client, with the host-availability check made explicit: on Windows
+    /// `cmd` always exists, so a `None` there is a real failure and not a skip.
+    fn live_client() -> Option<LspClient> {
+        let c = spawn_benign_lsp_client();
+        assert!(
+            c.is_some() || !cfg!(windows),
+            "`cmd /c pause` must be spawnable on Windows — a None here is a \
+             broken harness, not an absent dependency"
+        );
+        c
+    }
+
+    fn did_changes(msgs: &[Value]) -> Vec<&Value> {
+        msgs.iter()
+            .filter(|m| m["method"] == "textDocument/didChange")
+            .collect()
+    }
+
+    #[test]
+    fn a_typed_character_reaches_the_server_as_an_incremental_did_change() {
+        // The whole feature: before this, EVERY `textDocument/didChange` string
+        // in the tree was inside a test — diagnostics froze at the state the
+        // file had when it was opened.
+        let Some(mut client) = live_client() else {
+            return;
+        };
+        client.sync_kind.store(
+            TextDocumentSyncKind::Incremental.to_wire(),
+            Ordering::Relaxed,
+        );
+        let t0 = Instant::now();
+        let msgs = wire_after(&mut client, |c| {
+            c.did_open("file:///x.rs", "rust", "fn mai() {}\n").unwrap();
+            c.note_change("fn main() {}\n", t0);
+            assert!(
+                c.flush_pending_change(t0 + sync::DEBOUNCE).unwrap(),
+                "the change was due and must have been sent"
+            );
+        });
+        let changes = did_changes(&msgs);
+        assert_eq!(changes.len(), 1, "exactly one didChange on the wire");
+        let c = changes[0];
+        assert_eq!(c["params"]["textDocument"]["uri"], "file:///x.rs");
+        assert_eq!(
+            c["params"]["textDocument"]["version"], 2,
+            "didOpen is version 1, so the first change is version 2"
+        );
+        assert_eq!(
+            c["params"]["contentChanges"][0]["text"], "n",
+            "an incremental server receives the typed character, not the file"
+        );
+        assert_eq!(
+            c["params"]["contentChanges"][0]["range"]["start"]["character"],
+            6
+        );
+    }
+
+    #[test]
+    fn a_full_sync_server_receives_the_whole_document_and_no_range() {
+        let Some(mut client) = live_client() else {
+            return;
+        };
+        client
+            .sync_kind
+            .store(TextDocumentSyncKind::Full.to_wire(), Ordering::Relaxed);
+        let t0 = Instant::now();
+        let msgs = wire_after(&mut client, |c| {
+            c.did_open("file:///x.rs", "rust", "a\n").unwrap();
+            c.note_change("ab\n", t0);
+            c.flush_pending_change(t0 + sync::DEBOUNCE).unwrap();
+        });
+        let changes = did_changes(&msgs);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0]["params"]["contentChanges"][0]["text"], "ab\n");
+        assert!(
+            changes[0]["params"]["contentChanges"][0]
+                .get("range")
+                .is_none(),
+            "a full-sync change must carry no range"
+        );
+    }
+
+    #[test]
+    fn a_server_that_wants_no_change_notifications_gets_none() {
+        let Some(mut client) = live_client() else {
+            return;
+        };
+        client
+            .sync_kind
+            .store(TextDocumentSyncKind::NoSync.to_wire(), Ordering::Relaxed);
+        let t0 = Instant::now();
+        let msgs = wire_after(&mut client, |c| {
+            c.did_open("file:///x.rs", "rust", "a\n").unwrap();
+            c.note_change("ab\n", t0);
+            assert!(
+                !c.flush_pending_change(t0 + sync::DEBOUNCE).unwrap(),
+                "nothing is sent to a NoSync server"
+            );
+        });
+        assert!(
+            did_changes(&msgs).is_empty(),
+            "a NoSync server must receive no didChange at all, got: {msgs:?}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_sync_kind_falls_back_to_full_rather_than_sending_nothing() {
+        // Before the handshake result lands the editor must still sync — a
+        // silent "wait for capabilities" would freeze diagnostics exactly as
+        // the missing didChange did.
+        let Some(mut client) = live_client() else {
+            return;
+        };
+        assert_eq!(
+            client.declared_sync_kind(),
+            None,
+            "precondition: `cmd /c pause` never sends an initialize result"
+        );
+        let t0 = Instant::now();
+        let msgs = wire_after(&mut client, |c| {
+            c.did_open("file:///x.rs", "rust", "a\n").unwrap();
+            c.note_change("ab\n", t0);
+            c.flush_pending_change(t0 + sync::DEBOUNCE).unwrap();
+        });
+        let changes = did_changes(&msgs);
+        assert_eq!(changes.len(), 1, "the change is still sent");
+        assert_eq!(
+            changes[0]["params"]["contentChanges"][0]["text"], "ab\n",
+            "the fallback is FULL sync (whole document, no range)"
+        );
+    }
+
+    #[test]
+    fn a_burst_of_keystrokes_reaches_the_server_as_one_message() {
+        // Debounce, observed at the wire: five keystrokes, one didChange,
+        // carrying the FINAL text.
+        let Some(mut client) = live_client() else {
+            return;
+        };
+        client
+            .sync_kind
+            .store(TextDocumentSyncKind::Full.to_wire(), Ordering::Relaxed);
+        let t0 = Instant::now();
+        let msgs = wire_after(&mut client, |c| {
+            c.did_open("file:///x.rs", "rust", "").unwrap();
+            for (i, s) in ["h", "he", "hel", "hell", "hello"].iter().enumerate() {
+                let now = t0 + std::time::Duration::from_millis(10 * i as u64);
+                c.note_change(s, now);
+                // Every frame flushes; none is due inside the burst.
+                assert!(
+                    !c.flush_pending_change(now).unwrap(),
+                    "no send while the user is still typing"
+                );
+            }
+            assert!(c
+                .flush_pending_change(t0 + std::time::Duration::from_millis(40) + sync::DEBOUNCE)
+                .unwrap());
+        });
+        let changes = did_changes(&msgs);
+        assert_eq!(
+            changes.len(),
+            1,
+            "five keystrokes must produce ONE message, got {} — {msgs:?}",
+            changes.len()
+        );
+        assert_eq!(
+            changes[0]["params"]["contentChanges"][0]["text"], "hello",
+            "and it carries the final text, not an intermediate keystroke"
+        );
+    }
+
+    #[test]
+    fn successive_changes_advance_the_version_and_diff_from_the_servers_view() {
+        // Version must strictly increase (a server drops a non-advancing
+        // change), and the SECOND diff must be computed against what the server
+        // actually holds — not against the editor's previous frame.
+        let Some(mut client) = live_client() else {
+            return;
+        };
+        client.sync_kind.store(
+            TextDocumentSyncKind::Incremental.to_wire(),
+            Ordering::Relaxed,
+        );
+        let t0 = Instant::now();
+        let msgs = wire_after(&mut client, |c| {
+            c.did_open("file:///x.rs", "rust", "ab\n").unwrap();
+            c.note_change("axb\n", t0);
+            c.flush_pending_change(t0 + sync::DEBOUNCE).unwrap();
+            let t1 = t0 + sync::DEBOUNCE * 2;
+            c.note_change("axyb\n", t1);
+            c.flush_pending_change(t1 + sync::DEBOUNCE).unwrap();
+        });
+        let changes = did_changes(&msgs);
+        assert_eq!(changes.len(), 2);
+        assert_eq!(changes[0]["params"]["textDocument"]["version"], 2);
+        assert_eq!(changes[1]["params"]["textDocument"]["version"], 3);
+        assert_eq!(changes[0]["params"]["contentChanges"][0]["text"], "x");
+        assert_eq!(
+            changes[1]["params"]["contentChanges"][0]["text"], "y",
+            "the second diff is against 'axb' (what the server holds), so only \
+             'y' travels"
+        );
+        assert_eq!(
+            changes[1]["params"]["contentChanges"][0]["range"]["start"]["character"],
+            2
+        );
+        assert_eq!(client.document_version(), Some(3));
+    }
+
+    #[test]
+    fn a_debounced_edit_that_lands_back_on_the_original_text_sends_nothing() {
+        // Type a character and delete it inside the window: the server's view
+        // never changed, so it must not be told it did.
+        let Some(mut client) = live_client() else {
+            return;
+        };
+        client
+            .sync_kind
+            .store(TextDocumentSyncKind::Full.to_wire(), Ordering::Relaxed);
+        let t0 = Instant::now();
+        let msgs = wire_after(&mut client, |c| {
+            c.did_open("file:///x.rs", "rust", "ab\n").unwrap();
+            c.note_change("abc\n", t0);
+            c.note_change("ab\n", t0 + std::time::Duration::from_millis(20));
+            assert!(!c
+                .flush_pending_change(t0 + std::time::Duration::from_millis(20) + sync::DEBOUNCE)
+                .unwrap());
+        });
+        assert!(did_changes(&msgs).is_empty(), "got: {msgs:?}");
+        assert_eq!(
+            client.document_version(),
+            Some(1),
+            "the version must NOT advance for a no-op edit"
+        );
+    }
+
+    #[test]
+    fn a_frame_loop_re_noting_the_unchanged_buffer_still_gets_its_edit_sent() {
+        // The client's caller is a ~60fps frame loop that hands over the active
+        // buffer EVERY frame, changed or not. If each of those restarted the
+        // quiet window, the window would never elapse and no didChange would
+        // EVER reach the server — the feature dead in exactly the way it looks
+        // alive. Simulated here at the client level: one real edit, then many
+        // idle frames re-noting the same text.
+        let Some(mut client) = live_client() else {
+            return;
+        };
+        client
+            .sync_kind
+            .store(TextDocumentSyncKind::Full.to_wire(), Ordering::Relaxed);
+        let t0 = Instant::now();
+        let msgs = wire_after(&mut client, |c| {
+            c.did_open("file:///x.rs", "rust", "a\n").unwrap();
+            c.note_change("ab\n", t0);
+            for i in 0..60u64 {
+                let now = t0 + std::time::Duration::from_millis(i * 16);
+                c.note_change("ab\n", now); // unchanged: an idle frame
+                let _ = c.flush_pending_change(now).unwrap();
+            }
+        });
+        let changes = did_changes(&msgs);
+        assert_eq!(
+            changes.len(),
+            1,
+            "the edit must reach the server exactly once despite 60 idle \
+             re-notes, got {} — {msgs:?}",
+            changes.len()
+        );
+        assert_eq!(changes[0]["params"]["contentChanges"][0]["text"], "ab\n");
+    }
+
+    #[test]
+    fn opening_a_file_and_idling_queues_nothing() {
+        // A frame loop notes the buffer every frame from the moment the file
+        // opens. Text the server already has is not a change.
+        let Some(mut client) = live_client() else {
+            return;
+        };
+        let t0 = Instant::now();
+        let msgs = wire_after(&mut client, |c| {
+            c.did_open("file:///x.rs", "rust", "unchanged\n").unwrap();
+            for i in 0..30u64 {
+                let now = t0 + std::time::Duration::from_millis(i * 16);
+                c.note_change("unchanged\n", now);
+                let _ = c.flush_pending_change(now).unwrap();
+            }
+            assert!(
+                !c.has_pending_change(),
+                "opening a file must not leave a permanently pending no-op edit"
+            );
+        });
+        assert!(did_changes(&msgs).is_empty(), "got: {msgs:?}");
+    }
+
+    #[test]
+    fn a_change_noted_before_any_did_open_is_inert() {
+        let Some(mut client) = live_client() else {
+            return;
+        };
+        let t0 = Instant::now();
+        let msgs = wire_after(&mut client, |c| {
+            c.note_change("typing into nothing", t0);
+            assert!(!c.flush_pending_change(t0 + sync::DEBOUNCE).unwrap());
+        });
+        assert!(did_changes(&msgs).is_empty(), "got: {msgs:?}");
+    }
+
+    #[test]
+    fn reopening_a_document_resets_the_debouncer_so_no_stale_text_is_sent() {
+        // Switching files must not let the PREVIOUS file's pending text be
+        // flushed against the NEW document's uri.
+        let Some(mut client) = live_client() else {
+            return;
+        };
+        client
+            .sync_kind
+            .store(TextDocumentSyncKind::Full.to_wire(), Ordering::Relaxed);
+        let t0 = Instant::now();
+        let msgs = wire_after(&mut client, |c| {
+            c.did_open("file:///a.rs", "rust", "aaa\n").unwrap();
+            c.note_change("aaa edited\n", t0);
+            // No flush — the user switched files first.
+            c.did_open("file:///b.rs", "rust", "bbb\n").unwrap();
+            assert!(!c.flush_pending_change(t0 + sync::DEBOUNCE * 4).unwrap());
+        });
+        assert!(
+            did_changes(&msgs).is_empty(),
+            "the first file's pending text must not be sent against the \
+             second file's uri, got: {msgs:?}"
+        );
+    }
+
     #[test]
     fn read_message_decodes_a_stream_of_two_then_eof() {
         let a = protocol::notification("initialized", json!({}));
@@ -695,5 +1367,119 @@ mod tests {
         assert_eq!(protocol::read_message(&mut reader).unwrap().unwrap(), b);
         // Clean EOF -> Ok(None), never an error.
         assert!(protocol::read_message(&mut reader).unwrap().is_none());
+    }
+
+    /// `open_uri` is the guard the editor uses to make sure a change is only
+    /// ever sent for the buffer the server is actually tracking
+    /// (`frame_tick.rs` compares it against the active tab's path). Nothing
+    /// asserted its VALUE, so all three of its mutants survived: `-> None`
+    /// (the editor concludes no document is open and syncs nothing, freezing
+    /// diagnostics), `-> Some("")` and `-> Some("xyzzy")` (the comparison never
+    /// matches any real tab, same freeze — or, worse, matches the WRONG tab if
+    /// the constant ever collided).
+    ///
+    /// Three assertions, each discriminating: `None` before `did_open` kills
+    /// both constant-`Some` mutants; the exact URI after `did_open` kills
+    /// `-> None`; and re-opening a second document proves the value TRACKS the
+    /// document rather than being any fixed string.
+    #[test]
+    fn open_uri_names_the_document_the_server_is_actually_tracking() {
+        // `.expect`, not `else { return }`: `cat` (unix) / `cmd` (windows) is
+        // always present, so a None is a broken harness — and a test that
+        // silently returns is a mutant's best friend.
+        let mut client = live_client().expect(
+            "`cat` / `cmd /c pause` must be spawnable — a None here is a broken \
+             harness, not an absent dependency",
+        );
+
+        assert_eq!(
+            client.open_uri(),
+            None,
+            "before did_open the client tracks NO document — reporting some \
+             constant uri here would make the editor sync an unopened buffer"
+        );
+
+        client
+            .did_open("file:///proj/main.rs", "rust", "fn main() {}\n")
+            .expect("did_open enqueues while the writer is live");
+        assert_eq!(
+            client.open_uri(),
+            Some("file:///proj/main.rs"),
+            "open_uri must report the uri that was actually opened"
+        );
+
+        client
+            .did_open("file:///proj/other.rs", "rust", "fn other() {}\n")
+            .expect("did_open enqueues while the writer is live");
+        assert_eq!(
+            client.open_uri(),
+            Some("file:///proj/other.rs"),
+            "re-opening must RETARGET: a value that stays on the first uri (or \
+             on any constant) is what lets a tab switch send one file's text \
+             against another file's uri"
+        );
+    }
+
+    /// `has_pending_change` is the "an edit is noted but the quiet window has
+    /// not elapsed" signal. `-> false` survived: a client that always claims
+    /// nothing is queued makes a caller believe the edit already went out, so
+    /// the server keeps serving diagnostics for stale text with nothing to
+    /// indicate it. The complementary `-> true` mutant was already caught, so
+    /// this pins the direction that was not.
+    ///
+    /// The clock is passed in, never slept on — the debouncer takes `now`
+    /// explicitly, so the window is asserted with two instants and the test
+    /// stays deterministic.
+    #[test]
+    fn has_pending_change_is_true_exactly_while_an_edit_is_waiting_out_the_window() {
+        let mut client = live_client().expect(
+            "`cat` / `cmd /c pause` must be spawnable — a None here is a broken \
+             harness, not an absent dependency",
+        );
+        let t0 = Instant::now();
+
+        assert!(
+            !client.has_pending_change(),
+            "a client with no document open has nothing queued"
+        );
+        client
+            .did_open("file:///x.rs", "rust", "fn mai() {}\n")
+            .expect("did_open enqueues while the writer is live");
+        assert!(
+            !client.has_pending_change(),
+            "OPENING a file is not an edit — didOpen already carried the text"
+        );
+
+        client.note_change("fn main() {}\n", t0);
+        assert!(
+            client.has_pending_change(),
+            "an edit inside the quiet window IS pending: reporting false here \
+             tells the caller the server already has this text when it has not \
+             been sent at all"
+        );
+        // Still pending part-way through the window: the flag tracks the queue,
+        // not merely the instant of the keystroke.
+        assert!(
+            !client
+                .flush_pending_change(t0 + sync::DEBOUNCE / 2)
+                .expect("the writer is live"),
+            "a flush before the quiet window elapses must send nothing"
+        );
+        assert!(
+            client.has_pending_change(),
+            "and it must leave the edit QUEUED — the flag tracks the queue, not \
+             merely the instant of the keystroke"
+        );
+
+        assert!(
+            client
+                .flush_pending_change(t0 + sync::DEBOUNCE + Duration::from_millis(1))
+                .expect("the writer is live"),
+            "once the window has elapsed the change must actually be sent"
+        );
+        assert!(
+            !client.has_pending_change(),
+            "and the queue is empty again afterwards"
+        );
     }
 }

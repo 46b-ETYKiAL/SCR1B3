@@ -32,7 +32,7 @@ When an update is downloaded, SCR1B3 **cryptographically verifies it before appl
 - **Key-rotation-safe trust set.** Verification accepts a release signed by **any** key in an embedded set of trusted keys, so the signing key can be rotated with **zero downtime**: ship a build that trusts both the old and new keys, switch CI to sign with the new key, then retire the old key in a later release — no client is ever stranded. Trying multiple keys never upgrades a bad signature into an accepted one (a full cryptographic verify is still required).
 - **Anti-downgrade (rollback-attack defense).** The updater refuses to install any version that is not **strictly newer** than the running build — enforced again at the moment of applying, not only at selection — so an attacker cannot replay an older, still-validly-signed release to force a downgrade to a known-vulnerable build (the TUF monotonic-version rule).
 - **Automatic rollback.** The previous binary is snapshotted before the in-place swap and is automatically restored if the updated binary fails to relaunch — a failed update never leaves you without a working app.
-- **One click, then auto-cleanup.** Choosing **Update now** downloads and installs in a single action (no separate "install" step). Once the update is applied, the downloaded archive/installer and its `.minisig`/`.sha256` sidecars are deleted, and the one kept-prior backup is removed at the next launch (once the new build has confirmed it runs) — no stale downloads are left behind.
+- **One click, then auto-cleanup.** Choosing **Update now** downloads and installs in a single action (no separate "install" step). Once the update is applied, the downloaded archive/installer and any sidecars it fetched (`.minisig`, and `.sha256` on releases that still publish one) are deleted, and the one kept-prior backup is removed at the next launch (once the new build has confirmed it runs) — no stale downloads are left behind.
 - **Least-privilege install, explicit elevation.** For a per-user / portable install the updater swaps the binary in place with **your own user permissions** — no elevation. For an install in a protected location (e.g. `C:\Program Files`), it runs the **verified, signed** self-elevating installer, which requests administrator rights via the standard Windows **UAC** prompt. It never silently elevates and never uses setuid; the same minisign + checksum gate applies to the installer as to the archive.
 
 To verify a release manually, use the published `minisign` public key against the release's signature file (instructions accompany each release).
@@ -145,13 +145,13 @@ This section documents the load-bearing CI/CD controls on the `master` branch of
 | `required_status_checks` | `build & test (ubuntu-latest)`, `build & test (windows-latest)`, `build & test (macos-latest)`, `cargo-deny advisories`, `cargo-deny bans`, `cargo-deny licenses`, `cargo-deny sources`, `public-repo content-safety audit`, `F0RG3-W1R3 install-manifest audit`, `gitleaks`, `zizmor workflow audit`, `Analyze (python)`, `Analyze (actions)`, `Scorecard analysis` | A PR cannot merge unless every gate that already exists passes. The gates are advisory if they aren't required; advisory is honour-system. |
 | `required_pull_request_reviews.required_approving_review_count` | `1` | Forces every change through PR review, even from the maintainer. |
 | `required_pull_request_reviews.dismiss_stale_reviews` | `true` | A new push invalidates a stale approval. |
-| `required_pull_request_reviews.bypass_pull_request_allowances.users` | `[46b-ETYKiAL]` | Preserves the solo-maintainer emergency self-merge path; admin-bypass is the documented escape hatch for hotfixes when no second reviewer is available. |
+| `required_pull_request_reviews.bypass_pull_request_allowances` | configured | A narrow emergency self-merge path exists so a hotfix is not blocked when no second reviewer is available. Any such merge is recorded by GitHub in the repository audit log. |
 | `required_conversation_resolution` | `true` | Every PR comment thread must be resolved before merge. |
 | `required_linear_history` | `true` | No merge commits — rebase or squash only. |
 | `required_signatures` | `true` | Every commit landing on `master` must be signature-verified. |
 | `allow_force_pushes` | `false` | History on `master` is immutable. |
 | `allow_deletions` | `false` | `master` cannot be deleted. |
-| `enforce_admins` | `false` | Deliberately off so the solo maintainer can land emergency hotfixes when CI is broken; every admin-bypass merge is audited by GitHub itself. |
+| `enforce_admins` | `false` | An emergency path is deliberately preserved for the case where the gates themselves are broken. Every merge that uses it is recorded in the repository audit log and is reviewable after the fact. |
 
 ### Dependabot security updates
 

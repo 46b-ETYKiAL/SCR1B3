@@ -10,12 +10,302 @@
 
 use super::*;
 
+/// The OS reduced-motion preference, with a test-only override seam.
+///
+/// The real query is a `user32` call that reports whatever the HOST machine's
+/// "Show animations in Windows" setting happens to be — so a test could neither
+/// force it on nor force it off, and the entire OS-gating wire was therefore
+/// unprotected: cutting it left the whole suite green (that is exactly how an
+/// earlier deliberate break survived into a commit here). This seam lets a test
+/// pin the OS answer and assert the gate really consumes it.
+pub(super) fn os_reduced_motion_now() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = motion_test_hook::get_override() {
+        return forced;
+    }
+    scribe_win32_chrome::os_reduced_motion()
+}
+
+/// Test-only override for [`os_reduced_motion_now`]. Thread-local, so parallel
+/// tests cannot clobber each other's setting.
+#[cfg(test)]
+pub(super) mod motion_test_hook {
+    use std::cell::Cell;
+
+    thread_local! {
+        static FORCED: Cell<Option<bool>> = const { Cell::new(None) };
+    }
+
+    /// Force the OS answer for the current thread. `None` restores the real query.
+    pub(in crate::app) fn set_override(v: Option<bool>) {
+        FORCED.with(|c| c.set(v));
+    }
+
+    pub(super) fn get_override() -> Option<bool> {
+        FORCED.with(Cell::get)
+    }
+
+    /// RAII guard so a panicking test cannot leak its override into the next
+    /// test on the same thread.
+    pub(in crate::app) struct ForcedOsReducedMotion;
+
+    impl ForcedOsReducedMotion {
+        pub(in crate::app) fn on() -> Self {
+            set_override(Some(true));
+            Self
+        }
+        pub(in crate::app) fn off() -> Self {
+            set_override(Some(false));
+            Self
+        }
+    }
+
+    impl Drop for ForcedOsReducedMotion {
+        fn drop(&mut self) {
+            set_override(None);
+        }
+    }
+}
+
 /// ctx-data slot the editor right-click context menu stashes its chosen
 /// [`crate::app::commands::BuiltinCommand`] into, to be drained + dispatched a
 /// frame later where `self` is mutable (the menu closure runs while the
 /// highlighter borrows `self`).
-fn editor_ctx_cmd_id() -> egui::Id {
+/// `pub(super)` so the GRID pane's own right-click menu (`grid_methods`) stashes
+/// into the SAME slot the single-pane menu uses — one drain contract, not two.
+pub(super) fn editor_ctx_cmd_id() -> egui::Id {
     egui::Id::new("scr1b3_editor_ctx_menu_cmd")
+}
+
+/// ctx-data slot the in-editor `[[wiki-link]]` click stashes its TARGET into, to
+/// be drained + followed a frame later.
+///
+/// Same reason as [`editor_ctx_cmd_id`]: the click is detected inside the
+/// `ScrollArea` closure while the highlight layouter holds `&self`, so
+/// `open_or_create_wikilink` (which opens a tab and can rescan the vault) cannot
+/// run there. Deferring by a frame also keeps the `active` tab index the rest of
+/// this frame's editor code is indexing with from moving under it.
+fn editor_wikilink_follow_id() -> egui::Id {
+    egui::Id::new("scr1b3_editor_wikilink_follow")
+}
+
+/// ctx-data slot recording the frame on which a TEXT paste event was seen.
+///
+/// A clipboard carrying BOTH text and a bitmap must paste the TEXT; see
+/// [`PASTE_IMAGE_TEXT_GRACE_FRAMES`].
+fn last_text_paste_frame_id() -> egui::Id {
+    egui::Id::new("scr1b3_last_text_paste_frame")
+}
+
+/// How many frames a text paste suppresses the image-paste branch for.
+///
+/// `egui_winit` emits `Event::Paste` on the paste key-DOWN and the `V` key
+/// RELEASE one or more frames later, so the two halves of ONE gesture land in
+/// different frames. This window joins them back together.
+const PASTE_IMAGE_TEXT_GRACE_FRAMES: u64 = 20;
+
+/// Which editor surface actually rendered the active buffer on the last frame.
+///
+/// SCR1B3 swaps the editor out from under the user in three situations — the
+/// automatic rope-editor swap past `rope_editor_auto_threshold_bytes` (16 MiB by
+/// default), the read-only browse past the hard size cap, and the folded
+/// preview. Each of those disables a large set of `TextEdit`-only features, and
+/// none of them used to produce a toast, a badge or a gutter marker: the user
+/// was simply dropped into a degraded editor with no explanation for why their
+/// features stopped working. The status bar renders this so the active mode is
+/// always visible.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum EditorMode {
+    /// egui `TextEdit` — the full-feature default. Deliberately badge-less: no
+    /// badge IS the "nothing is degraded" signal.
+    Standard,
+    /// The in-house rope editor (opt-in, or auto past the byte threshold).
+    Rope,
+    /// The rope editor still on a memory-mapped buffer (read-only banner only).
+    RopeMmap,
+    /// Read-only huge-file browse past the hard size cap.
+    ReadOnlyLarge,
+    /// The folded read-only preview.
+    Fold,
+}
+
+impl EditorMode {
+    /// Map the widget's own report of which buffer variant it walked. This is
+    /// the first non-test consumer of `RopeEditorResponse::buffer_mode`.
+    /// `pub(super)` because the grid pane path renders the SAME widget and must
+    /// report the same distinction (`grid_methods`).
+    pub(super) fn from_buffer_mode(mode: &scribe_render::BufferModeSeen) -> Self {
+        match mode {
+            scribe_render::BufferModeSeen::Rope => Self::Rope,
+            scribe_render::BufferModeSeen::Mmap => Self::RopeMmap,
+        }
+    }
+
+    /// Short status-bar badge, or `None` for the full-feature default.
+    pub(super) fn badge(self) -> Option<&'static str> {
+        match self {
+            Self::Standard => None,
+            Self::Rope => Some("ROPE"),
+            Self::RopeMmap => Some("MMAP"),
+            Self::ReadOnlyLarge => Some("READ-ONLY"),
+            Self::Fold => Some("FOLDED"),
+        }
+    }
+
+    /// The explanation shown on hover — names the trade-off, so the badge is
+    /// self-describing rather than an unexplained acronym.
+    ///
+    /// The rope wording used to name FOUR unavailable features (breadcrumbs,
+    /// sticky scroll, spellcheck overlay, completion popup). That was a
+    /// substantial under-report: the rope branch `return`s before the whole
+    /// remainder of the `TextEdit` body, so roughly a dozen MORE conveniences
+    /// die with it — every galley-driven overlay, every caret op that needs the
+    /// `TextEditState`, multi-cursor, and the app-drawn gutter decorations. A
+    /// badge whose explanation lists a quarter of the damage is barely better
+    /// than no badge, so the list below is the real one.
+    pub(super) fn hover(self) -> &'static str {
+        match self {
+            Self::Standard => "Standard editor — all editing features available",
+            Self::Rope => {
+                "Large-file editor: this buffer is past the rope-editor size threshold, so it \
+                 renders through the in-house viewport-culled editor. Still working: typing, \
+                 undo/redo, find, line numbers, whitespace markers, snippets, and inline LSP \
+                 diagnostics (squiggle, gutter bar and hover message). Unavailable \
+                 here: breadcrumbs, sticky scroll, spellcheck underlines, the completion \
+                 popup, the find highlight-all wash, the right-click menu, multi-cursor \
+                 (Ctrl+D / Ctrl+click / Alt+drag column select), the markdown caret chords and \
+                 palette caret ops (bold, italic, inline code, strikethrough, task toggle, \
+                 format table, change case, insert date/time, duplicate selection, jump to \
+                 matching bracket), auto-indent on Enter, auto-pair, list Tab/Shift+Tab, smart \
+                 paste (URL to link), clickable URLs, indent guides, column rulers, the \
+                 trailing-whitespace tint, the current-line highlight, bracket-match boxes, \
+                 selection-occurrence boxes, the Block/Underline caret style, the status-bar \
+                 Ln/Col and selection counters, and the gutter's bookmark dots and change bars."
+            }
+            Self::RopeMmap => {
+                "Large-file editor on a memory-mapped buffer — read-only until the file is \
+                 loaded into a rope. Everything the ROPE badge lists as unavailable is \
+                 unavailable here too, and editing is disabled on top of that. Inline LSP \
+                 diagnostics do NOT paint here either: a memory-mapped buffer lays out no \
+                 per-row galley, so the overlay has nothing to position against. The \
+                 status-bar problem counter is still live."
+            }
+            Self::ReadOnlyLarge => {
+                "Read-only browse: this file is past the hard size cap, so it opens read-only \
+                 for O(viewport) navigation. Editing is disabled, and so is every \
+                 TextEdit-only convenience the ROPE badge lists (overlays, caret ops, \
+                 multi-cursor, the right-click menu, completion and spellcheck). Inline LSP \
+                 diagnostics do NOT paint here: the browse path lays out no per-row galley, \
+                 so the overlay has nothing to position against."
+            }
+            Self::Fold => "Folded preview — read-only projection. Exit folds to edit.",
+        }
+    }
+
+    /// The one-shot toast raised when the editor SWAPS into this surface, or
+    /// `None` for a surface the user asked for explicitly.
+    ///
+    /// The rope swap past `rope_editor_auto_threshold_bytes` is the only
+    /// transition the user never requested and cannot predict: they type past
+    /// 16 MiB and a dozen features stop responding. The badge alone is a passive,
+    /// four-letter signal that has to be HOVERED to explain itself, so a user who
+    /// does not already know it exists gets no explanation at all. `Fold` and
+    /// `ReadOnlyLarge` are deliberately silent — folding is an explicit user
+    /// action, and the read-only browse already prints its own
+    /// "[ large file: read-only ]" segment next to the badge.
+    pub(super) fn entry_notice(self) -> Option<&'static str> {
+        match self {
+            // The wording NAMES diagnostics, and that is the point of it. It used
+            // to stop at "Editing, undo and find still work", which was a
+            // half-truth in the most damaging direction available: inline
+            // diagnostics did NOT work on this path, and a banner that lists
+            // three surviving features and omits the one that just died reads as
+            // "everything important still works". The rope path now paints
+            // diagnostics, so saying so is both true and the answer to the
+            // question the user actually has.
+            Self::Rope => Some(
+                "This file crossed the large-file threshold, so SCR1B3 switched to the \
+                 viewport-culled editor to stay responsive. Editing, undo, find and \
+                 inline diagnostics still work — hover the mode badge in the status bar \
+                 for what is unavailable.",
+            ),
+            // Split off from `Rope` because the claim differs: a memory-mapped
+            // buffer lays out no per-row galley, so the diagnostic overlay has
+            // nothing to position against and paints nothing. Telling an MMAP
+            // user "inline diagnostics still work" would re-create the exact
+            // false claim above, one surface over.
+            Self::RopeMmap => Some(
+                "This file crossed the large-file threshold, so SCR1B3 switched to the \
+                 viewport-culled editor to stay responsive. Editing, undo and find still \
+                 work; inline diagnostics do NOT paint until the file is loaded into a \
+                 rope — hover the mode badge in the status bar for what is unavailable.",
+            ),
+            Self::Standard | Self::ReadOnlyLarge | Self::Fold => None,
+        }
+    }
+}
+
+/// ctx-data slot the active [`EditorMode`] is published into. The status bar
+/// renders BEFORE the central panel, so it reads the previous frame's value —
+/// a one-frame lag that is invisible, and always correct once steady.
+fn editor_mode_id() -> egui::Id {
+    egui::Id::new("scr1b3_active_editor_mode")
+}
+
+/// ctx-data slot holding the one-shot notice queued by [`publish_editor_mode`]
+/// on a real transition INTO a degraded surface, drained by
+/// [`ScribeApp::drain_editor_mode_notice`] where `self` is mutable again.
+fn editor_mode_notice_id() -> egui::Id {
+    egui::Id::new("scr1b3_editor_mode_notice")
+}
+
+/// Publish the surface that just rendered.
+///
+/// Every editor path MUST call this: the status bar reads the published value
+/// and would otherwise keep rendering the PREVIOUS surface's badge forever. The
+/// doc comment here used to assert that every path already did — it did not.
+/// `render_grid_central_panel` (the split / multi-note grid) published nothing,
+/// so switching into grid view left whatever the last single-pane frame had
+/// published frozen on screen: open a 20 MiB file, flip on the grid, and the
+/// status bar still claimed ROPE while a full-feature `TextEdit` was rendering
+/// — the exact "silent and misleading" state the badge exists to prevent. The
+/// grid path now publishes too, and `grid_publishes_the_active_panes_mode` /
+/// `grid_badge_clears_when_the_active_pane_is_a_small_buffer` pin it so the
+/// claim in this comment stays true.
+///
+/// On a real transition into an unrequested degraded surface it also queues
+/// [`EditorMode::entry_notice`], so the swap is announced once instead of only
+/// being discoverable by hovering a four-letter badge.
+pub(super) fn publish_editor_mode(ctx: &egui::Context, mode: EditorMode) {
+    let prev: Option<EditorMode> = ctx.data(|d| d.get_temp(editor_mode_id()));
+    if prev != Some(mode) {
+        if let Some(notice) = mode.entry_notice() {
+            ctx.data_mut(|d| d.insert_temp(editor_mode_notice_id(), notice.to_string()));
+        }
+    }
+    ctx.data_mut(|d| d.insert_temp(editor_mode_id(), mode));
+}
+
+/// The surface that rendered last frame, defaulting to the full-feature editor
+/// before the first central-panel frame has run.
+pub(super) fn active_editor_mode(ctx: &egui::Context) -> EditorMode {
+    ctx.data(|d| d.get_temp(editor_mode_id()))
+        .unwrap_or(EditorMode::Standard)
+}
+
+/// What the user chose in the unsaved-changes close prompt.
+///
+/// The three answers a close guard must offer: keep the work, knowingly drop it,
+/// or stay. `Cancel` is the safe default (Esc maps to it) and is the ONLY one
+/// that leaves the window alive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CloseChoice {
+    /// Save every unsaved buffer, then close — but only if every save landed.
+    Save,
+    /// Close and lose the unsaved changes, deliberately.
+    Discard,
+    /// Abort the close entirely.
+    Cancel,
 }
 
 impl ScribeApp {
@@ -139,6 +429,22 @@ impl ScribeApp {
     /// cannot self-invalidate on a family change; this explicit drop is the only
     /// signal. (Bug: changing the app UI font silently rebuilt the atlas and the
     /// note text rendered from the stale galley.)
+    /// Move a queued editor-mode entry notice (see [`publish_editor_mode`]) onto
+    /// the toast line. Called once per frame AFTER the central panel, which is
+    /// the first point at which `self` is mutable again — the publish sites all
+    /// sit inside closures that hold a borrow of `self.hl` or `self.tabs`.
+    pub(super) fn drain_editor_mode_notice(&mut self, ctx: &egui::Context) {
+        let queued = ctx.data_mut(|d| {
+            let id = editor_mode_notice_id();
+            let v = d.get_temp::<String>(id);
+            d.remove::<String>(id);
+            v
+        });
+        if let Some(msg) = queued {
+            self.toast = Some(msg);
+        }
+    }
+
     pub(super) fn invalidate_galley_caches(&self) {
         *self.hl_cache.borrow_mut() = None;
         *self.hl_galley_cache.borrow_mut() = None;
@@ -150,7 +456,299 @@ impl ScribeApp {
     /// `egui_kittest` E2E tests can drive it through `Context::run` without an
     /// `eframe::Frame`. Drives every top-level panel via the deprecated-but-
     /// functional `Panel::show(ctx, …)` path.
+    /// Whether animations should actually run this frame — the user's `[motion]`
+    /// toggle GATED by the OS reduced-motion preference (WCAG 2.3.3). All animated
+    /// paint (caret trail, cursor blink, CRT scanlines) reads THIS rather than
+    /// `config.motion.enabled` raw, so Windows' "show animations" accessibility
+    /// setting overrides the in-app toggle. The OS query is a cheap cached
+    /// user32 read; on non-Windows it is a `false` constant so motion follows the
+    /// toggle only.
+    /// `pub(super)` so SIBLING modules gate on it too. It was private, and
+    /// `theme_visuals::apply_motion_style` — which drives egui's `animation_time`
+    /// and the NATIVE caret blink, i.e. the widget-layer half of the whole Motion
+    /// feature — therefore still read `config.motion.enabled` raw and ignored the
+    /// OS preference entirely. Gating only the overlay painters is not
+    /// "end-to-end"; every consumer must resolve through here.
+    pub(super) fn motion_active(&self) -> bool {
+        self.config
+            .motion
+            .effective_enabled(os_reduced_motion_now())
+    }
+
+    /// Does ANY open tab hold unsaved edits? The close guard's whole predicate.
+    pub(super) fn has_unsaved_tabs(&self) -> bool {
+        self.tabs.iter().any(EditorTab::is_dirty)
+    }
+
+    /// Feed the active buffer to the language server, debounced.
+    ///
+    /// Called once per frame. Before this existed the client sent `didOpen` and
+    /// then nothing: the server's copy of the document was frozen at the moment
+    /// the file was opened, so every diagnostic the editor displayed described
+    /// text the user had already changed. `note_change` only records; the actual
+    /// `textDocument/didChange` goes out from `flush_pending_change` once the
+    /// buffer has been quiet for `lsp::sync::DEBOUNCE`.
+    ///
+    /// Guarded on URI identity: the client tracks ONE document, and a tab switch
+    /// must not send the newly-active buffer's text against the previously
+    /// opened file's URI. When the active tab is not the opened one we send
+    /// nothing and leave the server on its last known-good state (the user can
+    /// re-run "Start LSP" to move it) rather than corrupting it.
+    pub(super) fn sync_lsp_document(&mut self) {
+        let Some(client) = self.lsp.as_mut() else {
+            return;
+        };
+        let Some(open_uri) = client.open_uri().map(str::to_owned) else {
+            return;
+        };
+        let active = self.active.min(self.tabs.len().saturating_sub(1));
+        let matching_text = self.tabs.get(active).and_then(|t| {
+            let path = t.doc.path()?;
+            (path_to_uri(path) == open_uri).then(|| t.text.clone())
+        });
+        if let Some(text) = matching_text {
+            client.note_change(&text, std::time::Instant::now());
+        }
+        // Flush unconditionally: a pending change must still go out on the frame
+        // AFTER the user tabbed away, and a flush with nothing pending is a
+        // cheap `Option` check.
+        if let Err(e) = client.flush_pending_change(std::time::Instant::now()) {
+            // The writer thread is gone (server died). Diagnostics will stop
+            // updating; drop the client so a later "Start LSP" can spawn a
+            // fresh one instead of talking to a corpse.
+            tracing::warn!(
+                target: "scribe::lsp",
+                error_kind = ?e.kind(),
+                "language server stopped accepting changes; dropping the client"
+            );
+            self.lsp = None;
+            self.lsp_lang = None;
+        }
+    }
+
+    /// The active buffer's diagnostics resolved onto byte spans, ready to paint.
+    /// Empty (and free) when there are no diagnostics, which is the common case.
+    pub(super) fn diagnostic_spans_for_active(
+        &self,
+        active: usize,
+    ) -> Vec<super::diagnostics_overlay::DiagSpan> {
+        if self.diagnostics.is_empty() {
+            return Vec::new();
+        }
+        let Some(tab) = self.tabs.get(active) else {
+            return Vec::new();
+        };
+        super::diagnostics_overlay::diagnostic_spans(&tab.text, &self.diagnostics)
+    }
+
+    /// Paint the inline diagnostic overlay over the ROPE editor's painted rows.
+    ///
+    /// The `TextEdit` path walks `out.galley.rows`; this path has no galley of
+    /// its own, so it walks [`RopeEditorResponse::rows`] — the rects and
+    /// per-row galleys the widget reports for the rows it actually painted this
+    /// frame. Everything else (severity colours, the gutter bar, the hover
+    /// tooltip) is deliberately the SAME as the `TextEdit` overlay: a user who
+    /// crosses the size threshold should not have to learn a second visual
+    /// language for the same information.
+    ///
+    /// Silent when the widget reports no rows — the read-only browse path and a
+    /// still-memory-mapped buffer lay no per-row galley out, so there is nothing
+    /// to position against. That gap is stated in the mode badge's hover text
+    /// rather than left for the user to discover.
+    fn paint_rope_diagnostics(
+        &self,
+        ui: &egui::Ui,
+        resp: &scribe_render::RopeEditorResponse,
+        active: usize,
+        viewport: egui::Rect,
+        accent: Color32,
+        muted: Color32,
+    ) {
+        if self.diagnostics.is_empty() || resp.rows.is_empty() {
+            return;
+        }
+        let Some(tab) = self.tabs.get(active) else {
+            return;
+        };
+        let spans = super::diagnostics_overlay::diagnostic_spans(&tab.text, &self.diagnostics);
+        if spans.is_empty() {
+            return;
+        }
+        // Delegates to the free function the grid rope arm also calls, so the
+        // two rope surfaces cannot drift: the arithmetic that used to live here
+        // now exists once, in `grid_render::paint_rope_pane_diagnostics`.
+        //
+        // The colours are the ones THIS path ALREADY resolved — `accent` and
+        // `muted` arrive from the caller and the two `ui_color` lookups below
+        // are the pre-existing ones, unchanged. No third theme lookup is
+        // introduced: swapping these caller-supplied colours for fresh
+        // `from_theme` lookups would be a behaviour change, not a refactor.
+        super::grid_render::paint_rope_pane_diagnostics(
+            ui,
+            resp,
+            &tab.text,
+            &spans,
+            &super::diagnostics_overlay::gutter_marks(&self.diagnostics),
+            super::grid_render::DiagColors {
+                error: ui_color(&self.theme, "error", Rgba::new(0xe5, 0x3e, 0x3e, 255)),
+                warning: ui_color(&self.theme, "warning", Rgba::new(0xf2, 0xb3, 0x3d, 255)),
+                info: accent,
+                hint: muted,
+            },
+            viewport,
+        );
+    }
+
+    /// Titles of the tabs holding unsaved edits, for the close prompt. Listing
+    /// them is what makes the prompt actionable — "some file is unsaved" leaves
+    /// the user unable to judge whether Discard is safe.
+    pub(super) fn unsaved_tab_names(&self) -> Vec<String> {
+        self.tabs
+            .iter()
+            .filter(|t| t.is_dirty())
+            .map(|t| t.doc.file_name().to_string())
+            .collect()
+    }
+
+    /// Save every dirty tab through the REAL single-tab save path (so save-time
+    /// hygiene, encoding, change-bar baselines and save hooks all behave exactly
+    /// as a manual save), restoring the active tab afterwards.
+    ///
+    /// Deliberately reports nothing: the caller re-asks [`has_unsaved_tabs`]
+    /// instead. An untitled buffer routes through Save-As, which the user can
+    /// cancel, and a write can fail — in both cases the tab is STILL dirty and
+    /// the close must not proceed. Trusting a "saved everything" return value
+    /// here is precisely how a cancelled Save-As would silently become a discard.
+    pub(super) fn save_all_dirty(&mut self) {
+        let prev_active = self.active;
+        for i in 0..self.tabs.len() {
+            if !self.tabs[i].is_dirty() {
+                continue;
+            }
+            self.active = i;
+            self.save_active();
+        }
+        self.active = prev_active.min(self.tabs.len().saturating_sub(1));
+    }
+
+    /// Enter phase 1 of the two-phase close: hide the window now, so phase 2
+    /// (next frame, via the `self.closing` branch) can destroy it without the
+    /// DWM keeping the last composited frame on screen as a ghost (T19.1).
+    pub(super) fn begin_hide_then_close(&mut self, ctx: &egui::Context) {
+        self.closing = true;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        ctx.request_repaint();
+    }
+
+    /// Apply a resolved [`CloseChoice`]. Returns `true` when the close has been
+    /// started (the window is now hidden and the frame should be abandoned).
+    ///
+    /// Split out of the rendering so the CONSEQUENCE of each button is
+    /// unit-testable without driving pixels — and, in particular, so the
+    /// "Save-As cancelled ⇒ still dirty ⇒ do NOT close" path can be pinned.
+    pub(super) fn apply_close_choice(&mut self, ctx: &egui::Context, choice: CloseChoice) -> bool {
+        match choice {
+            CloseChoice::Save => {
+                self.save_all_dirty();
+                if self.has_unsaved_tabs() {
+                    // A Save-As was cancelled or a write failed. The prompt stays
+                    // up: proceeding here would turn "Save" into "Discard".
+                    self.status =
+                        "Still unsaved — the save didn't complete, so SCR1B3 stayed open.".into();
+                    false
+                } else {
+                    self.close_confirm_open = false;
+                    self.begin_hide_then_close(ctx);
+                    true
+                }
+            }
+            CloseChoice::Discard => {
+                // Explicit, informed discard: bypass the guard rather than
+                // re-entering it through `want_close` (which would re-raise this
+                // same prompt forever).
+                self.close_confirm_open = false;
+                self.begin_hide_then_close(ctx);
+                true
+            }
+            CloseChoice::Cancel => {
+                // A real abort: no hide, no `closing` latch, nothing destroyed.
+                self.close_confirm_open = false;
+                false
+            }
+        }
+    }
+
+    /// The unsaved-changes close prompt. Returns `true` when the user's choice
+    /// started the close (see [`apply_close_choice`](Self::apply_close_choice)).
+    ///
+    /// A modal — the same `egui::Modal` shape as the update / crash-consent /
+    /// report-issue dialogs — because the question must be answered before
+    /// anything else happens, and Esc-to-cancel matches those dialogs too.
+    pub(super) fn render_close_confirm(&mut self, ctx: &egui::Context) -> bool {
+        let names = self.unsaved_tab_names();
+        let mut choice: Option<CloseChoice> = None;
+        egui::Modal::new(egui::Id::new("scr1b3_close_confirm")).show(ctx, |ui| {
+            ui.set_max_width(420.0);
+            ui.heading("Unsaved changes");
+            ui.add_space(8.0);
+            ui.label(if names.len() == 1 {
+                "1 file has unsaved changes:".to_string()
+            } else {
+                format!("{} files have unsaved changes:", names.len())
+            });
+            ui.add_space(4.0);
+            for n in &names {
+                // Indented with a spacer rather than padded text so each file's
+                // ACCESSIBLE name is exactly the file name (a screen reader — and
+                // the kittest a11y query that pins this list — reads the label).
+                ui.horizontal(|ui| {
+                    ui.add_space(12.0);
+                    ui.label(n);
+                });
+            }
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                if ui
+                    .button("Save and close")
+                    .on_hover_text("Save every unsaved file, then close SCR1B3.")
+                    .clicked()
+                {
+                    choice = Some(CloseChoice::Save);
+                }
+                if ui
+                    .button("Discard and close")
+                    .on_hover_text("Close SCR1B3 and lose these unsaved changes.")
+                    .clicked()
+                {
+                    choice = Some(CloseChoice::Discard);
+                }
+                if ui
+                    .button("Cancel")
+                    .on_hover_text("Stay open and keep editing.")
+                    .clicked()
+                {
+                    choice = Some(CloseChoice::Cancel);
+                }
+            });
+        });
+        // Esc cancels, mirroring the other dialogs. Cancel is the safe answer, so
+        // it is the one the dismissal gesture maps to.
+        if choice.is_none() && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            choice = Some(CloseChoice::Cancel);
+        }
+        match choice {
+            Some(c) => self.apply_close_choice(ctx, c),
+            None => false,
+        }
+    }
+
     pub(crate) fn frame_tick(&mut self, ctx: &egui::Context) {
+        // Resolve the effective motion gate ONCE per frame (the OS reduced-motion
+        // preference AND the in-app toggle), before any borrow of `self` fields —
+        // the animated paint sites below read this Copy `bool` rather than calling
+        // the `&self` helper mid-borrow. Querying once also costs one OS read, not
+        // one per animated element.
+        let motion_on = self.motion_active();
         // Font-switch step 2 (see step 1 at the `ctx.set_fonts` call below):
         // `set_fonts` took effect at the START of this frame, so the NEW atlas is
         // now live. Drop the galley caches that were (re)baked against the OLD
@@ -177,6 +775,19 @@ impl ScribeApp {
         // renders, so the injected event reaches the central editor (shown
         // later this frame) and egui's TextEdit performs it natively.
         self.drain_pending_editor_action(ctx);
+        // Follow a `[[wiki-link]]` clicked in the EDITOR on a previous frame
+        // (stashed by the overlay pass, which runs while `self` is immutably
+        // borrowed). Unconditional — a link in a read-only buffer is still
+        // followable, and this is the same `open_or_create_wikilink` the notes
+        // pane's link list calls, so the vault-traversal gate is identical.
+        if let Some(target) = ctx.data_mut(|d| {
+            let id = editor_wikilink_follow_id();
+            let v = d.get_temp::<String>(id);
+            d.remove::<String>(id);
+            v
+        }) {
+            self.open_or_create_wikilink(&target);
+        }
         // F-022 — poll the disk mtimes of every open file-backed tab. Cheap
         // when nothing changed (one stat per tab); silent reload when the
         // buffer is clean; status toast when local edits would be clobbered.
@@ -199,12 +810,29 @@ impl ScribeApp {
         }
         // Once per launch: kick off an automatic update check if opted in.
         self.maybe_remind_update(ctx);
+        // Republish the unsaved-work verdict BEFORE the drain, so the apply
+        // sites inside `poll` see this frame's answer. `poll` auto-chains
+        // `Downloaded(Ok)` / `InstallerReady(Ok)` straight into
+        // `apply_and_restart` / `run_installer` with no user present, and both
+        // of those do their IRREVERSIBLE work (exe swap + replacement spawn; the
+        // elevated `-Wait` installer launch) BEFORE any close is adjudicated —
+        // so by the time the unsaved-changes prompt appears, Cancel could no
+        // longer mean what it says. The apply itself has to be gated, not just
+        // the close. `has_unsaved_tabs` is the same predicate the close guard
+        // rules on, so the two can never disagree.
+        self.updater.unsaved_work = self.has_unsaved_tabs();
         // Drain the updater worker each frame. A `notify`-mode launch check that
         // found a release raises a prominent top banner (Update / Dismiss) instead
         // of the easily-missed passive toast — see the "update-notice" panel below.
         self.updater.poll(ctx);
         if let Some(v) = self.updater.toast_pending.take() {
             self.update_notice = Some(v);
+        }
+        // An apply that was HELD for unsaved work must say so — a silent hold is
+        // indistinguishable from a broken "Restart now" button. The updater's
+        // state is left retriable, so saving and clicking again just works.
+        if let Some(msg) = self.updater.unsaved_hold_notice.take() {
+            self.toast = Some(msg);
         }
         // `auto`-mode found-an-update yes/no modal.
         self.render_update_prompt(ctx);
@@ -228,6 +856,13 @@ impl ScribeApp {
         // Phase 1: on any close request (custom ✕ or OS close) cancel the
         // immediate close, hide the window, repaint. Phase 2 (next frame): the
         // window is hidden, so issue the real Close.
+        //
+        // The UNSAVED-CHANGES GUARD sits in front of phase 1, not instead of it.
+        // The two-phase sequence is unchanged for every close that proceeds; the
+        // guard only decides WHETHER a close proceeds. Before it existed, closing
+        // with dirty buffers hid and destroyed the window unconditionally and the
+        // unsaved text was gone with no prompt (the hot-exit backup is opt-in and
+        // throttled, so it is not a substitute for asking).
         if self.closing {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
@@ -235,13 +870,27 @@ impl ScribeApp {
         let os_close = ctx.input(|i| i.viewport().close_requested());
         if os_close || self.want_close {
             self.want_close = false;
-            self.closing = true;
             if os_close {
                 // Stop eframe acting on the OS close THIS frame; we drive it.
+                // Sent on BOTH branches: whether we close or prompt, eframe must
+                // not destroy the window out from under us this frame.
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             }
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-            ctx.request_repaint();
+            if self.has_unsaved_tabs() {
+                // Do NOT latch `closing` and do NOT hide: raise the prompt and
+                // fall through so this frame renders it. Cancel genuinely aborts.
+                self.close_confirm_open = true;
+                ctx.request_repaint();
+            } else {
+                self.begin_hide_then_close(ctx);
+                return;
+            }
+        }
+        // The prompt renders every frame it is open (not only the frame the close
+        // was requested), and returns true once the user's choice has started the
+        // close — in which case the window is already hidden and the rest of this
+        // frame is skipped exactly as the direct path skips it.
+        if self.close_confirm_open && self.render_close_confirm(ctx) {
             return;
         }
 
@@ -359,6 +1008,16 @@ impl ScribeApp {
         // back this frame so the results pane fills in progressively. Cheap
         // (one `try_recv` loop) and a no-op when no search is in flight.
         self.drain_find_in_files();
+
+        // Keep the language server's copy of the buffer in step with the
+        // editor's, then drain whatever it published back.
+        //
+        // Sync FIRST: the server only ever knew the text as it stood at
+        // `didOpen`, so without this every diagnostic on screen described a file
+        // the user had already edited past. `note_change` is a cheap per-frame
+        // record; nothing goes on the wire until the buffer has been quiet for
+        // `lsp::sync::DEBOUNCE`, so a keystroke cannot spam the server.
+        self.sync_lsp_document();
 
         // Drain LSP diagnostics published by the server thread.
         let mut new_diags: Option<Vec<Diagnostic>> = None;
@@ -944,6 +1603,12 @@ impl ScribeApp {
                         self.find_open = false;
                     }
                 });
+                // Matching-mode row: regex / match-case / whole-word toggles plus
+                // the inline invalid-regex error. THIS CALL IS THE WIRE the
+                // toggles ride — `find_query_flags` reads the very fields these
+                // checkboxes bind, so cutting this line makes the modes
+                // unreachable from the UI (which `find_toggle_tests` detects).
+                self.find_bar_options_ui(ui);
                 // Second row: replace field + actions.
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("with").color(accent).monospace());
@@ -959,6 +1624,9 @@ impl ScribeApp {
                         self.replace_in_active(true);
                     }
                 });
+                // Third row: regex / match-case / whole-word toggles + the
+                // inline invalid-regex error (see `find_replace.rs`).
+                // CUT
             });
         }
 
@@ -1010,6 +1678,8 @@ impl ScribeApp {
                     }
                     ui.horizontal(|ui| {
                         ui.checkbox(&mut self.find_in_files_regex, "regex");
+                        ui.checkbox(&mut self.find_in_files_case_sensitive, "match case");
+                        ui.checkbox(&mut self.find_in_files_whole_word, "whole word");
                         let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                         if enter || ui.button("search").clicked() {
                             self.run_find_in_files(ctx);
@@ -1240,6 +1910,14 @@ impl ScribeApp {
                 ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(level));
                 self.save_config();
             }
+        } else {
+            // Settings is closed — by its own ✕, by Esc, by a command, or by any
+            // other route — so no chord capture can be in flight. Clearing here
+            // (rather than only on the ✕ path) is what keeps a capture the user
+            // walked away from from surviving into the next time Settings opens,
+            // where it would stand the editor's shortcut layer down for keys the
+            // user never meant to rebind.
+            crate::app::settings_keys::clear_capture(ctx);
         }
 
         // ---- Keyboard cheatsheet (F1) ----
@@ -1442,6 +2120,25 @@ impl ScribeApp {
                                         .monospace(),
                                 );
                             }
+                            // Editor-mode badge. When the buffer crosses the rope
+                            // threshold the editor silently swaps to a degraded
+                            // surface and ~25 TextEdit-only conveniences stop working;
+                            // before this, the user was given no signal at all. The
+                            // full-feature Standard mode is deliberately badge-less —
+                            // no badge IS the "nothing is degraded" signal — and the
+                            // hover names the exact trade-off so the acronym is
+                            // self-describing. Reads last frame's published mode
+                            // (status bar renders before the central panel); the
+                            // one-frame lag is invisible and always correct at rest.
+                            if let Some(badge) = active_editor_mode(ctx).badge() {
+                                ui.label(
+                                    RichText::new(format!("[ {badge} ]"))
+                                        .color(warn)
+                                        .small()
+                                        .monospace(),
+                                )
+                                .on_hover_text(active_editor_mode(ctx).hover());
+                            }
                             if spell_on {
                                 let (txt, col) = if spell_misspellings == 0 {
                                     (format!("spell {}", egui_phosphor::thin::CHECK), accent)
@@ -1607,6 +2304,14 @@ impl ScribeApp {
             }
         }
 
+        // ---- Notes (PKM) side pane ----
+        // Self-guarded: renders its own left SidePanel only when `notes_pane_open`
+        // is set (toggled by BuiltinCommand::ToggleNotesPane), lazily (re)building
+        // the vault index. This is the single live call site that makes the whole
+        // note-app surface reachable — the vault scan, the operator search, the
+        // wiki-link open/create, and the backlinks pane.
+        self.render_notes_pane(ctx, panel, accent, muted);
+
         let active = self.active.min(self.tabs.len().saturating_sub(1));
         self.active = active;
         let font = FontId::monospace(self.config.fonts.clamped_editor_size());
@@ -1630,30 +2335,48 @@ impl ScribeApp {
                 .unwrap_or(false);
             if is_md {
                 let md = self.tabs[active].text.clone();
-                // The live preview re-parses the whole document and rebuilds the
-                // widget tree every frame it is open. Bound that cost: above this
-                // size the metric scans + full markdown parse are skipped and a
-                // notice is shown, so a multi-MiB note can't peg a core at single-
-                // digit FPS. (Mirrors the highlighter's own large-buffer cap.)
+                // Bound on the size of note the live preview will render.
+                //
+                // This cap used to be justified by "the preview re-parses the
+                // whole document and rebuilds the widget tree every frame". Half
+                // of that is no longer true: the parse is cached on the source
+                // text (`md_preview::cache`) and so are the three header metric
+                // scans below (`note_metrics`). The cap survives on the OTHER
+                // half — the widget rebuild, which is not cached and cannot
+                // easily be: `md_preview::show` reconstructs every egui widget
+                // for the whole document on every frame.
+                //
+                // Re-derived by measurement rather than inherited. Release
+                // profile, synthetic markdown, this machine:
+                //
+                //   size     parse (cold)   metrics (cold / cached)   full frame
+                //   256 KiB     10.5 ms        1.4 ms / 0.017 ms        26.8 ms
+                //   512 KiB      9.8 ms        2.3 ms / 0.035 ms        50.8 ms
+                //   1 MiB       23.8 ms        4.5 ms / 0.134 ms       117.3 ms
+                //   2 MiB       42.6 ms        9.7 ms / 0.214 ms       292.1 ms
+                //
+                // "full frame" is a complete egui pass through `md_preview::show`
+                // with the parse ALREADY cached. At 1 MiB that is ~117 ms — about
+                // 8 fps, seven times over a 60 fps budget — and the caching this
+                // change added removed only ~28 ms of it (parse + metrics). So
+                // the cap stays at 1 MiB: raising it would hand the user a
+                // preview that pins a core for a quarter-second per frame, and
+                // the two things that got cheaper were never what made it
+                // expensive.
                 const PREVIEW_MAX_BYTES: usize = 1 << 20; // 1 MiB
                 let preview_too_large = md.len() > PREVIEW_MAX_BYTES;
                 // P0-1 / P1-3: task progress + reading-time + heading count, shown
-                // in the preview header (computed via pure scribe-core fns). Skipped
-                // for an oversized note (each is a full-document scan).
-                let (done, total) = if preview_too_large {
-                    (0, 0)
+                // in the preview header. Three full-document scans, cached on the
+                // source text so they run once per EDIT rather than once per
+                // frame. Still skipped entirely for an oversized note, whose
+                // preview is not drawn at all.
+                let metrics = if preview_too_large {
+                    super::note_metrics::NoteMetrics::default()
                 } else {
-                    scribe_core::md_ops::tasks_progress(&md)
+                    super::note_metrics::metrics_for(&md)
                 };
-                let (mins, headings) = if preview_too_large {
-                    (0, 0)
-                } else {
-                    let words = md.split_whitespace().count();
-                    (
-                        scribe_core::md_ops::reading_time_minutes(words),
-                        scribe_core::md_ops::heading_outline(&md).len(),
-                    )
-                };
+                let (done, total) = (metrics.done, metrics.total);
+                let (mins, headings) = (metrics.minutes, metrics.headings);
                 // Source lines whose checkbox was clicked this frame (applied
                 // after the panel closes so the borrow on `md` is released).
                 let mut toggled: Vec<usize> = Vec::new();
@@ -1789,7 +2512,36 @@ impl ScribeApp {
         // (`line_gutter`). The read-only RopeEditor draws its OWN gutter, so
         // skip this one there (and avoid the O(n) `lines().count()` on a
         // 256 MiB+ buffer).
-        if show_line_numbers && !self.fold_view && !read_only && !chrome_hidden {
+        //
+        // The EDITABLE rope arm draws its own gutter for exactly the same
+        // reason (`.with_line_numbers(show_line_numbers)` below), and it never
+        // writes `line_gutter` — the only writers are the two TextEdit arms, at
+        // the end of this function and in `grid_methods`. Rendering the external
+        // strip beside it therefore painted a SECOND gutter out of whatever the
+        // last TextEdit frame left behind: numbers, bookmark dots, change-bar
+        // stripes and diagnostic marks frozen at the PREVIOUS buffer's row Ys,
+        // next to the rope editor's own correct gutter. With no TextEdit frame
+        // ever run (a >= threshold file opened first) the vector is empty, the
+        // loop paints nothing, and `exact_width` still reserves and fills a dead
+        // strip.
+        let rope_arm = use_rope_editor(
+            self.config.editor.experimental_rope_editor,
+            self.tabs[active].text.len(),
+            self.config.editor.rope_editor_auto_threshold_bytes,
+        );
+        // Clearing is not just cosmetic. `line_gutter` is ALSO the preferred
+        // scroll source for `goto_line` and `scroll_to_offset` (find_nav.rs): a
+        // stale entry sends go-to-line, find-navigate and bookmark jumps to the
+        // previous buffer's Y instead of falling through to the
+        // `editor_size * line_height` estimate. That estimate is EXACTLY right
+        // on a rope surface — it equals `gutter_row_h`, the row pitch
+        // `RopeEditor::show_rows` lays out with — so an empty vector is the
+        // correct state here, not merely a safe one. Hiding the panel without
+        // clearing would fix the paint and leave navigation wrong.
+        if (rope_arm || read_only) && !self.line_gutter.is_empty() {
+            self.line_gutter.clear();
+        }
+        if show_line_numbers && !self.fold_view && !read_only && !rope_arm && !chrome_hidden {
             // Change-bar: refresh the per-line state cache before borrowing it.
             self.ensure_change_states(active);
             // PA-05: reuse the PA-04 (edit_gen, doc_id) memo for the gutter
@@ -1811,6 +2563,13 @@ impl ScribeApp {
                 "change_bar_saved",
                 Rgba::new(0x6f, 0xb8, 0x9a, 255),
             );
+            // Diagnostic gutter marks: worst severity per source line, sorted.
+            // The squiggle tells you a line is wrong once you are looking at it;
+            // the gutter mark is what tells you WHICH line to look at while you
+            // are somewhere else in the file.
+            let diag_marks = super::diagnostics_overlay::gutter_marks(&self.diagnostics);
+            let diag_err = ui_color(&self.theme, "error", Rgba::new(0xe5, 0x3e, 0x3e, 255));
+            let diag_warn = ui_color(&self.theme, "warning", Rgba::new(0xf2, 0xb3, 0x3d, 255));
             egui::SidePanel::left("line-gutter")
                 .exact_width(gutter_w)
                 .resizable(false)
@@ -1869,6 +2628,34 @@ impl ScribeApp {
                                 accent,
                             );
                         }
+                        // Diagnostic marker: a short severity-coloured bar on the
+                        // gutter's LEFT edge (the bookmark dot's own lane is a
+                        // circle at `lx`; a bar is a distinguishable shape at the
+                        // same glance, and the two can legitimately coexist on
+                        // one line). Errors win over warnings on a shared line.
+                        if let Ok(m) = diag_marks.binary_search_by_key(&(i as u32), |(l, _)| *l) {
+                            let sev = diag_marks[m].1;
+                            // INFO resolves to the theme accent, exactly as the
+                            // squiggle's own `match` does. Without this arm an
+                            // info diagnostic fell through to `muted` and drew a
+                            // GREY bar under a GREEN underline — the same
+                            // diagnostic wearing two colours, which reads as two
+                            // unrelated marks.
+                            let col = match sev {
+                                super::diagnostics_overlay::SEVERITY_ERROR => diag_err,
+                                super::diagnostics_overlay::SEVERITY_WARNING => diag_warn,
+                                super::diagnostics_overlay::SEVERITY_INFO => accent,
+                                _ => muted,
+                            };
+                            painter.rect_filled(
+                                egui::Rect::from_min_max(
+                                    egui::pos2(lx - 3.0, y + gutter_row_h * 0.2),
+                                    egui::pos2(lx - 0.5, y + gutter_row_h * 0.8),
+                                ),
+                                1.0,
+                                col,
+                            );
+                        }
                         painter.text(
                             egui::pos2(rx, y),
                             egui::Align2::RIGHT_TOP,
@@ -1891,6 +2678,21 @@ impl ScribeApp {
             egui::CentralPanel::default().show(ctx, |ui| {
                 // Folded read-only preview is a distinct surface (no live editing).
                 if self.fold_view {
+                    // The fold preview builds its own `ScrollArea` (id_salt
+                    // "fold-scroll") inside `show_fold_view`, so a queued
+                    // find-navigate / go-to-line scroll had nothing to consume it
+                    // here. Bridge it through the persisted state the same way the
+                    // rope paths do.
+                    //
+                    // The drag assist and the minimap deliberately do NOT run for
+                    // this surface: the preview's `TextEdit` is `interactive(false)`
+                    // (no selection to extend), and its content height is the
+                    // projected galley's, which is not observable from outside the
+                    // widget — publishing a guessed height would make the minimap
+                    // lie, which is worse than leaving it alone.
+                    let fold_scroll = super::drag_scroll::embedded_scroll_id(ui, "fold-scroll");
+                    self.drive_embedded_scroll(ctx, fold_scroll);
+                    publish_editor_mode(ctx, EditorMode::Fold);
                     self.show_fold_view(ui, font.clone(), ext.as_deref());
                     return;
                 }
@@ -1904,6 +2706,22 @@ impl ScribeApp {
                 // syntax highlighting (F-030).
                 if read_only {
                     let rope = self.tabs[active].doc.rope().clone();
+                    // Exact content height: `RopeEditor` lays out through
+                    // `ScrollArea::show_rows(ui, line_h, total_lines, ..)`, so the
+                    // content is precisely `len_lines * gutter_row_h`. Captured
+                    // before the buffer is moved into the widget.
+                    let content_h = rope.len_lines() as f32 * gutter_row_h;
+                    let scroll_id = super::drag_scroll::embedded_scroll_id(
+                        ui,
+                        super::drag_scroll::DEFAULT_SCROLL_SALT,
+                    );
+                    let focus_id = super::drag_scroll::rope_editor_focus_id(ui);
+                    let viewport = ui.max_rect();
+                    // Consume a queued find-navigate / go-to-line scroll BEFORE the
+                    // widget renders — the read-only browse path owns no ScrollArea
+                    // builder of its own, so this bridge is what makes those jumps
+                    // move the viewport instead of silently doing nothing.
+                    self.drive_embedded_scroll(ctx, scroll_id);
                     let mut buf = scribe_core::buffer::Buffer::Rope(rope);
                     let fg = ui_color(&self.theme, "foreground", Rgba::new(0xc8, 0xd6, 0xdc, 255));
                     scribe_render::RopeEditor::new(&mut buf, font.clone(), gutter_row_h)
@@ -1912,6 +2730,8 @@ impl ScribeApp {
                         .with_line_numbers(show_line_numbers)
                         .with_syntax(&self.hl, ext.clone())
                         .show(ui);
+                    publish_editor_mode(ctx, EditorMode::ReadOnlyLarge);
+                    self.finish_embedded_scroll(ctx, scroll_id, focus_id, viewport, content_h);
                     return;
                 }
 
@@ -1941,6 +2761,17 @@ impl ScribeApp {
                     // mutable rope borrow as a disjoint-field borrow).
                     let render_whitespace = self.config.editor.render_whitespace;
                     let snippets_enabled = self.config.editor.snippets_enabled;
+                    // Scroll-surface handles for the shared assist. Taken from the
+                    // SAME `ui` the widget is handed, before the `&mut self.tabs`
+                    // borrow below, so the ids match the ones `RopeEditor` derives
+                    // internally.
+                    let scroll_id = super::drag_scroll::embedded_scroll_id(
+                        ui,
+                        super::drag_scroll::DEFAULT_SCROLL_SALT,
+                    );
+                    let focus_id = super::drag_scroll::rope_editor_focus_id(ui);
+                    let viewport = ui.max_rect();
+                    self.drive_embedded_scroll(ctx, scroll_id);
                     let snippets = &self.snippets;
                     let hl = &self.hl;
                     let tab = &mut self.tabs[active];
@@ -1977,6 +2808,36 @@ impl ScribeApp {
                         // Response, so bump the gen counter here for parity.
                         tab.edit_gen = tab.edit_gen.wrapping_add(1);
                     }
+                    // Exact content height for the minimap + the drag assist:
+                    // `RopeEditor` lays out via `show_rows(ui, line_h,
+                    // total_lines, ..)`, so it is `len_lines * gutter_row_h`.
+                    // Read while `tab` is still borrowed, used after it drops.
+                    let content_h = tab
+                        .rope_buf
+                        .as_ref()
+                        .and_then(scribe_core::buffer::Buffer::as_rope)
+                        .map_or(1.0, |r| r.len_lines() as f32 * gutter_row_h);
+                    // The FIRST non-test consumer of `RopeEditorResponse::buffer_mode`:
+                    // publish which buffer variant actually rendered so the status
+                    // bar can tell the user they are in the degraded editor
+                    // instead of silently swapping it in under them.
+                    publish_editor_mode(ctx, EditorMode::from_buffer_mode(&resp.buffer_mode));
+                    // Inline LSP diagnostics on the ROPE path. `paint_squiggle`
+                    // used to be reachable ONLY from the `TextEdit` body below,
+                    // so this path — the one a buffer is AUTO-promoted into past
+                    // `rope_editor_auto_threshold_bytes`, i.e. exactly the files
+                    // where an LSP is worth having — showed no squiggle and no
+                    // gutter mark at all. The two integers in the status bar were
+                    // the whole of it. The widget now reports the geometry of the
+                    // rows it painted, so the same spans can be drawn here.
+                    self.paint_rope_diagnostics(ui, &resp, active, viewport, accent, muted);
+                    // Join the shared autoscroll + minimap-metrics implementation, the
+                    // same call the read-only-large path makes above. Without this the
+                    // editable rope path recorded no `scroll_metrics` (freezing the
+                    // minimap on the last TextEdit frame) and drag-select autoscroll
+                    // never ran here — the parity gap the frame-loop work exists to
+                    // close. `content_h` is the rope's real laid-out height.
+                    self.finish_embedded_scroll(ctx, scroll_id, focus_id, viewport, content_h);
                     if let Some(text) = clipboard {
                         // On Cut the selection is already removed from the buffer,
                         // so a clipboard failure here means the text is only
@@ -2108,6 +2969,62 @@ impl ScribeApp {
                         }
                     });
 
+                    // Ctrl/Cmd+V with an IMAGE on the clipboard saves it into the
+                    // vault's attachments folder and inserts the markdown link —
+                    // the same `paste_image_attachment` the palette runs, now on
+                    // the key people actually press.
+                    //
+                    // The hook is the V key RELEASE, not `consume_key(COMMAND, V)`,
+                    // and that is NOT a stylistic choice: `egui_winit`'s
+                    // `on_keyboard_input` special-cases the paste chord on
+                    // key-DOWN and `return`s immediately after pushing
+                    // `Event::Paste` — so `Event::Key { key: V, pressed: true }`
+                    // NEVER reaches us, and when the clipboard holds no TEXT it
+                    // pushes nothing at all. On an image-only clipboard the key
+                    // release is therefore the ONLY observable event of the whole
+                    // gesture; a `consume_key` here would be permanently dead
+                    // code. Shift is excluded so Ctrl+Shift+V keeps its binding.
+                    let now = ctx.cumulative_pass_nr();
+                    let (text_pasted, paste_released) = ctx.input(|i| {
+                        (
+                            i.events
+                                .iter()
+                                .any(|e| matches!(e, egui::Event::Paste(t) if !t.is_empty())),
+                            i.events.iter().any(|e| {
+                                matches!(
+                                    e,
+                                    egui::Event::Key {
+                                        key: egui::Key::V,
+                                        pressed: false,
+                                        modifiers,
+                                        ..
+                                    } if modifiers.command && !modifiers.shift && !modifiers.alt
+                                )
+                            }),
+                        )
+                    });
+                    if text_pasted {
+                        ctx.data_mut(|d| d.insert_temp(last_text_paste_frame_id(), now));
+                    }
+                    if paste_released {
+                        // A clipboard carrying BOTH text and a bitmap pastes the
+                        // TEXT: that already happened on the key-down frame, so
+                        // the release must not also drop an image in.
+                        let text_won = ctx
+                            .data_mut(|d| {
+                                let id = last_text_paste_frame_id();
+                                let v = d.get_temp::<u64>(id);
+                                d.remove::<u64>(id);
+                                v
+                            })
+                            .is_some_and(|f| {
+                                now.saturating_sub(f) <= PASTE_IMAGE_TEXT_GRACE_FRAMES
+                            });
+                        if !text_won && self.config.notes.vault_dir.is_some() {
+                            self.paste_image_attachment();
+                        }
+                    }
+
                     // P1-2 — smart paste: rewrite a clipboard-URL Paste event that
                     // lands over a non-empty selection into `[selection](url)`, so
                     // egui's native paste replaces the selection with a md link.
@@ -2135,19 +3052,16 @@ impl ScribeApp {
                 // so they run here — after the editor stored its state this
                 // frame — and `store` takes effect next frame.
                 if !read_only {
-                    if act.jump_bracket || std::mem::take(&mut self.pending_jump_bracket) {
-                        self.jump_matching_bracket(ctx, editor_id, active);
-                    }
-                    if std::mem::take(&mut self.pending_insert_datetime) {
-                        self.insert_datetime_at_caret(ctx, editor_id, active);
-                    }
-                    if std::mem::take(&mut self.pending_dup_selection) {
-                        self.duplicate_selection(ctx, editor_id, active);
+                    // The keyboard chord and the `pending_*` latch are the same
+                    // request; fold the chord into the latch so ONE drain applies
+                    // every caret op.
+                    if act.jump_bracket {
+                        self.pending_jump_bracket = true;
                     }
                     // A right-click context-menu command stashed in ctx-data on a
                     // previous frame (it couldn't run inside the editor closure
                     // while the highlighter borrowed `self`) — dispatch it now so
-                    // its pending_* flag is applied by the drains just below.
+                    // its pending_* flag is applied by the drain just below.
                     if let Some(cmd) = ctx.data_mut(|d| {
                         let id = editor_ctx_cmd_id();
                         let v = d.get_temp::<crate::app::commands::BuiltinCommand>(id);
@@ -2157,25 +3071,22 @@ impl ScribeApp {
                         self.execute_builtin(cmd);
                     }
                     // Note-usability caret ops (palette + chord) — P0-1 / P0-4 /
-                    // P1-4 / P2-1.
-                    if std::mem::take(&mut self.pending_toggle_task) {
-                        self.toggle_task_checkbox_active(ctx, editor_id, active);
-                    }
-                    if let Some(marker) = self.pending_wrap_marker.take() {
-                        self.wrap_selection_active(ctx, editor_id, active, marker);
-                    }
-                    if let Some(op) = self.pending_case.take() {
-                        self.case_selection_active(ctx, editor_id, active, op);
-                    }
-                    if std::mem::take(&mut self.pending_format_table) {
-                        self.format_table_active(ctx, editor_id, active);
-                    }
+                    // P1-4 / P2-1. Shared with the grid pane path so the two
+                    // surfaces can never drift into two different drain sets (the
+                    // grid drained NONE of them, so every one of these latched
+                    // forever in split view).
+                    self.apply_pending_caret_ops(ctx, editor_id, active);
                 }
 
                 // #78 — misspellings for the active buffer, computed (memoized)
                 // BEFORE the partial borrows below so the owned Vec can move into
                 // the editor closure and drive the red underline painter.
                 let misspellings = self.misspellings_for_active();
+                // LSP diagnostics resolved onto byte spans, owned so they can
+                // move into the editor closure alongside `misspellings` and
+                // drive the squiggle + hover overlay. Empty (and free) when the
+                // language server has published nothing.
+                let diag_spans = self.diagnostic_spans_for_active(active);
                 // Wave-5: compute all find matches once (needs &self) so the
                 // highlight-all overlay can paint every match, not just the
                 // navigated one. Empty when the find bar is closed.
@@ -2305,6 +3216,35 @@ impl ScribeApp {
                         egui::ScrollArea::both()
                     })
                     .id_salt(("scr1b3-editor-scroll", self.tabs[active].doc_id));
+                    // ROOT CAUSE of "drag-select can't scroll the view" (P0-2).
+                    // egui's own TextEdit cursor-follow calls
+                    // `ui.scroll_to_rect(primary_cursor_rect, None)` on
+                    // `response.changed() || selection_changed`
+                    // (`text_edit/builder.rs`), which during a drag-select is
+                    // true nearly every frame. With the ScrollArea's default
+                    // `animated == true` that installs a persistent
+                    // `state.offset_target`, and `Prepared::begin` LERPS
+                    // `state.offset` toward it (`scroll_area.rs`) AFTER our
+                    // `vertical_scroll_offset` write below has landed but BEFORE
+                    // `add_contents` lays anything out. So every value
+                    // `drag_scroll_assist` computed was overwritten before it
+                    // could take effect, and because `scroll_metrics` is then
+                    // recorded from the CLOBBERED offset the assist re-based off
+                    // egui's value each frame and could never accumulate.
+                    //
+                    // With `animated(false)` the same cursor-follow instead
+                    // writes `state.offset[d] = target_offset` directly and
+                    // installs NO `offset_target`, so nothing survives into the
+                    // next frame to clobber our write.
+                    //
+                    // Gated STRICTLY on an active drag-select: turning animation
+                    // off unconditionally would also kill the user's
+                    // `animate_jumps` easing for goto-line / find-navigation.
+                    let drag_selecting = ctx.input(|i| i.pointer.primary_down())
+                        && ctx.memory(|m| m.has_focus(editor_id));
+                    if drag_selecting {
+                        sa = sa.animated(false);
+                    }
                     if let Some(off) = self.pending_scroll.take() {
                         sa = sa.vertical_scroll_offset(off);
                     }
@@ -2430,9 +3370,17 @@ impl ScribeApp {
                         // Wave-3: the egui in-place edit happened inside show();
                         // `.changed()` is true exactly on the edited frame, so this
                         // is the ONLY hook for the default editor's text mutation.
-                        // Bump the gen counter so the minimap + spell caches refresh.
+                        //
+                        // It must therefore run the FULL invalidation, not just the
+                        // gen bump. `edit_gen` refreshes the gen-keyed minimap and
+                        // spell caches; it does NOT clear `rope_buf`. A bare bump
+                        // left the pre-switch rope alive, and because the rope path
+                        // rebuilds only when `rope_buf.is_none()`, re-enabling the
+                        // rope editor wrote that stale rope back over `text` and
+                        // silently destroyed the user's typing. Same writer duty as
+                        // `set_text` and the two in-place splicers.
                         if out.response.changed() {
-                            self.tabs[active].edit_gen = self.tabs[active].edit_gen.wrapping_add(1);
+                            self.tabs[active].note_text_mutated();
                         }
                         // P1-3 scroll-past-end: pad blank space below the last
                         // line so it can rest at a comfortable height instead of
@@ -2451,62 +3399,123 @@ impl ScribeApp {
                         // to http/https (a URL in a file is untrusted data; open only
                         // on an explicit modifier-click, never on render). Bounded by
                         // a buffer-size cap like the other per-frame overlays.
-                        if self.config.editor.detect_links
-                            && self.tabs[active].text.len() <= 1_000_000
+                        //
+                        // The SAME pointer->byte hit-test also resolves an
+                        // in-editor `[[wiki-link]]`: `extract_wikilinks` already
+                        // reports ABSOLUTE byte spans, so the link arm is a
+                        // sibling of the URL arm rather than a second scan. The
+                        // two are mutually exclusive at a given byte (a URL is
+                        // never inside a link target), so URL wins the `find` and
+                        // the link arm is the `else`.
+                        //
+                        // Nothing here is needed unless the pointer is actually
+                        // over the editor, so the hover test comes FIRST: both
+                        // scans are O(buffer) and would otherwise run every frame
+                        // of every session, for a hit-test that cannot happen.
+                        let link_hover = ui
+                            .input(|i| i.pointer.hover_pos())
+                            .filter(|p| out.response.rect.contains(*p));
+                        if let Some(p) =
+                            link_hover.filter(|_| self.tabs[active].text.len() <= 1_000_000)
                         {
                             let text_ref = &self.tabs[active].text;
                             let mut url_spans: Vec<(usize, usize, &str)> = Vec::new();
-                            let mut base = 0usize;
-                            for line in text_ref.split_inclusive('\n') {
-                                for r in scribe_core::url_scan::detect_urls(line) {
-                                    url_spans.push((base + r.start, base + r.end, &line[r]));
+                            if self.config.editor.detect_links {
+                                let mut base = 0usize;
+                                for line in text_ref.split_inclusive('\n') {
+                                    for r in scribe_core::url_scan::detect_urls(line) {
+                                        url_spans.push((base + r.start, base + r.end, &line[r]));
+                                    }
+                                    base += line.len();
                                 }
-                                base += line.len();
                             }
-                            if !url_spans.is_empty() {
-                                if let Some(p) = ui.input(|i| i.pointer.hover_pos()) {
-                                    if out.response.rect.contains(p) {
-                                        let rel = p - out.galley_pos;
-                                        let ci = out.galley.cursor_from_pos(rel).index;
-                                        let byte = char_to_byte(text_ref, ci);
-                                        if let Some(&(_, _, url)) = url_spans
-                                            .iter()
-                                            .find(|(s, e, _)| byte >= *s && byte < *e)
-                                        {
-                                            let cmd = ui.input(|i| i.modifiers.command);
-                                            // P1 — pointer affordance when the follow
-                                            // modifier is held.
-                                            if cmd {
-                                                ui.ctx().set_cursor_icon(
-                                                    egui::CursorIcon::PointingHand,
-                                                );
-                                            }
-                                            // P1 — anti-phishing hover preview of the
-                                            // destination (so the user sees where a
-                                            // link goes before opening it).
-                                            egui::show_tooltip_at_pointer(
-                                                ui.ctx(),
-                                                out.response.layer_id,
-                                                egui::Id::new("scr1b3-url-tooltip"),
-                                                |ui| {
-                                                    ui.label(if cmd {
-                                                        url.to_string()
-                                                    } else {
-                                                        format!("{url}  —  Ctrl+click to open")
-                                                    });
-                                                },
+                            // A wiki-link is a NOTES affordance, not a URL one:
+                            // it is live whenever a vault is configured (there is
+                            // nowhere to resolve a target without one), which is
+                            // exactly the precondition `open_or_create_wikilink`
+                            // enforces. An empty target (`[[#Heading]]`, an
+                            // intra-note anchor) names no note and is skipped.
+                            let link_spans: Vec<scribe_core::notes::wikilink::WikiLink> =
+                                if self.config.notes.vault_dir.is_some() {
+                                    scribe_core::notes::wikilink::extract_wikilinks(text_ref)
+                                        .into_iter()
+                                        .filter(|l| !l.target.is_empty())
+                                        .collect()
+                                } else {
+                                    Vec::new()
+                                };
+                            if !url_spans.is_empty() || !link_spans.is_empty() {
+                                let rel = p - out.galley_pos;
+                                let ci = out.galley.cursor_from_pos(rel).index;
+                                let byte = char_to_byte(text_ref, ci);
+                                if let Some(&(_, _, url)) =
+                                    url_spans.iter().find(|(s, e, _)| byte >= *s && byte < *e)
+                                {
+                                    let cmd = ui.input(|i| i.modifiers.command);
+                                    // P1 — pointer affordance when the follow
+                                    // modifier is held.
+                                    if cmd {
+                                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                    }
+                                    // P1 — anti-phishing hover preview of the
+                                    // destination (so the user sees where a
+                                    // link goes before opening it).
+                                    egui::show_tooltip_at_pointer(
+                                        ui.ctx(),
+                                        out.response.layer_id,
+                                        egui::Id::new("scr1b3-url-tooltip"),
+                                        |ui| {
+                                            ui.label(if cmd {
+                                                url.to_string()
+                                            } else {
+                                                format!("{url}  —  Ctrl+click to open")
+                                            });
+                                        },
+                                    );
+                                    // P0 — open only on explicit modifier-click,
+                                    // and only for an http/https scheme.
+                                    if cmd
+                                        && ui.input(|i| i.pointer.primary_clicked())
+                                        && scribe_core::url_scan::is_clickable_url(url)
+                                    {
+                                        ui.ctx().open_url(egui::OpenUrl::new_tab(url.to_string()));
+                                    }
+                                } else if let Some(link) =
+                                    link_spans.iter().find(|l| byte >= l.start && byte < l.end)
+                                {
+                                    let cmd = ui.input(|i| i.modifiers.command);
+                                    if cmd {
+                                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                    }
+                                    // The hover names the TARGET, not the
+                                    // label — an aliased link must not
+                                    // hide where it goes (same contract as
+                                    // the notes pane's link list).
+                                    egui::show_tooltip_at_pointer(
+                                        ui.ctx(),
+                                        out.response.layer_id,
+                                        egui::Id::new("scr1b3-wikilink-tooltip"),
+                                        |ui| {
+                                            ui.label(if cmd {
+                                                format!("[[{}]]", link.target)
+                                            } else {
+                                                format!(
+                                                    "[[{}]]  —  Ctrl+click to open",
+                                                    link.target
+                                                )
+                                            });
+                                        },
+                                    );
+                                    // Stash, don't follow: `self` is
+                                    // borrowed here. Drained at the top of
+                                    // the next frame.
+                                    if cmd && ui.input(|i| i.pointer.primary_clicked()) {
+                                        ui.ctx().data_mut(|d| {
+                                            d.insert_temp(
+                                                editor_wikilink_follow_id(),
+                                                link.target.clone(),
                                             );
-                                            // P0 — open only on explicit modifier-click,
-                                            // and only for an http/https scheme.
-                                            if cmd
-                                                && ui.input(|i| i.pointer.primary_clicked())
-                                                && scribe_core::url_scan::is_clickable_url(url)
-                                            {
-                                                ui.ctx().open_url(egui::OpenUrl::new_tab(
-                                                    url.to_string(),
-                                                ));
-                                            }
-                                        }
+                                        });
                                     }
                                 }
                             }
@@ -2533,6 +3542,89 @@ impl ScribeApp {
                                 let x0 = out.galley_pos.x + r0.min.x;
                                 let x1 = out.galley_pos.x + r1.min.x;
                                 paint_squiggle(painter, x0, x1, y, red);
+                            }
+                        }
+                        // ---- Inline LSP diagnostics ----
+                        //
+                        // The client has drained `publishDiagnostics` since it
+                        // was written, but the ONLY thing rendered from them was
+                        // a pair of integers in the status bar ("3e / 7") — no
+                        // squiggle, no gutter mark, no message. Two integers do
+                        // not tell you which line is wrong or why. Paint a
+                        // severity-coloured squiggle under each diagnostic's
+                        // range, and describe it on hover.
+                        //
+                        // Painted per galley ROW rather than per span, so a
+                        // multi-line diagnostic (an unclosed delimiter, a type
+                        // error spanning a match arm) underlines every line it
+                        // covers instead of being dropped for spanning rows —
+                        // and so it follows soft wrapping.
+                        if !diag_spans.is_empty() {
+                            let text_ref = &self.tabs[active].text;
+                            let painter = ui.painter();
+                            let err_c =
+                                ui_color(&self.theme, "error", Rgba::new(0xe5, 0x3e, 0x3e, 255));
+                            let warn_c =
+                                ui_color(&self.theme, "warning", Rgba::new(0xf2, 0xb3, 0x3d, 255));
+                            let info_c = accent;
+                            let origin = out.galley_pos.to_vec2();
+                            // Rects actually painted, so the hover test is
+                            // "is the pointer over a squiggle", not "is it
+                            // somewhere on a line that has one".
+                            let mut painted: Vec<egui::Rect> = Vec::new();
+                            for span in &diag_spans {
+                                let color = match span.severity {
+                                    crate::app::diagnostics_overlay::SEVERITY_ERROR => err_c,
+                                    crate::app::diagnostics_overlay::SEVERITY_WARNING => warn_c,
+                                    crate::app::diagnostics_overlay::SEVERITY_INFO => info_c,
+                                    _ => muted,
+                                };
+                                let c0 = byte_to_char_index(text_ref, span.start);
+                                let c1 = byte_to_char_index(text_ref, span.end);
+                                let mut row_start = 0usize;
+                                for prow in &out.galley.rows {
+                                    let row_end = row_start + prow.char_count_including_newline();
+                                    let s = c0.max(row_start);
+                                    let e = c1.min(row_end);
+                                    if s < e {
+                                        let rx = origin.x + prow.pos.x;
+                                        let x0 = rx + prow.row.x_offset(s - row_start);
+                                        let x1 = rx + prow.row.x_offset(e - row_start);
+                                        let top = origin.y + prow.pos.y;
+                                        let bot = top + prow.row.size.y;
+                                        paint_squiggle(painter, x0, x1, bot, color);
+                                        painted.push(egui::Rect::from_min_max(
+                                            egui::pos2(x0, top),
+                                            egui::pos2(x1, bot),
+                                        ));
+                                    }
+                                    row_start = row_end;
+                                    if row_start >= c1 {
+                                        break;
+                                    }
+                                }
+                            }
+                            // Hover: name the problem. Resolved through the
+                            // galley so the message belongs to the character
+                            // under the pointer, not merely to the same line.
+                            if let Some(p) = ui.ctx().pointer_hover_pos() {
+                                if painted.iter().any(|r| r.contains(p)) {
+                                    let cursor = out.galley.cursor_from_pos(p - out.galley_pos);
+                                    let byte = char_to_byte(text_ref, cursor.index);
+                                    if let Some(text) = crate::app::diagnostics_overlay::hover_text(
+                                        &diag_spans,
+                                        byte,
+                                    ) {
+                                        egui::show_tooltip_at_pointer(
+                                            ui.ctx(),
+                                            out.response.layer_id,
+                                            egui::Id::new("scr1b3-diagnostic-tooltip"),
+                                            |ui| {
+                                                ui.label(text);
+                                            },
+                                        );
+                                    }
+                                }
                             }
                         }
                         // Wave-5: incremental highlight-all — paint a translucent
@@ -2728,7 +3820,7 @@ impl ScribeApp {
                             self.last_selection_chars =
                                 range.primary.index.abs_diff(range.secondary.index);
                             // Wave-6 motion: feed the caret-trail when the caret moves.
-                            if self.config.motion.enabled && self.config.motion.caret_trail {
+                            if motion_on && self.config.motion.caret_trail {
                                 let t = ui.input(|i| i.time);
                                 let caret_rect = egui::Rect::from_min_max(
                                     out.galley_pos + rect.min.to_vec2(),
@@ -2876,8 +3968,7 @@ impl ScribeApp {
                                 && out.response.has_focus()
                             {
                                 let now = ui.ctx().input(|i| i.time);
-                                let blink =
-                                    self.config.motion.enabled && self.config.motion.cursor_blink;
+                                let blink = motion_on && self.config.motion.cursor_blink;
                                 let visible = if blink {
                                     (now / 1.06).rem_euclid(1.0) < 0.6
                                 } else {
@@ -2998,6 +4089,12 @@ impl ScribeApp {
                         sa_out.content_size.y.max(1.0),
                         sa_out.inner_rect.height().max(1.0),
                     );
+                    // This is the full-feature TextEdit path — publish Standard so the
+                    // status-bar mode badge CLEARS when the user returns to a small
+                    // file. Without this the badge would keep showing ROPE/MMAP from
+                    // whatever large file rendered last, which is exactly the "silent
+                    // and misleading" state the badge exists to prevent.
+                    publish_editor_mode(ctx, EditorMode::Standard);
                     // Hand the viewport rect to the post-render drag-scroll +
                     // caret-scroll-off assists (applied after the `hl` borrow).
                     editor_vp = sa_out.inner_rect;
@@ -3155,6 +4252,12 @@ impl ScribeApp {
             });
         }
 
+        // An unrequested swap into a degraded editor queues a one-shot notice
+        // (see `publish_editor_mode`). Drain it HERE — the first point after the
+        // central panel where `self` is mutable again — so the swap is announced
+        // rather than only being discoverable by hovering the status-bar badge.
+        self.drain_editor_mode_notice(ctx);
+
         // Window color-tint overlay (subtle wash; portable across modes/OSes).
         if self.config.window.tint_strength > 0.0 {
             paint_tint_overlay(
@@ -3167,7 +4270,7 @@ impl ScribeApp {
         // retro overlay; only when motion AND scanlines are both enabled. Drives
         // a modest ~30 fps repaint while on so the bands drift (no busy-spin), and
         // never paints in the headless test harness (no real window to overlay).
-        if !cfg!(test) && self.config.motion.enabled && self.config.motion.crt_scanlines {
+        if !cfg!(test) && motion_on && self.config.motion.crt_scanlines {
             let t = ctx.input(|i| i.time);
             paint_crt_scanlines(ctx, self.config.motion.scanline_darkness, t);
             ctx.request_repaint_after(std::time::Duration::from_millis(33));
@@ -3175,7 +4278,7 @@ impl ScribeApp {
         // Wave-6 motion overlays (master-gated; never in the headless harness).
         // Each is a calm post-effect; while any is active we drive a ~30 fps
         // repaint so it animates. The resting (motion-off) frame is unchanged.
-        if !cfg!(test) && self.config.motion.enabled {
+        if !cfg!(test) && motion_on {
             let t = ctx.input(|i| i.time);
             let accent = ui_color(&self.theme, "accent", Rgba::new(0x4c, 0xc2, 0xff, 255));
             let mut animating = false;
@@ -3279,5 +4382,340 @@ impl ScribeApp {
         );
 
         self.persist_session_and_autosave();
+    }
+}
+
+/// Editor-surface link + paste wiring, asserted by OBSERVABLE OUTCOME.
+///
+/// Both features are wires between things that already worked separately (the
+/// wiki-link resolver; the attachment-paste command), so the only failure worth
+/// testing for is the wire itself being absent — which a "a pending flag was
+/// set" assertion cannot see. Every test here asserts the end of the wire: the
+/// note that got created and opened, or the markdown that landed in the buffer.
+#[cfg(test)]
+mod editor_link_paste_wiring_tests {
+    use super::super::e2e::Driver;
+    use super::super::note_capture::{test_hooks, ClipboardImage};
+    use crate::app::ScribeApp;
+    use scribe_core::config::Config;
+    use std::path::{Path, PathBuf};
+
+    const CMD: egui::Modifiers = egui::Modifiers::COMMAND;
+
+    struct Vault {
+        _root: tempfile::TempDir,
+        path: PathBuf,
+    }
+
+    fn vault() -> Vault {
+        let root = tempfile::tempdir().expect("temp root");
+        let path = root.path().join("vault");
+        std::fs::create_dir_all(&path).expect("vault dir");
+        Vault { _root: root, path }
+    }
+
+    fn app_with_vault(v: &Path) -> ScribeApp {
+        let mut cfg = Config::default();
+        cfg.editor.first_run_completed = true;
+        cfg.notes.vault_dir = Some(v.to_path_buf());
+        ScribeApp::new_test(cfg)
+    }
+
+    fn solid_image(w: usize, h: usize) -> ClipboardImage {
+        ClipboardImage {
+            width: w,
+            height: h,
+            rgba: vec![0x40u8; w * h * 4],
+        }
+    }
+
+    /// A modified pointer click (move + press + release) in ONE frame — the same
+    /// shape `e2e`'s own Ctrl+click test uses.
+    fn mod_click(d: &Driver, app: &mut ScribeApp, pos: egui::Pos2, modifiers: egui::Modifiers) {
+        d.frame(
+            app,
+            modifiers,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers,
+                },
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers,
+                },
+            ],
+        );
+    }
+
+    /// A buffer whose every byte sits inside a link span, so the pointer
+    /// hit-test cannot land in a gap between links. Taller than the window (any
+    /// y lands on text) and each line is ~60 chars — wide enough that [`CLICK`]'s
+    /// x is mid-row, narrow enough not to soft-wrap. Both bounds matter: a
+    /// wrapped row's short tail clamps the hit-test onto the trailing NEWLINE,
+    /// which is inside no link, and the click silently does nothing.
+    fn wall_of(link: &str) -> String {
+        let line = link.repeat(60_usize.div_ceil(link.len()));
+        assert!(
+            (60..90).contains(&line.chars().count()),
+            "fixture geometry: {line:?}"
+        );
+        (0..200)
+            .map(|_| line.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Well inside the wall of links, on both axes.
+    const CLICK: egui::Pos2 = egui::Pos2::new(150.0, 380.0);
+
+    // ---- A: in-editor [[wiki-link]] click ----
+
+    /// Ctrl+clicking a `[[wiki-link]]` IN THE EDITOR opens the note — creating
+    /// it when it does not exist yet, exactly as the notes pane's link list
+    /// does. Asserted on the file that appears and the tab that ends up active,
+    /// never on an intermediate latch.
+    #[test]
+    fn ctrl_clicking_a_wikilink_in_the_editor_opens_the_note() {
+        let v = vault();
+        std::fs::write(v.path.join("Home.md"), "seed\n").unwrap();
+        let mut app = app_with_vault(&v.path);
+        app.open_path(v.path.join("Home.md"));
+        let active = app.active;
+        app.tabs[active].text = wall_of("[[Target]]");
+
+        let d = Driver::new();
+        d.idle(&mut app);
+        d.idle(&mut app); // editor lays out + takes focus
+        assert!(
+            !v.path.join("Target.md").exists(),
+            "precondition: the link target does not exist yet"
+        );
+
+        mod_click(&d, &mut app, CLICK, CMD);
+        d.idle(&mut app); // the stashed follow is drained at the top of the frame
+
+        let target = v.path.join("Target.md");
+        assert!(
+            target.exists(),
+            "the clicked [[Target]] must be created in the vault"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "# Target\n",
+            "created through open_or_create_wikilink, seeded with its heading"
+        );
+        assert_eq!(
+            app.tabs[app.active].doc.path(),
+            Some(target.as_path()),
+            "…and opened in the active tab"
+        );
+    }
+
+    /// A plain (unmodified) click over a wiki-link must NOT follow it — the
+    /// modifier is the whole consent gesture, same as the URL arm.
+    #[test]
+    fn a_plain_click_on_a_wikilink_does_not_open_anything() {
+        let v = vault();
+        std::fs::write(v.path.join("Home.md"), "seed\n").unwrap();
+        let mut app = app_with_vault(&v.path);
+        app.open_path(v.path.join("Home.md"));
+        let active = app.active;
+        app.tabs[active].text = wall_of("[[Target]]");
+
+        let d = Driver::new();
+        d.idle(&mut app);
+        d.idle(&mut app);
+        mod_click(&d, &mut app, CLICK, egui::Modifiers::NONE);
+        d.idle(&mut app);
+
+        assert!(
+            !v.path.join("Target.md").exists(),
+            "an unmodified click must not create or open the note"
+        );
+    }
+
+    /// The traversal gate is the resolver's, not a second copy: a link that
+    /// escapes the vault is refused with a toast and writes nothing outside it.
+    #[test]
+    fn a_traversal_wikilink_clicked_in_the_editor_is_refused() {
+        let v = vault();
+        let outside = v.path.parent().unwrap().to_path_buf();
+        std::fs::write(v.path.join("Home.md"), "seed\n").unwrap();
+        let mut app = app_with_vault(&v.path);
+        app.open_path(v.path.join("Home.md"));
+        let active = app.active;
+        app.tabs[active].text = wall_of("[[../escaped]]");
+
+        let d = Driver::new();
+        d.idle(&mut app);
+        d.idle(&mut app);
+        mod_click(&d, &mut app, CLICK, CMD);
+        d.idle(&mut app);
+
+        assert!(
+            !outside.join("escaped.md").exists(),
+            "nothing may be written outside the vault"
+        );
+        assert!(
+            app.toast
+                .as_deref()
+                .unwrap_or("")
+                .contains("Can't open that link"),
+            "the refusal is surfaced, not silent: {:?}",
+            app.toast
+        );
+    }
+
+    // ---- C: Ctrl+V pastes a clipboard image as an attachment ----
+
+    /// Ctrl+V with an image on the clipboard runs the attachment paste and the
+    /// markdown link lands IN THE BUFFER. The end of the wire, not the latch:
+    /// `pending_insert_text.is_some()` would still pass with the drain deleted.
+    #[test]
+    fn ctrl_v_with_a_clipboard_image_inserts_the_attachment_markdown() {
+        let v = vault();
+        std::fs::write(v.path.join("Note.md"), "before\n").unwrap();
+        let mut app = app_with_vault(&v.path);
+        app.open_path(v.path.join("Note.md"));
+        let active = app.active;
+
+        let d = Driver::new();
+        d.idle(&mut app);
+        d.idle(&mut app); // the editor must own focus for the paste hook
+
+        test_hooks::set_next_image(solid_image(2, 2));
+        // egui_winit swallows the paste key-DOWN, so the RELEASE is the event
+        // the app really sees; `Driver::key` sends press + release.
+        d.key(&mut app, egui::Key::V, CMD);
+        d.idle(&mut app); // deliver the queued insertion
+        d.idle(&mut app); // …and let the editor settle it
+
+        let text = app.tabs[active].text.clone();
+        assert!(
+            text.contains("![pasted image](attachments/pasted-"),
+            "Ctrl+V must insert the attachment markdown, got {text:?}"
+        );
+        assert!(
+            text.contains("before"),
+            "existing content survives: {text:?}"
+        );
+        let name = text
+            .split_once("](")
+            .and_then(|(_, t)| t.split_once(')'))
+            .map(|(p, _)| p.to_string())
+            .expect("a link target");
+        assert!(
+            v.path.join(&name).exists(),
+            "the link names a PNG that is really there: {name}"
+        );
+    }
+
+    /// The RELEASE alone must fire it — which is the whole reason the hook is
+    /// not `consume_key(COMMAND, V)`.
+    ///
+    /// `egui_winit::State::on_keyboard_input` special-cases the paste chord on
+    /// key-DOWN and returns immediately, so `Event::Key { key: V, pressed: true }`
+    /// is NEVER emitted for Ctrl+V, and on an image-only clipboard (no text to
+    /// put in an `Event::Paste`) it emits nothing at all on the way down. This
+    /// test replays exactly what the real integration delivers — the release and
+    /// nothing else. Without it, `Driver::key`'s press+release pair lets a
+    /// press-watching implementation pass while being dead code in the app.
+    #[test]
+    fn the_paste_key_release_alone_pastes_the_image() {
+        let v = vault();
+        std::fs::write(v.path.join("Note.md"), "before\n").unwrap();
+        let mut app = app_with_vault(&v.path);
+        app.open_path(v.path.join("Note.md"));
+        let active = app.active;
+
+        let d = Driver::new();
+        d.idle(&mut app);
+        d.idle(&mut app);
+
+        test_hooks::set_next_image(solid_image(2, 2));
+        d.frame(
+            &mut app,
+            CMD,
+            vec![egui::Event::Key {
+                key: egui::Key::V,
+                physical_key: None,
+                pressed: false,
+                repeat: false,
+                modifiers: CMD,
+            }],
+        );
+        d.idle(&mut app);
+        d.idle(&mut app);
+
+        assert!(
+            app.tabs[active]
+                .text
+                .contains("![pasted image](attachments/pasted-"),
+            "the key RELEASE is the only event egui emits for an image-only \
+             clipboard; got {:?}",
+            app.tabs[active].text
+        );
+    }
+
+    /// A clipboard carrying TEXT pastes the text: the image branch must not also
+    /// fire on the key release and drop an unwanted attachment in.
+    #[test]
+    fn a_text_paste_is_not_hijacked_by_the_image_branch() {
+        let v = vault();
+        std::fs::write(v.path.join("Note.md"), "before\n").unwrap();
+        let mut app = app_with_vault(&v.path);
+        app.open_path(v.path.join("Note.md"));
+
+        let d = Driver::new();
+        d.idle(&mut app);
+        d.idle(&mut app);
+
+        test_hooks::set_next_image(solid_image(2, 2));
+        // The real gesture shape: `Event::Paste` on the key-down frame, the `V`
+        // release a frame later.
+        d.frame(&mut app, CMD, vec![egui::Event::Paste("hello".into())]);
+        d.key(&mut app, egui::Key::V, CMD);
+        d.idle(&mut app);
+        d.idle(&mut app);
+
+        assert!(
+            !v.path.join("attachments").exists(),
+            "a text paste must not write an image attachment"
+        );
+        assert!(
+            !app.tabs[app.active].text.contains("![pasted image]"),
+            "…nor insert attachment markdown: {:?}",
+            app.tabs[app.active].text
+        );
+    }
+
+    /// Ctrl+SHIFT+V is a different binding (markdown preview) — the image branch
+    /// must not claim its release.
+    #[test]
+    fn ctrl_shift_v_does_not_paste_an_image() {
+        let v = vault();
+        std::fs::write(v.path.join("Note.md"), "before\n").unwrap();
+        let mut app = app_with_vault(&v.path);
+        app.open_path(v.path.join("Note.md"));
+
+        let d = Driver::new();
+        d.idle(&mut app);
+        d.idle(&mut app);
+
+        test_hooks::set_next_image(solid_image(2, 2));
+        d.key(&mut app, egui::Key::V, CMD | egui::Modifiers::SHIFT);
+        d.idle(&mut app);
+        d.idle(&mut app);
+
+        assert!(
+            !v.path.join("attachments").exists(),
+            "Ctrl+Shift+V must not paste an image attachment"
+        );
     }
 }

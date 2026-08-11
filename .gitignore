@@ -28,11 +28,15 @@ desktop.ini
 *.log
 /scr1b3.toml.local
 
-# Harness runtime state — must never enter the public repo
-.s4f3-data/
-.claude-data/
+# Tooling runtime state — must never enter the public repo.
+# Matched by shape rather than by name, so this file does not itself publish
+# the internal directory names the content-safety audit exists to suppress.
+.*-data/
 /mutants.out*/
 
 # Python bytecode (scripts/ helpers are run in-place)
 __pycache__/
 *.pyc
+
+# Mutation-run scratch (agent analysis logs; mutants.out* already ignored above)
+/.mutlogs/

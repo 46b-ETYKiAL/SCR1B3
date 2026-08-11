@@ -56,6 +56,12 @@ const GITHUB_API_VERSION: &str = "2026-03-10";
 /// GitHub Releases API `Accept` header value.
 const GITHUB_ACCEPT: &str = "application/vnd.github+json";
 
+/// Origin of the GitHub REST API — the single outbound host the updater talks
+/// to. Named (and threaded through as a parameter) rather than inlined into the
+/// URL composer so the compose-then-fetch step is reachable from a test; see
+/// [`fetch_releases`].
+pub const GITHUB_API_BASE: &str = "https://api.github.com";
+
 /// Overall per-request network timeout. Bounds a slow or stalled connection (a
 /// hostile or just-bad network) so an update check / download can never hang the
 /// worker thread indefinitely.
@@ -245,15 +251,51 @@ pub fn ensure_upgrade(candidate: &str, running: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Compose the exact Releases-API URL the update check issues, from the app's
+/// `owner`/`repo` coordinates. Pure (no I/O) so the composed target is
+/// assertable in a unit test.
+///
+/// This being testable is load-bearing, not cosmetic. [`fetch_releases_at`]
+/// forbids redirects (see its comment), so the URL must name the repository's
+/// CURRENT name: GitHub answers a request for a repo's FORMER name with a `301`
+/// to the numeric `/repositories/{id}/…` form, and a redirect-forbidden client
+/// turns that `301` into an error — every update check fails. A stale name here
+/// therefore breaks the updater for every installed copy while the code still
+/// looks correct, so the composed URL is pinned by
+/// [`tests::releases_api_url_composes_the_documented_shape`] and, against the
+/// live constants, by `scribe-app`'s `updater` tests. The fix for a rename is
+/// always the NAME — never relaxing the redirect ban, which is what stops an
+/// off-GitHub bounce from serving forged JSON.
+pub fn releases_api_url(owner: &str, repo: &str) -> String {
+    releases_api_url_at(GITHUB_API_BASE, owner, repo)
+}
+
+/// [`releases_api_url`] against an explicit API `base`.
+///
+/// The base is a PARAMETER rather than a literal baked into the `format!` for
+/// one reason: it is what lets [`fetch_releases`] — the compose-then-fetch step
+/// the updater actually calls — be driven against the loopback mock. With
+/// `api.github.com` hard-coded, that function could only be exercised by a real
+/// network request, so nothing tested it and its body could be replaced by an
+/// empty list with the suite still green.
+fn releases_api_url_at(base: &str, owner: &str, repo: &str) -> String {
+    // per_page=100 returns every release in one page for a project this size.
+    format!("{base}/repos/{owner}/{repo}/releases?per_page=100")
+}
+
 /// Blocking GET of `/repos/{owner}/{repo}/releases` (the FULL list, one page).
 /// Sends `Cache-Control: no-cache` so an intermediary can't serve a stale list
 /// that hides a freshly-published release, and maps a 403/429 to an explicit
 /// rate-limit message (unauthenticated GitHub allows 60 req/hr/IP). Never
 /// panics.
-pub fn fetch_releases(owner: &str, repo: &str) -> Result<Vec<RawRelease>, String> {
-    // per_page=100 returns every release in one page for a project this size.
-    let url = format!("https://api.github.com/repos/{owner}/{repo}/releases?per_page=100");
-    fetch_releases_at(&url)
+/// `base` is [`GITHUB_API_BASE`] in production and a loopback mock's origin in
+/// tests. It is a parameter, not a constant read inside, because otherwise this
+/// composition — "build THAT url, then fetch and parse it" — has no observable
+/// behaviour short of a real request to GitHub, and a body replaced with an
+/// empty list would leave `check_for_update` reporting "up to date" forever on
+/// every installed copy while the whole suite stayed green.
+pub fn fetch_releases(base: &str, owner: &str, repo: &str) -> Result<Vec<RawRelease>, String> {
+    fetch_releases_at(&releases_api_url_at(base, owner, repo))
 }
 
 /// The URL-targetable core of [`fetch_releases`]: issue the redirect-forbidden,
@@ -261,7 +303,7 @@ pub fn fetch_releases(owner: &str, repo: &str) -> Result<Vec<RawRelease>, String
 /// list. Split out so the request/parse path can be unit-tested against a local
 /// mock server (no real network).
 fn fetch_releases_at(url: &str) -> Result<Vec<RawRelease>, String> {
-    let releases = ureq::get(url)
+    let mut response = ureq::get(url)
         // The API answers 200 directly, so forbid redirects (no off-GitHub
         // bounce to forged JSON that would steer the asset URLs the updater
         // trusts up to the minisign check) + a timeout (anti-hang).
@@ -275,11 +317,28 @@ fn fetch_releases_at(url: &str) -> Result<Vec<RawRelease>, String> {
         .header("X-GitHub-Api-Version", GITHUB_API_VERSION)
         .header("Cache-Control", "no-cache")
         .call()
-        .map_err(map_github_error)?
+        .map_err(map_github_error)?;
+    // With `max_redirects(0)` the client does NOT follow the 3xx — it hands the
+    // redirect response back verbatim, which is exactly the security posture we
+    // want. But an unhandled 3xx then falls through to `read_json` and surfaces
+    // as "failed to parse releases JSON", masking the real cause behind a
+    // parse error. That masking is not hypothetical: it is what a repository
+    // RENAME looks like from here (GitHub 301s a former name to the numeric
+    // `/repositories/{id}/…` form), and it made a wholly-broken update check
+    // read as a malformed-response blip. Name it instead — the check still
+    // refuses to follow, it just says why.
+    if response.status().is_redirection() {
+        return Err(format!(
+            "update check failed: the releases API answered {} (a redirect, which is \
+             deliberately not followed). The repository may have been renamed or moved — \
+             the update coordinates need updating.",
+            response.status().as_u16()
+        ));
+    }
+    response
         .body_mut()
         .read_json::<Vec<RawRelease>>()
-        .map_err(|e| format!("failed to parse releases JSON: {e}"))?;
-    Ok(releases)
+        .map_err(|e| format!("failed to parse releases JSON: {e}"))
 }
 
 /// Friendly mapping for a GitHub API transport/status error. A 403/429 on the
@@ -360,7 +419,7 @@ pub fn check_for_update(
     current: &semver::Version,
     target: &str,
 ) -> Result<UpdateOutcome, String> {
-    let releases = fetch_releases(owner, repo)?;
+    let releases = fetch_releases(GITHUB_API_BASE, owner, repo)?;
     // Discovery: which release (if any) is even newer than us?
     let Some((latest, raw)) = pick_highest_stable(&releases) else {
         // No parseable stable release at all — silent "up to date".
@@ -499,9 +558,22 @@ fn resolve_tier1_update(
 }
 
 /// Resolve a manifest asset's per-asset `.minisig` + `.sha256` sidecar URLs from
-/// the release asset list (the manifest does not enumerate the sidecars; they
-/// are kept as defense-in-depth). A missing sidecar is a malformed release —
-/// fail-closed `Err`.
+/// the release asset list (the manifest does not enumerate the sidecars).
+///
+/// The `.minisig` is REQUIRED — a manifest asset with no signature in the
+/// release is a malformed release, fail-closed `Err`.
+///
+/// The `.sha256` is OPTIONAL, and an ABSENT one yields an EMPTY url rather than
+/// an error. That is NOT a relaxation of the integrity check: every
+/// [`ReleaseInfo`] carries `pinned_sha256`, taken from the `latest.json`
+/// manifest that was ITSELF minisign-verified against the embedded key before
+/// any of this ran, so the download is always bound to a SIGNED digest. The
+/// per-artifact `.sha256` was only ever an UNSIGNED defense-in-depth
+/// cross-check, and releases from v0.4.63 on publish one SIGNED aggregate
+/// `SHA256SUMS` instead of N unsigned per-artifact sidecars. When a release DOES
+/// still enumerate the sidecar it is fetched and must still AGREE with the
+/// pinned digest (see [`resolve_expected_sha`]) — the check is relaxed only for
+/// a release that deliberately omits it, never for one that ships a wrong one.
 fn sidecar_urls(raw: &RawRelease, asset_name: &str) -> Result<(String, String), String> {
     let url_of = |name: &str| -> Option<String> {
         raw.assets
@@ -514,10 +586,25 @@ fn sidecar_urls(raw: &RawRelease, asset_name: &str) -> Result<(String, String), 
     let sig_url = url_of(&sig_name).ok_or_else(|| {
         format!("manifest asset {asset_name:?} is missing its .minisig sidecar in the release — refusing")
     })?;
-    let sha_url = url_of(&sha_name).ok_or_else(|| {
-        format!("manifest asset {asset_name:?} is missing its .sha256 sidecar in the release — refusing")
-    })?;
+    // Empty == "the release does not enumerate this sidecar" (see doc above).
+    let sha_url = url_of(&sha_name).unwrap_or_default();
     Ok((sig_url, sha_url))
+}
+
+/// Fetch a per-artifact `.sha256` sidecar that MAY be absent.
+///
+/// An EMPTY `url` means the release does not enumerate the sidecar; return
+/// `Ok(None)` WITHOUT touching the network. A present url is fetched over the
+/// same https/host-confined, size-capped path as every other sidecar and must
+/// parse as UTF-8.
+fn fetch_optional_sha_sidecar(url: &str) -> Result<Option<String>, String> {
+    if url.trim().is_empty() {
+        return Ok(None);
+    }
+    let bytes = download_small(url)?;
+    let text =
+        String::from_utf8(bytes).map_err(|e| format!("sha256 sidecar is not valid UTF-8: {e}"))?;
+    Ok(Some(text))
 }
 
 /// Build the download plumbing for a Tier-1 update: the SIGNED archive url from
@@ -586,12 +673,18 @@ fn build_tier1_installer(
 /// Resolve the expected SHA-256 the downloaded artifact is verified against.
 ///
 /// The `pinned` (signed-manifest) digest is AUTHORITATIVE; the `.sha256` sidecar
-/// is kept as defense-in-depth and MUST AGREE with it — a disagreement is a
-/// tampered sidecar or a manifest/asset mismatch and is refused (fail-closed).
-/// Comparison is case-insensitive and whitespace-trimmed (hex digests). The
-/// pinned (manifest) value is returned, so the load-bearing digest is always the
-/// signed one.
-fn resolve_expected_sha<'a>(pinned: &'a str, sidecar: &str) -> Result<&'a str, String> {
+/// is kept as defense-in-depth and, WHEN PRESENT, MUST AGREE with it — a
+/// disagreement is a tampered sidecar or a manifest/asset mismatch and is
+/// refused (fail-closed). `None` means the release does not publish a
+/// per-artifact sidecar (v0.4.63+ ship one SIGNED aggregate `SHA256SUMS`
+/// instead); the pinned digest then stands alone, which is the SIGNED value and
+/// therefore the stronger of the two. Comparison is case-insensitive and
+/// whitespace-trimmed (hex digests). The pinned (manifest) value is always what
+/// is returned, so the load-bearing digest is always the signed one.
+fn resolve_expected_sha<'a>(pinned: &'a str, sidecar: Option<&str>) -> Result<&'a str, String> {
+    let Some(sidecar) = sidecar else {
+        return Ok(pinned.trim());
+    };
     if pinned.trim().eq_ignore_ascii_case(sidecar.trim()) {
         Ok(pinned.trim())
     } else {
@@ -896,15 +989,17 @@ fn download_verify_installer_inner(
 
     let exe_bytes = download_asset(&installer.url, progress)?;
     let sig_bytes = download_small(&installer.sig_url)?;
-    let sha_text = download_small(&installer.sha_url)?;
-
-    let sha_str = String::from_utf8(sha_text)
-        .map_err(|e| format!("sha256 sidecar is not valid UTF-8: {e}"))?;
-    let sidecar_sha = sha_str
-        .split_whitespace()
-        .next()
-        .ok_or_else(|| "sha256 sidecar was empty".to_string())?;
-    // The manifest's SIGNED digest is authoritative; the sidecar must AGREE.
+    // OPTIONAL: absent in v0.4.63+ releases (one signed SHA256SUMS instead).
+    let sha_str = fetch_optional_sha_sidecar(&installer.sha_url)?;
+    let sidecar_sha = match sha_str.as_deref() {
+        Some(s) => Some(
+            s.split_whitespace()
+                .next()
+                .ok_or_else(|| "sha256 sidecar was empty".to_string())?,
+        ),
+        None => None,
+    };
+    // The manifest's SIGNED digest is authoritative; a PRESENT sidecar must AGREE.
     let expected_sha = resolve_expected_sha(&installer.pinned_sha256, sidecar_sha)?;
     let sig_str =
         String::from_utf8(sig_bytes).map_err(|e| format!("minisig is not valid UTF-8: {e}"))?;
@@ -926,23 +1021,28 @@ fn download_verify_extract_inner(
 ) -> Result<PathBuf, String> {
     fs::create_dir_all(staging_dir).map_err(|e| format!("failed to create staging dir: {e}"))?;
 
-    // Big asset (streamed for progress) + the two tiny sidecars.
+    // Big asset (streamed for progress) + the REQUIRED signature + the OPTIONAL
+    // checksum sidecar (absent in v0.4.63+ releases, which publish one signed
+    // aggregate SHA256SUMS instead of N unsigned per-artifact `.sha256`).
     let asset_bytes = download_asset(&info.asset_url, progress)?;
     let sig_bytes = download_small(&info.sig_url)?;
-    let sha_text = download_small(&info.sha_url)?;
+    let sha_str = fetch_optional_sha_sidecar(&info.sha_url)?;
 
     // The .sha256 sidecar is text — either a bare hex digest or the
     // `<hex>  <filename>` `sha256sum` form. Take the first whitespace token.
-    let sha_str = String::from_utf8(sha_text)
-        .map_err(|e| format!("sha256 sidecar is not valid UTF-8: {e}"))?;
-    let sidecar_sha = sha_str
-        .split_whitespace()
-        .next()
-        .ok_or_else(|| "sha256 sidecar was empty".to_string())?;
+    let sidecar_sha = match sha_str.as_deref() {
+        Some(s) => Some(
+            s.split_whitespace()
+                .next()
+                .ok_or_else(|| "sha256 sidecar was empty".to_string())?,
+        ),
+        None => None,
+    };
 
-    // The manifest's SIGNED digest is authoritative and the sidecar must AGREE
-    // (defense-in-depth — a disagreement fails closed). Every `ReleaseInfo`
-    // carries a pin, so the download is always bound to the signed hash.
+    // The manifest's SIGNED digest is authoritative and a PRESENT sidecar must
+    // AGREE (defense-in-depth — a disagreement fails closed). Every
+    // `ReleaseInfo` carries a pin, so the download is ALWAYS bound to the signed
+    // hash whether or not the unsigned sidecar exists.
     let expected_sha = resolve_expected_sha(&info.pinned_sha256, sidecar_sha)?;
 
     let sig_str =
@@ -1431,19 +1531,87 @@ mod tests {
         assert!(err.contains("missing its .minisig sidecar"), "got: {err}");
     }
 
+    #[test]
+    fn build_info_tolerates_an_absent_sha256_sidecar() {
+        // v0.4.63+ releases publish ONE signed aggregate SHA256SUMS instead of a
+        // per-artifact `.sha256`. The archive is still bound to the SIGNED
+        // manifest digest, so an absent `.sha256` must resolve (empty url =
+        // "not enumerated"), NOT fail closed the way an absent `.minisig` does.
+        let mut raw = raw_release("v0.5.0", "0.5.0");
+        raw.assets
+            .retain(|a| a.name != "scr1b3-x86_64-unknown-linux-gnu.tar.gz.sha256");
+        let cand = semver::Version::parse("0.5.0").unwrap();
+        let m = tier1_manifest("0.5.0", 5000, FUTURE);
+        let masset = manifest_asset(
+            "x86_64-unknown-linux-gnu",
+            "tar.gz",
+            "scr1b3-x86_64-unknown-linux-gnu.tar.gz",
+            "2222bbbb",
+        );
+        let info =
+            build_tier1_release_info(&raw, &m, &masset, &cand, 5000, "x86_64-unknown-linux-gnu")
+                .expect("an absent .sha256 sidecar must be tolerated");
+        assert!(info.sha_url.is_empty(), "got: {:?}", info.sha_url);
+        assert!(
+            info.sig_url
+                .ends_with("scr1b3-x86_64-unknown-linux-gnu.tar.gz.minisig"),
+            "the .minisig binding must survive: {:?}",
+            info.sig_url
+        );
+        assert_eq!(info.pinned_sha256, "2222bbbb");
+    }
+
+    #[test]
+    fn optional_sha_sidecar_is_not_fetched_when_absent() {
+        // An empty url must short-circuit BEFORE any network I/O.
+        assert_eq!(fetch_optional_sha_sidecar("").unwrap(), None);
+        assert_eq!(fetch_optional_sha_sidecar("   ").unwrap(), None);
+    }
+
+    #[test]
+    fn optional_sha_sidecar_is_fetched_and_returned_when_present() {
+        // The absent-url test above is, on its own, satisfied by a function
+        // that ALWAYS returns `Ok(None)` — so it pins the short-circuit and
+        // nothing else. This is the other half: a PRESENT url must actually be
+        // fetched and its body handed back, or the updater would silently lose
+        // the sidecar it cross-checks the manifest SHA against.
+        let body = b"2222bbbb  scr1b3-x86_64-unknown-linux-gnu.tar.gz".to_vec();
+        let server = one_shot("200 OK", &[], body.clone());
+        let url = format!("{}/scr1b3.tar.gz.sha256", server.url);
+        assert_eq!(
+            fetch_optional_sha_sidecar(&url).expect("a present sidecar must fetch"),
+            Some(String::from_utf8(body).expect("ascii body")),
+            "a non-empty url must be fetched, never short-circuited to None"
+        );
+        let _ = server.captured();
+    }
+
     // --- resolve_expected_sha (manifest authoritative, sidecar must agree) ---
 
     #[test]
     fn expected_sha_agrees_case_insensitively() {
-        assert_eq!(resolve_expected_sha("ABCDEF", "abcdef").unwrap(), "ABCDEF");
-        assert_eq!(resolve_expected_sha("  dead  ", "dead").unwrap(), "dead");
+        assert_eq!(
+            resolve_expected_sha("ABCDEF", Some("abcdef")).unwrap(),
+            "ABCDEF"
+        );
+        assert_eq!(
+            resolve_expected_sha("  dead  ", Some("dead")).unwrap(),
+            "dead"
+        );
     }
 
     #[test]
     fn expected_sha_disagreement_is_refused() {
-        let err = resolve_expected_sha("aaaa", "bbbb")
+        let err = resolve_expected_sha("aaaa", Some("bbbb"))
             .expect_err("a manifest/sidecar sha disagreement must be refused");
         assert!(err.contains("sha256 disagreement"), "got: {err}");
+    }
+
+    #[test]
+    fn expected_sha_falls_back_to_the_signed_pin_when_absent() {
+        // No sidecar => the SIGNED manifest digest stands alone. It must still
+        // be returned (trimmed) — never an empty/"any hash accepted" value.
+        assert_eq!(resolve_expected_sha("  abc123  ", None).unwrap(), "abc123");
     }
 
     // --- ensure_upgrade (apply-time anti-downgrade) -------------------------
@@ -1763,13 +1931,43 @@ mod tests {
         handle: JoinHandle<Option<CapturedRequest>>,
     }
 
+    /// How long the mock waits for its one client. A real loopback connection
+    /// lands in microseconds, so this is a ~million-fold margin whose only job
+    /// is to make "the request was never issued" terminate.
+    const ACCEPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
     fn one_shot(status_line: &str, extra_headers: &[&str], body: Vec<u8>) -> OneShotServer {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
         let port = listener.local_addr().unwrap().port();
+        listener
+            .set_nonblocking(true)
+            .expect("a pollable listener so the accept below can be bounded");
         let status_line = status_line.to_string();
         let extra: Vec<String> = extra_headers.iter().map(|s| s.to_string()).collect();
         let handle = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().ok()?;
+            // BOUNDED accept. An unbounded one wedges the whole suite the moment
+            // the code under test stops issuing the request — which is exactly
+            // what a mutant that replaces a fetch with a canned value does, and
+            // it turned `fetch_releases_at -> Ok(vec![])` into a mutation-run
+            // TIMEOUT instead of a kill. With a deadline the thread ends, and
+            // `captured()` reports "server handled no request": a clean failure
+            // that says the request was never made.
+            let deadline = std::time::Instant::now() + ACCEPT_TIMEOUT;
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        if std::time::Instant::now() >= deadline {
+                            return None;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(_) => return None,
+                }
+            };
+            // The accepted stream inherits the listener's non-blocking mode on
+            // some platforms; the request read below is a blocking one.
+            stream.set_nonblocking(false).ok()?;
             let mut reader = BufReader::new(stream.try_clone().ok()?);
             let mut start_line = String::new();
             reader.read_line(&mut start_line).ok()?;
@@ -1819,6 +2017,66 @@ mod tests {
     }
 
     #[test]
+    fn releases_api_url_composes_the_documented_shape() {
+        // The shape ADR-0004 publishes as the single outbound surface. Pinned
+        // so a refactor cannot silently move to `/releases/latest` (mutable,
+        // can skip a newer tag) or drop `per_page=100` (would paginate away
+        // older releases).
+        assert_eq!(
+            releases_api_url("o", "r"),
+            "https://api.github.com/repos/o/r/releases?per_page=100"
+        );
+        // The repo segment is interpolated verbatim — a rename is a one-word
+        // change at the call site, never a URL rewrite here.
+        assert!(releases_api_url("46b-ETYKiAL", "SCR1B3").contains("/repos/46b-ETYKiAL/SCR1B3/"));
+    }
+
+    #[test]
+    fn fetch_releases_at_never_follows_a_redirect_to_another_host() {
+        // The redirect ban is a SECURITY control: following a 3xx would let an
+        // off-GitHub bounce serve forged release JSON, steering the asset URLs
+        // the updater trusts all the way up to the minisign check.
+        //
+        // The decoy is the whole test. It is a REAL server on another port
+        // serving a PERFECTLY VALID release list — the payload an attacker
+        // would want us to accept. If anyone ever relaxes `max_redirects`, this
+        // call starts returning that release list and the assertion below
+        // fires. Asserting "it errored" alone would not catch a follow that
+        // happened to fail for some other reason; asserting the decoy's
+        // contents never come back does.
+        let decoy = one_shot(
+            "200 OK",
+            &[],
+            br#"[{"tag_name":"v99.0.0","prerelease":false,"draft":false,
+                 "html_url":"https://evil.example/releases/tag/v99.0.0","assets":[]}]"#
+                .to_vec(),
+        );
+        let server = one_shot(
+            "301 Moved Permanently",
+            &[&format!("Location: {}/repositories/1/releases", decoy.url)],
+            Vec::new(),
+        );
+        let url = format!("{}/repos/o/former-name/releases?per_page=100", server.url);
+        let err = fetch_releases_at(&url).expect_err("a redirect must never be followed");
+        assert!(
+            !err.contains("v99.0.0"),
+            "the redirect target's payload must never be reached: {err}"
+        );
+
+        // ...and the refusal must NAME itself. A repository RENAME is exactly
+        // this 301, and it used to surface as "failed to parse releases JSON" —
+        // a wholly-broken update check reading as a malformed-response blip.
+        assert!(
+            err.contains("redirect"),
+            "the refusal must say it refused a redirect, not masquerade as a parse error: {err}"
+        );
+        assert!(
+            !err.contains("failed to parse releases JSON"),
+            "a 3xx must be named, never masked by the JSON parse error: {err}"
+        );
+    }
+
+    #[test]
     fn fetch_releases_at_parses_a_release_list_and_sends_freshness_headers() {
         let json = br#"[
             {"tag_name":"v0.4.0","prerelease":false,"draft":false,
@@ -1845,6 +2103,50 @@ mod tests {
             Some(GITHUB_API_VERSION)
         );
         assert!(!req.start_line.contains("&t=") && !req.start_line.contains("?t="));
+    }
+
+    #[test]
+    fn fetch_releases_composes_the_api_url_then_returns_what_it_fetched() {
+        // `fetch_releases` is the composition the updater actually calls: build
+        // the releases URL for (owner, repo), fetch it, hand back the parsed
+        // list. Both halves were separately tested and the JOIN between them was
+        // not, so replacing the body with `Ok(vec![])` left every assertion
+        // green while `check_for_update` saw no releases, took the
+        // "no parseable stable release at all" branch, and reported UpToDate
+        // forever — every installed copy silently stops updating.
+        //
+        // It was untestable because the API origin was baked into the composer,
+        // so the only way to exercise it was a real request to api.github.com.
+        // Threading the base through as a parameter is what makes the loopback
+        // mock reachable; a network call here would be flaky and is not an
+        // option. Kills the `fetch_releases -> Ok(vec![])` mutant.
+        let json = br#"[
+            {"tag_name":"v9.9.9","prerelease":false,"draft":false,
+             "html_url":"https://example.invalid/r/tag/v9.9.9","assets":[]}
+        ]"#
+        .to_vec();
+        let server = one_shot("200 OK", &[], json);
+        let releases =
+            fetch_releases(&server.url, "o", "r").expect("the mock serves a valid release list");
+        assert_eq!(
+            releases.len(),
+            1,
+            "the FETCHED list must come back, not an empty stand-in"
+        );
+        assert_eq!(releases[0].tag_name, "v9.9.9");
+
+        // And it must have gone to the composed path. This is the leg the doc
+        // comment on `releases_api_url` calls load-bearing: a stale repo name
+        // here makes GitHub answer 301 to the numeric `/repositories/{id}/…`
+        // form, which the redirect ban then turns into a hard failure for every
+        // installed copy.
+        let req = server.captured();
+        assert!(
+            req.start_line
+                .starts_with("GET /repos/o/r/releases?per_page=100"),
+            "the composed request path must be the documented shape, got {:?}",
+            req.start_line
+        );
     }
 
     #[test]

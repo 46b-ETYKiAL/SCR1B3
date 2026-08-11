@@ -79,6 +79,113 @@ pub(super) fn minimap_geometry(scroll: (f32, f32, f32), panel_h: f32, drawn_h: f
     }
 }
 
+/// A vertical lane of the minimap's overview ruler.
+///
+/// Each decoration class owns its own lane so a search hit can never hide an
+/// error, and an error can never hide a change — the failure mode of painting
+/// them all in one strip is that the marker you most needed to see is the one
+/// that got overdrawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum MarkLane {
+    /// Lines edited this session. Left edge — the same side as the gutter change
+    /// bar it mirrors, so the eye reads them as the same information.
+    Change,
+    /// Live find-bar matches. Centre.
+    Search,
+    /// LSP diagnostics for the active document. Right edge.
+    Error,
+}
+
+/// Horizontal geometry `(x_offset_from_panel_left, width)` of `lane` in a panel
+/// `width` px wide.
+///
+/// Proportional with a clamp, because the minimap is user-resizable across
+/// `48..=260` px (`width_range`): a fixed pixel width is either invisible at
+/// 260 or eats the whole strip at 48.
+pub(super) fn mark_lane(width: f32, lane: MarkLane) -> (f32, f32) {
+    let w = (width * 0.12).clamp(2.0, 6.0);
+    let x = match lane {
+        MarkLane::Change => 0.0,
+        MarkLane::Search => ((width - w) * 0.5).max(0.0),
+        MarkLane::Error => (width - w).max(0.0),
+    };
+    (x, w.min(width.max(0.0)))
+}
+
+/// Panel-local Y of the overview mark for 0-based `line`.
+///
+/// Uses the SAME transform the minimap content is painted with — the galley is
+/// drawn at `rect.top() + map_offset` with height `drawn_h` — so a mark sits over
+/// the row it describes rather than floating near it. That shared-scale
+/// discipline is the same invariant [`minimap_geometry`] exists to protect.
+///
+/// Exact when `editor.word_wrap` is OFF, which is the mode the minimap already
+/// documents as one minimap row per logical line. With wrap ON both the editor
+/// and the minimap wrap, so line-fraction is proportional rather than exact —
+/// the same approximation the viewport indicator already makes.
+pub(super) fn mark_y(line: usize, total_lines: usize, drawn_h: f32, map_offset: f32) -> f32 {
+    let total = total_lines.max(1) as f32;
+    let frac = (line as f32 / total).clamp(0.0, 1.0);
+    map_offset + frac * drawn_h
+}
+
+/// Minimum vertical separation between two painted marks, in px. Below this the
+/// two rectangles are the same pixel row and the second adds nothing.
+const MARK_MIN_GAP: f32 = 2.0;
+/// Hard ceiling on painted marks per lane. A 200k-line file with a one-character
+/// search query would otherwise queue a shape per hit and stall the frame; the
+/// merge below normally gets there first, this is the backstop.
+const MARK_MAX_PER_LANE: usize = 512;
+
+/// Collapse marks that would land on the same pixel row, preserving order.
+///
+/// Returns at most [`MARK_MAX_PER_LANE`] entries. `ys` need not be sorted; it is
+/// sorted here because match/diagnostic sources do not guarantee line order.
+pub(super) fn merge_marks(mut ys: Vec<f32>, min_gap: f32) -> Vec<f32> {
+    ys.retain(|y| y.is_finite());
+    ys.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mut out: Vec<f32> = Vec::new();
+    for y in ys {
+        if out.last().is_none_or(|last| y - last >= min_gap) {
+            out.push(y);
+            if out.len() >= MARK_MAX_PER_LANE {
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// 0-based line index of each byte offset in `offsets`, for `text`.
+///
+/// One forward pass over the buffer for the whole batch (offsets are sorted
+/// first), rather than a `text[..off].lines().count()` per offset — that form is
+/// O(n·m) and would re-walk a large document once per search hit.
+pub(super) fn lines_of_offsets(text: &str, offsets: &[usize]) -> Vec<usize> {
+    let mut sorted: Vec<usize> = offsets.to_vec();
+    sorted.sort_unstable();
+    let mut out = Vec::with_capacity(sorted.len());
+    let mut line = 0usize;
+    let mut cursor = 0usize;
+    let bytes = text.as_bytes();
+    for off in sorted {
+        // `sorted` is ascending and `min` is monotone, so `cursor <= off` always
+        // holds and the slice below is never inverted.
+        //
+        // Counted over a slice rather than walked with a `cursor += 1` loop
+        // deliberately: the per-byte form generated a `cursor *= 1` mutant that
+        // pinned `cursor` at 0 and made the `while` non-terminating, so the
+        // mutation gate reported a TIMEOUT no test could ever convert into a
+        // kill. Removing the increment removes the mutant at the source instead
+        // of leaving a hang for a future run to re-pay. Same O(n) single pass.
+        let off = off.min(bytes.len());
+        line += bytes[cursor..off].iter().filter(|&&b| b == b'\n').count();
+        cursor = off;
+        out.push(line);
+    }
+    out
+}
+
 impl ScribeApp {
     /// True when a modal with a focused text field or arrow-key navigation
     /// currently owns the keyboard (#72). The editor-surface completion popup
@@ -100,20 +207,64 @@ impl ScribeApp {
     /// Open the identifier-completion popup for the prefix ending at `char_idx`
     /// in the active buffer. Sources suggestions from the buffer's own words
     /// (zero network / LSP dependency).
+    ///
+    /// A half-typed NOTES sigil wins first. When the caret sits inside an open
+    /// `[[note` or `#tag`, the vault's own titles / tag tree are the candidates
+    /// — the SAME `notes::completion::complete` source the notes-pane search box
+    /// consumes, so the two surfaces can never drift into two recognition rules.
+    /// The buffer-word source is the fallback for ordinary identifiers.
     pub(super) fn open_completion(&mut self, active: usize, char_idx: Option<usize>) {
         let Some(ci) = char_idx else {
             self.completion = None;
             return;
         };
-        let text = &self.tabs[active].text;
-        let byte = char_to_byte(text, ci);
-        let (start, prefix) = crate::editor_features::prefix_before(text, byte);
-        let items = crate::editor_features::word_completions(text, &prefix, 8);
-        self.completion = (!items.is_empty()).then_some(Completion {
-            prefix_start: start,
-            items,
+        // Scope every immutable borrow of `self` so the assignment below is free
+        // to take `&mut self`.
+        let next = {
+            let text = &self.tabs[active].text;
+            let byte = char_to_byte(text, ci);
+            self.notes_sigil_completion(text, byte).or_else(|| {
+                let (start, prefix) = crate::editor_features::prefix_before(text, byte);
+                let items = crate::editor_features::word_completions(text, &prefix, 8);
+                (!items.is_empty()).then_some(Completion {
+                    prefix_start: start,
+                    items,
+                    selected: 0,
+                })
+            })
+        };
+        self.completion = next;
+    }
+
+    /// The `[[note` / `#tag` completion active at `byte` in `text`, if any.
+    ///
+    /// The candidate pools are the live note index's titles and its tag tree —
+    /// the same two pools the notes pane builds. The stored `items` are the
+    /// FINISHED editor text (`[[Title]]` / `#tag`), because `accept_completion`
+    /// splices an item verbatim over `prefix_start..caret`; `notes::completion`
+    /// deliberately leaves that choice to its caller, which is what lets the
+    /// search box expand the same suggestion into `title:"…"` instead.
+    fn notes_sigil_completion(&self, text: &str, byte: usize) -> Option<Completion> {
+        use scribe_core::notes::{completion as notes_completion, tag_tree};
+
+        let tag_pool: Vec<String> =
+            tag_tree::build(self.note_index.iter().map(|d| d.tags.as_slice()))
+                .iter()
+                .map(|n| n.tag.clone())
+                .collect();
+        let title_pool: Vec<String> = self.note_index.iter().map(|d| d.title.clone()).collect();
+        let s = notes_completion::complete(text, byte, &tag_pool, &title_pool, 8)?;
+        Some(Completion {
+            // Already a byte offset, and `accept_completion` re-validates it
+            // against a char boundary before splicing.
+            prefix_start: s.start,
+            items: s
+                .candidates
+                .iter()
+                .map(|c| super::notes_ui::suggestion_chip_label(s.trigger, c))
+                .collect(),
             selected: 0,
-        });
+        })
     }
 
     /// Insert the selected completion, replacing the typed prefix.
@@ -136,7 +287,172 @@ impl ScribeApp {
         if c.prefix_start <= byte && byte <= text.len() && text.is_char_boundary(c.prefix_start) {
             text.replace_range(c.prefix_start..byte, &item);
         }
-        self.tabs[active].edit_gen = self.tabs[active].edit_gen.wrapping_add(1);
+        // The in-place splice above mutates `text` outside the `set_text` seam,
+        // so it owes the buffer the SAME invalidation — not just the `edit_gen`
+        // bump this used to do alone. A bare bump leaves `rope_buf` holding
+        // pre-completion content; if this ever runs on a rope-backed tab the
+        // next write-back restores it over the accepted completion.
+        self.tabs[active].note_text_mutated();
+    }
+
+    /// 0-based lines of the active buffer carrying a change-bar state, as
+    /// `(unsaved, saved)`.
+    ///
+    /// Reads the SAME `change_states` the gutter change bar paints, so the
+    /// overview ruler and the gutter can never disagree about which lines moved.
+    /// Empty when the user has the change bar switched off — one toggle, both
+    /// surfaces. Call [`Self::ensure_change_states`] first.
+    pub(super) fn overview_change_lines(&self) -> (Vec<usize>, Vec<usize>) {
+        if !self.config.editor.show_change_bar || self.active >= self.tabs.len() {
+            return (Vec::new(), Vec::new());
+        }
+        let mut unsaved = Vec::new();
+        let mut saved = Vec::new();
+        for (line, state) in self.tabs[self.active].change_states.iter().enumerate() {
+            match state {
+                crate::change_bar::LineChange::Unsaved => unsaved.push(line),
+                crate::change_bar::LineChange::Saved => saved.push(line),
+                crate::change_bar::LineChange::None => {}
+            }
+        }
+        (unsaved, saved)
+    }
+
+    /// 0-based lines of the active buffer holding a live find-bar match.
+    ///
+    /// Gated on the find bar being OPEN, not merely on the query being non-empty:
+    /// the query string survives closing the bar, and leaving its marks painted
+    /// afterwards would show hits for a search the user has finished with.
+    pub(super) fn overview_search_lines(&self) -> Vec<usize> {
+        if !self.find_open || self.active >= self.tabs.len() {
+            return Vec::new();
+        }
+        let matches = self.find_matches_active();
+        if matches.is_empty() {
+            return Vec::new();
+        }
+        let offsets: Vec<usize> = matches.iter().map(|m| m.start).collect();
+        lines_of_offsets(&self.tabs[self.active].text, &offsets)
+    }
+
+    /// `(0-based line, LSP severity)` for every error/warning diagnostic that
+    /// belongs to the ACTIVE document.
+    ///
+    /// The uri filter is load-bearing: `self.diagnostics` is whatever the server
+    /// last published, which after a tab switch is still the PREVIOUS file's
+    /// diagnostics. Painting those over this document would mark lines that have
+    /// nothing wrong with them. Info/hint (severity 3/4) are dropped — an
+    /// overview ruler is a "where is the damage" instrument, and hint noise is
+    /// what makes people stop trusting one.
+    pub(super) fn overview_error_lines(&self) -> Vec<(usize, u8)> {
+        if self.diagnostics.is_empty() || self.active >= self.tabs.len() {
+            return Vec::new();
+        }
+        let Some(uri) = self.tabs[self.active].doc.path().map(path_to_uri) else {
+            return Vec::new();
+        };
+        self.diagnostics
+            .iter()
+            .filter(|d| d.uri == uri && (d.severity == 1 || d.severity == 2))
+            .map(|d| (d.line as usize, d.severity))
+            .collect()
+    }
+
+    /// Paint the overview-ruler marks (changes / search hits / diagnostics) over
+    /// the minimap content.
+    ///
+    /// Drawn AFTER the viewport indicator so a mark inside the current viewport
+    /// stays readable through the indicator's translucent fill — the marks are
+    /// the navigation signal, the indicator is context.
+    fn paint_overview_marks(
+        &self,
+        painter: &egui::Painter,
+        rect: egui::Rect,
+        drawn_h: f32,
+        map_offset: f32,
+        total_lines: usize,
+    ) {
+        let width = rect.width();
+        let lane = |lane: MarkLane, lines: Vec<usize>, color: Color32| {
+            if lines.is_empty() {
+                return;
+            }
+            let (dx, w) = mark_lane(width, lane);
+            let ys = merge_marks(
+                lines
+                    .into_iter()
+                    .map(|l| mark_y(l, total_lines, drawn_h, map_offset))
+                    .collect(),
+                MARK_MIN_GAP,
+            );
+            for y in ys {
+                let top = rect.top() + y;
+                // Skip marks scrolled outside the panel in the co-scrolling
+                // huge-file regime; the painter clips, but not queueing the shape
+                // at all is what keeps a 200k-line file cheap.
+                if top < rect.top() - 2.0 || top > rect.bottom() + 2.0 {
+                    continue;
+                }
+                painter.rect_filled(
+                    egui::Rect::from_min_size(
+                        egui::pos2(rect.left() + dx, top),
+                        egui::vec2(w, MARK_MIN_GAP),
+                    ),
+                    0.0,
+                    color,
+                );
+            }
+        };
+
+        let (unsaved, saved) = self.overview_change_lines();
+        lane(
+            MarkLane::Change,
+            saved,
+            ui_color(
+                &self.theme,
+                "change_bar_saved",
+                Rgba::new(0x6f, 0xb8, 0x9a, 255),
+            ),
+        );
+        lane(
+            MarkLane::Change,
+            unsaved,
+            ui_color(
+                &self.theme,
+                "change_bar_unsaved",
+                Rgba::new(0xf2, 0xb3, 0x3d, 255),
+            ),
+        );
+        lane(
+            MarkLane::Search,
+            self.overview_search_lines(),
+            ui_color(
+                &self.theme,
+                "minimap_search",
+                Rgba::new(0xd8, 0xc7, 0x4a, 255),
+            ),
+        );
+        let diagnostics = self.overview_error_lines();
+        lane(
+            MarkLane::Error,
+            diagnostics
+                .iter()
+                .filter(|(_, sev)| *sev == 2)
+                .map(|(l, _)| *l)
+                .collect(),
+            ui_color(&self.theme, "warning", Rgba::new(0xfb, 0xbf, 0x24, 255)),
+        );
+        // Errors last so a line that carries both an error and a warning reads
+        // as the error.
+        lane(
+            MarkLane::Error,
+            diagnostics
+                .iter()
+                .filter(|(_, sev)| *sev == 1)
+                .map(|(l, _)| *l)
+                .collect(),
+            ui_color(&self.theme, "error", Rgba::new(0xe0, 0x5c, 0x5c, 255)),
+        );
     }
 
     /// Render the minimap strip (rightmost): a memoized fit-to-height overview of
@@ -151,6 +467,11 @@ impl ScribeApp {
     /// natural height while the indicator carried an extra `* scale` factor, so for
     /// any document taller than the panel the highlight sat over the wrong rows.
     pub(super) fn show_minimap(&mut self, ctx: &egui::Context, panel: Color32, accent: Color32) {
+        // The overview ruler paints the change lane from the SAME cache the
+        // gutter change bar uses. `frame_tick` refreshes it further down the
+        // frame, so without this the minimap would trail the gutter by one edit.
+        let active = self.active;
+        self.ensure_change_states(active);
         egui::SidePanel::right("minimap")
             // #86 — the Map view is now user-resizable (was a fixed exact_width).
             // The minimap galley re-lays out to `available_size` each frame, so
@@ -282,6 +603,17 @@ impl ScribeApp {
                     2.0,
                     Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 40),
                 );
+                // (6b) Overview-ruler decorations: changes, find hits, and LSP
+                // errors as marks in three non-overlapping lanes, so a long
+                // document is navigable without scrolling to look for them.
+                // Shares `drawn_h` + `map_offset` with the content above, so a
+                // mark sits over the row it describes.
+                // The MEMOIZED line count (keyed on edit_gen + doc_id), not a
+                // fresh `lines().count()` — that is an O(n) walk of the whole
+                // buffer, and paying it every frame is exactly the per-frame
+                // cost this file's other caches exist to avoid.
+                let total_lines = self.doc_counts_active(self.active).0.max(1);
+                self.paint_overview_marks(&painter, rect, drawn_h, geom.map_offset, total_lines);
                 // (7) Click/drag → scroll the editor. P3: a drag that BEGINS on the
                 // indicator box grabs it and moves by pointer delta (mapped through
                 // the shared scale); a press elsewhere is an absolute scrub that
@@ -381,6 +713,407 @@ impl ScribeApp {
                     .layouter(&mut layouter);
                 ui.add_sized(ui.available_size(), editor);
             });
+    }
+}
+
+#[cfg(test)]
+mod overview_mark_tests {
+    use super::{
+        lines_of_offsets, mark_lane, mark_y, merge_marks, minimap_geometry, MarkLane,
+        MARK_MAX_PER_LANE, MARK_MIN_GAP,
+    };
+
+    const EPS: f32 = 1e-3;
+
+    #[test]
+    fn a_mark_sits_over_the_row_it_describes() {
+        // The load-bearing accuracy invariant, mirroring the one
+        // `minimap_geometry` protects: the mark transform and the CONTENT
+        // transform must be the same one. The content galley is painted at
+        // `rect.top() + map_offset` with height `drawn_h`, so line L must land
+        // at `map_offset + (L/total) * drawn_h` — nothing else.
+        let (total, drawn_h) = (1000usize, 700.0_f32);
+        for line in [0usize, 1, 250, 500, 999] {
+            let y = mark_y(line, total, drawn_h, 0.0);
+            assert!(
+                (y - (line as f32 / total as f32) * drawn_h).abs() < EPS,
+                "line {line} mapped to {y}, which is not its fraction of the drawn content"
+            );
+        }
+        // Halfway down a 1000-line document is halfway down the drawn map.
+        assert!((mark_y(500, 1000, 700.0, 0.0) - 350.0).abs() < EPS);
+    }
+
+    #[test]
+    fn marks_co_scroll_with_the_content_on_a_huge_file() {
+        // In the proportional-slider regime the content is translated by
+        // `map_offset`; a mark that ignored it would drift off its row by the
+        // full scroll distance — the exact bug class `minimap_geometry`'s
+        // history records.
+        let panel_h = 700.0;
+        let drawn_h = 2_100.0;
+        let content_h = 200_000.0;
+        let view_h = 800.0;
+        let geom = minimap_geometry(
+            ((content_h - view_h) * 0.5, content_h, view_h),
+            panel_h,
+            drawn_h,
+        );
+        assert!(
+            geom.map_offset < 0.0,
+            "this fixture must be the co-scroll regime"
+        );
+        let unscrolled = mark_y(5_000, 10_000, drawn_h, 0.0);
+        let scrolled = mark_y(5_000, 10_000, drawn_h, geom.map_offset);
+        assert!(
+            (scrolled - (unscrolled + geom.map_offset)).abs() < EPS,
+            "a mark must be translated by exactly the content's map_offset"
+        );
+    }
+
+    #[test]
+    fn mark_y_clamps_a_line_past_the_end_of_the_document() {
+        // A diagnostic can outlive the edit that shortened the buffer; an
+        // out-of-range line must clamp to the bottom, never paint off-panel at
+        // an unbounded Y.
+        let y = mark_y(9_999, 100, 700.0, 0.0);
+        assert!(
+            (y - 700.0).abs() < EPS,
+            "an out-of-range line must clamp, got {y}"
+        );
+        // And an empty document must not divide by zero.
+        assert!(mark_y(0, 0, 700.0, 0.0).is_finite());
+    }
+
+    #[test]
+    fn the_three_lanes_never_overlap_at_any_supported_panel_width() {
+        // The minimap is user-resizable over `width_range(48.0..=260.0)`. If two
+        // lanes overlap at some width, one decoration class silently overpaints
+        // another — an error hidden behind a search hit is the failure this
+        // separation exists to prevent.
+        for w in [48.0_f32, 60.0, 110.0, 180.0, 260.0] {
+            let (cx, cw) = mark_lane(w, MarkLane::Change);
+            let (sx, sw) = mark_lane(w, MarkLane::Search);
+            let (ex, ew) = mark_lane(w, MarkLane::Error);
+            assert!(cx + cw <= sx + EPS, "change/search overlap at width {w}");
+            assert!(sx + sw <= ex + EPS, "search/error overlap at width {w}");
+            assert!(cx >= 0.0, "change lane starts off-panel at width {w}");
+            assert!(
+                ex + ew <= w + EPS,
+                "error lane runs past the panel edge at width {w}"
+            );
+            for lane_w in [cw, sw, ew] {
+                assert!(
+                    lane_w >= 2.0,
+                    "a sub-2px lane is invisible; got {lane_w} at width {w}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn merge_marks_collapses_the_same_pixel_row_and_keeps_distinct_ones() {
+        // Dense hits in one pixel row.
+        let merged = merge_marks(vec![10.0, 10.4, 10.9, 11.5], MARK_MIN_GAP);
+        assert_eq!(merged, vec![10.0], "one pixel row must yield one mark");
+        // Rows further apart than the gap all survive, in order.
+        let merged = merge_marks(vec![30.0, 10.0, 20.0], MARK_MIN_GAP);
+        assert_eq!(
+            merged,
+            vec![10.0, 20.0, 30.0],
+            "distinct rows must survive and come back sorted"
+        );
+    }
+
+    #[test]
+    fn merge_marks_bounds_the_shape_count_on_a_pathological_document() {
+        // A one-character query over a 200k-line file. Without the cap this
+        // queues a shape per hit and stalls the frame.
+        let ys: Vec<f32> = (0..200_000).map(|i| i as f32 * 100.0).collect();
+        let merged = merge_marks(ys, MARK_MIN_GAP);
+        assert_eq!(
+            merged.len(),
+            MARK_MAX_PER_LANE,
+            "the per-lane cap must bound the painted shapes"
+        );
+    }
+
+    #[test]
+    fn merge_marks_drops_non_finite_values_instead_of_poisoning_the_sort() {
+        // A NaN reaches the sort comparator as "not orderable"; letting it
+        // through would make the merge order (and therefore the output) depend
+        // on the sort's internal pivot choice.
+        let merged = merge_marks(vec![f32::NAN, 10.0, f32::INFINITY, 40.0], MARK_MIN_GAP);
+        assert_eq!(merged, vec![10.0, 40.0]);
+    }
+
+    #[test]
+    fn lines_of_offsets_maps_byte_offsets_to_their_zero_based_lines() {
+        //          0         1  2                3
+        let text = "alpha\nbeta\n\ndelta\n";
+        // byte offsets of: 'a'lpha, 'b'eta, the empty line, 'd'elta, mid-"delta"
+        let offsets = [0usize, 6, 11, 12, 15];
+        assert_eq!(lines_of_offsets(text, &offsets), vec![0, 1, 2, 3, 3]);
+    }
+
+    #[test]
+    fn lines_of_offsets_is_order_independent_and_clamps_past_the_end() {
+        let text = "a\nb\nc\n";
+        // Unsorted input — search/diagnostic sources do not promise line order.
+        let mut got = lines_of_offsets(text, &[4, 0, 2]);
+        got.sort_unstable();
+        assert_eq!(got, vec![0, 1, 2]);
+        // Past-the-end offset must clamp to the last line, not panic or index out.
+        assert_eq!(lines_of_offsets(text, &[9_999]), vec![3]);
+        assert!(lines_of_offsets("", &[0]) == vec![0]);
+        assert!(lines_of_offsets(text, &[]).is_empty());
+    }
+
+    #[test]
+    fn lines_of_offsets_handles_multibyte_text() {
+        // Byte offsets, not char offsets: a naive char-count walk would report
+        // the wrong line for anything after a non-ASCII character.
+        let text = "日本語\nsecond\n";
+        let second_line_start = "日本語\n".len(); // 10 bytes
+        assert_eq!(lines_of_offsets(text, &[0, second_line_start]), vec![0, 1]);
+    }
+
+    #[test]
+    fn mark_lane_widths_are_twelve_percent_clamped_and_the_lanes_sit_where_documented() {
+        // The non-overlap test above can never fail for any `w` inside the
+        // 2..=6 clamp band, so it passes on `width + 0.12` and `width / 0.12`
+        // alike. Pin the VALUES: the width is 12% of the panel under a 2..=6
+        // clamp, Change is flush left, Search is CENTRED, Error is flush right.
+        // (`width, expected lane width`)
+        for (width, want_w) in [
+            (16.0_f32, 2.0_f32), // 12% = 1.92 -> clamped UP to the 2px floor.
+            //                      Below the 48px minimum panel, so this row
+            //                      pins totality rather than a reachable state.
+            (48.0, 5.76), // narrowest real panel; 12% sits inside the band
+            (50.0, 6.0),  // 12% == 6.0, exactly on the ceiling
+            (260.0, 6.0), // widest real panel; 12% = 31.2 -> clamped DOWN
+        ] {
+            let (cx, cw) = mark_lane(width, MarkLane::Change);
+            let (sx, sw) = mark_lane(width, MarkLane::Search);
+            let (ex, ew) = mark_lane(width, MarkLane::Error);
+
+            for (name, w) in [("change", cw), ("search", sw), ("error", ew)] {
+                assert!(
+                    (w - want_w).abs() < EPS,
+                    "{name} lane width at panel {width}: want {want_w}, got {w}"
+                );
+            }
+            assert!(
+                (cx - 0.0).abs() < EPS,
+                "change lane must be flush left at {width}"
+            );
+            assert!(
+                ((sx + sw * 0.5) - width * 0.5).abs() < EPS,
+                "search lane must be CENTRED at {width}: x={sx} w={sw}"
+            );
+            assert!(
+                ((ex + ew) - width).abs() < EPS,
+                "error lane must be flush right at {width}: x={ex} w={ew}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod overview_source_tests {
+    use super::super::*;
+    use crate::app::ScribeApp;
+    use scribe_core::Config;
+
+    #[test]
+    fn change_marks_report_the_same_lines_as_the_gutter_change_bar() {
+        let mut app = ScribeApp::new_test(Config::default());
+        app.config.editor.show_change_bar = true;
+        app.tabs[0].session_baseline = "a\nb\nc\nd\n".into();
+        app.tabs[0].saved_baseline = "a\nb\nc\nd\n".into();
+        app.tabs[0].set_text("a\nCHANGED\nc\nd\n".to_string());
+        app.tabs[0].change_gen = None;
+        app.ensure_change_states(0);
+        let (unsaved, saved) = app.overview_change_lines();
+        assert_eq!(
+            unsaved,
+            vec![1],
+            "only the edited line may carry an unsaved mark"
+        );
+        assert!(saved.is_empty(), "nothing has been saved this session");
+        // The overview must agree with the gutter, line for line.
+        let gutter: Vec<usize> = app.tabs[0]
+            .change_states
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| **s == crate::change_bar::LineChange::Unsaved)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(unsaved, gutter);
+    }
+
+    #[test]
+    fn change_marks_are_empty_when_the_user_turned_the_change_bar_off() {
+        // One toggle governs both surfaces; an overview lane that ignored it
+        // would resurrect a feature the user switched off.
+        let mut app = ScribeApp::new_test(Config::default());
+        app.config.editor.show_change_bar = true;
+        app.tabs[0].session_baseline = "a\nb\n".into();
+        app.tabs[0].saved_baseline = "a\nb\n".into();
+        app.tabs[0].set_text("a\nZ\n".to_string());
+        app.tabs[0].change_gen = None;
+        app.ensure_change_states(0);
+        assert_eq!(app.overview_change_lines().0, vec![1]);
+        app.config.editor.show_change_bar = false;
+        assert_eq!(
+            app.overview_change_lines(),
+            (Vec::new(), Vec::new()),
+            "the overview must honour the change-bar toggle"
+        );
+    }
+
+    #[test]
+    fn search_marks_track_the_live_find_query() {
+        let mut app = ScribeApp::new_test(Config::default());
+        app.tabs[0].set_text("needle\nhay\nneedle\nhay\n".to_string());
+        app.find_open = true;
+        app.find_query = "needle".to_string();
+        assert_eq!(
+            app.overview_search_lines(),
+            vec![0, 2],
+            "every matching line must get a mark"
+        );
+        app.find_query = "nothing-here".to_string();
+        assert!(
+            app.overview_search_lines().is_empty(),
+            "a query with no hits must mark nothing"
+        );
+    }
+
+    #[test]
+    fn search_marks_disappear_when_the_find_bar_closes() {
+        // `find_query` outlives the bar being closed. Marks that outlived it too
+        // would show hits for a search the user has finished with.
+        let mut app = ScribeApp::new_test(Config::default());
+        app.tabs[0].set_text("needle\nhay\n".to_string());
+        app.find_open = true;
+        app.find_query = "needle".to_string();
+        assert_eq!(app.overview_search_lines(), vec![0]);
+        app.find_open = false;
+        assert!(
+            app.overview_search_lines().is_empty(),
+            "closing the find bar must clear its marks"
+        );
+    }
+
+    #[test]
+    fn error_marks_only_cover_the_active_document() {
+        // `self.diagnostics` holds whatever the server last published — after a
+        // tab switch that is the PREVIOUS file. Painting those here would mark
+        // lines of this document that have nothing wrong with them.
+        let dir = tempfile::tempdir().unwrap();
+        let mine = dir.path().join("mine.rs");
+        std::fs::write(&mine, "fn a() {}\nfn b() {}\nfn c() {}\n").unwrap();
+        let mut app = ScribeApp::new_test(Config::default());
+        app.tabs[0] = EditorTab::from_path(mine.clone()).unwrap();
+        app.active = 0;
+        let mine_uri = path_to_uri(&mine);
+        let other_uri = path_to_uri(&dir.path().join("someone-elses.rs"));
+        app.diagnostics = vec![
+            scribe_core::lsp::protocol::Diagnostic {
+                uri: mine_uri.clone(),
+                line: 1,
+                character: 0,
+                end_line: 1,
+                end_character: 4,
+                severity: 1,
+                message: "boom".into(),
+            },
+            scribe_core::lsp::protocol::Diagnostic {
+                uri: other_uri,
+                line: 2,
+                character: 0,
+                end_line: 2,
+                end_character: 4,
+                severity: 1,
+                message: "not mine".into(),
+            },
+        ];
+        assert_eq!(
+            app.overview_error_lines(),
+            vec![(1, 1)],
+            "only the active document's diagnostics may be marked"
+        );
+    }
+
+    #[test]
+    fn error_marks_keep_errors_and_warnings_and_drop_hint_noise() {
+        let dir = tempfile::tempdir().unwrap();
+        let mine = dir.path().join("mine.rs");
+        std::fs::write(&mine, "a\nb\nc\nd\n").unwrap();
+        let mut app = ScribeApp::new_test(Config::default());
+        app.tabs[0] = EditorTab::from_path(mine.clone()).unwrap();
+        app.active = 0;
+        let uri = path_to_uri(&mine);
+        app.diagnostics = (1u8..=4)
+            .map(|sev| scribe_core::lsp::protocol::Diagnostic {
+                uri: uri.clone(),
+                line: u32::from(sev),
+                character: 0,
+                end_line: u32::from(sev),
+                end_character: 1,
+                severity: sev,
+                message: "m".into(),
+            })
+            .collect();
+        assert_eq!(
+            app.overview_error_lines(),
+            vec![(1, 1), (2, 2)],
+            "errors + warnings are marked; info/hint are ruler noise and are not"
+        );
+    }
+
+    #[test]
+    fn error_marks_are_empty_for_an_unsaved_scratch_buffer() {
+        // No path means no uri means no diagnostic can belong to it. Without the
+        // path guard an empty uri would match and mark a scratch note.
+        let mut app = ScribeApp::new_test(Config::default());
+        app.diagnostics = vec![scribe_core::lsp::protocol::Diagnostic {
+            uri: String::new(),
+            line: 0,
+            character: 0,
+            end_line: 0,
+            end_character: 1,
+            severity: 1,
+            message: "m".into(),
+        }];
+        assert!(app.tabs[0].doc.path().is_none());
+        assert!(app.overview_error_lines().is_empty());
+    }
+
+    #[test]
+    fn overview_error_lines_is_empty_when_the_active_index_is_out_of_range() {
+        // The `||` guard is two guards: the empty-diagnostics half is a pure
+        // fast path (the filter below returns empty anyway), but the
+        // active-out-of-range half is the one that keeps `self.tabs[self.active]`
+        // from panicking. With `&&` the short-circuit inverts and a stale
+        // `active` — the state a tab close leaves behind for one frame — indexes
+        // past the end and takes the whole frame down.
+        let mut app = ScribeApp::new_test(Config::default());
+        app.diagnostics = vec![scribe_core::lsp::protocol::Diagnostic {
+            uri: "file:///nowhere.rs".into(),
+            line: 0,
+            character: 0,
+            end_line: 0,
+            end_character: 0,
+            severity: 1,
+            message: "boom".into(),
+        }];
+        app.active = app.tabs.len(); // out of range, diagnostics NON-empty
+        assert!(
+            app.overview_error_lines().is_empty(),
+            "an out-of-range active index must yield no marks, not a panic"
+        );
     }
 }
 
@@ -527,5 +1260,150 @@ mod minimap_geom_tests {
         // at natural_h ≈ (BASE/MIN) × panel_h.
         let ratio = MINIMAP_BASE_PT / MINIMAP_MIN_PT;
         assert!((ratio - 3.0).abs() < EPS);
+    }
+}
+
+/// Editor `[[note` / `#tag` completion, asserted on the text that is actually
+/// inserted into the buffer.
+///
+/// The candidates come from the VAULT, not the buffer, so a suggestion that
+/// appears nowhere in the open document is proof the notes source is really
+/// wired — a `completion.is_some()` assertion would pass just as happily with
+/// the old buffer-word source still in place.
+#[cfg(test)]
+mod notes_sigil_completion_tests {
+    use crate::app::ScribeApp;
+    use scribe_core::config::Config;
+    use std::path::{Path, PathBuf};
+
+    struct Vault {
+        _root: tempfile::TempDir,
+        path: PathBuf,
+    }
+
+    fn vault() -> Vault {
+        let root = tempfile::tempdir().expect("temp root");
+        let path = root.path().join("vault");
+        std::fs::create_dir_all(&path).expect("vault dir");
+        Vault { _root: root, path }
+    }
+
+    fn app_with_vault(v: &Path) -> ScribeApp {
+        let mut cfg = Config::default();
+        cfg.editor.first_run_completed = true;
+        cfg.notes.vault_dir = Some(v.to_path_buf());
+        let mut app = ScribeApp::new_test(cfg);
+        app.notes_ensure_index();
+        app
+    }
+
+    /// Type `text` into tab 0, open completion at its end, accept the first
+    /// suggestion, and return the resulting buffer.
+    fn complete_at_end(app: &mut ScribeApp, text: &str) -> String {
+        app.tabs[0].text = text.to_string();
+        let ci = text.chars().count();
+        app.open_completion(0, Some(ci));
+        app.accept_completion(0, Some(ci));
+        app.tabs[0].text.clone()
+    }
+
+    #[test]
+    fn an_open_double_bracket_completes_a_vault_note_title_into_a_finished_link() {
+        let v = vault();
+        std::fs::write(v.path.join("Roadmap.md"), "# Roadmap\n\nbody\n").unwrap();
+        let mut app = app_with_vault(&v.path);
+        assert_eq!(
+            app.note_index.len(),
+            1,
+            "precondition: the vault is indexed"
+        );
+
+        assert_eq!(
+            complete_at_end(&mut app, "see [[Road"),
+            "see [[Roadmap]]",
+            "the accepted candidate must replace the whole `[[Road` token with a \
+             CLOSED link — `Roadmap` appears nowhere in the buffer, so this can \
+             only have come from the note index"
+        );
+    }
+
+    #[test]
+    fn an_open_hash_completes_a_vault_tag() {
+        let v = vault();
+        std::fs::write(v.path.join("Work.md"), "# Work\n\n#project/frontend\n").unwrap();
+        let mut app = app_with_vault(&v.path);
+
+        assert_eq!(
+            complete_at_end(&mut app, "note #proj"),
+            "note #project",
+            "the tag tree materialises the `project` ancestor and the sigil is \
+             replaced along with the typed body"
+        );
+    }
+
+    /// An OPEN sigil wins over the buffer-word source even when that source has
+    /// a perfectly good match for the same prefix.
+    ///
+    /// `Roadster` is a buffer word matching `Road`, so with the two sources in
+    /// the other order the user typing `[[Road` would get a bare `Roadster`
+    /// spliced over their `[[` — a broken link, from the wrong pool. Precedence
+    /// is behaviour, not tidiness.
+    #[test]
+    fn an_open_sigil_beats_a_matching_buffer_word() {
+        let v = vault();
+        std::fs::write(v.path.join("Roadmap.md"), "# Roadmap\n").unwrap();
+        let mut app = app_with_vault(&v.path);
+
+        assert_eq!(
+            complete_at_end(&mut app, "Roadster see [[Road"),
+            "Roadster see [[Roadmap]]",
+            "the open `[[` owns the caret; the buffer word `Roadster` must not \
+             claim it"
+        );
+    }
+
+    #[test]
+    fn a_closed_link_is_no_longer_a_sigil_context_and_falls_back_to_buffer_words() {
+        // `[[Roadmap]]` is closed, so the caret is outside it: the notes source
+        // must decline and the ORIGINAL buffer-word source must still run. This
+        // is the regression guard for the fallback the sigil branch now precedes.
+        let v = vault();
+        std::fs::write(v.path.join("Roadmap.md"), "# Roadmap\n").unwrap();
+        let mut app = app_with_vault(&v.path);
+
+        assert_eq!(
+            complete_at_end(&mut app, "banana [[Roadmap]] ban"),
+            "banana [[Roadmap]] banana",
+            "buffer-word completion still works when no sigil is open"
+        );
+    }
+
+    #[test]
+    fn a_sigil_with_no_matching_note_opens_no_popup() {
+        let v = vault();
+        std::fs::write(v.path.join("Roadmap.md"), "# Roadmap\n").unwrap();
+        let mut app = app_with_vault(&v.path);
+        app.tabs[0].text = "see [[zzzz".to_string();
+        app.open_completion(0, Some(10));
+        assert!(
+            app.completion.is_none(),
+            "an unmatched query is no suggestion, not an empty popup"
+        );
+    }
+
+    #[test]
+    fn with_no_vault_the_sigil_branch_is_inert_and_the_word_source_still_serves() {
+        // Empty pools => `notes::completion::complete` yields nothing, so the
+        // fallback must carry the case rather than the popup going dead.
+        let mut cfg = Config::default();
+        cfg.editor.first_run_completed = true;
+        let mut app = ScribeApp::new_test(cfg);
+        assert!(app.config.notes.vault_dir.is_none());
+
+        assert_eq!(
+            complete_at_end(&mut app, "banana ban"),
+            "banana banana",
+            "no vault must not disable identifier completion"
+        );
     }
 }

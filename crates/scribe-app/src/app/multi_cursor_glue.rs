@@ -163,10 +163,17 @@ impl ScribeApp {
             primary = Caret::at(np);
         }
         mc_push_undo_checkpoint(ctx, editor_id, undo_checkpoint);
-        // Parity with the TextEdit edit path: mark the doc dirty and bump the gen
-        // counter so the minimap / spell / change-bar caches refresh.
+        // Parity with the TextEdit edit path: mark the doc dirty and invalidate
+        // every `text`-derived cache. `apply_edit` splices `tabs[active].text`
+        // in place, outside the `set_text` seam, so a bare `edit_gen` bump is
+        // not enough: it refreshes the minimap / spell / change-bar caches but
+        // leaves a stale `rope_buf` alive. In split view `handle_multi_cursor_keys`
+        // is called BEFORE the per-pane rope-vs-TextEdit decision, so nothing
+        // STRUCTURALLY keeps this off a rope-backed pane — only the runtime
+        // focus/`TextEdit::load_state` guards do. `note_text_mutated` removes
+        // the dependency on those guards holding.
         self.tabs[active].doc.mark_dirty();
-        self.tabs[active].edit_gen = self.tabs[active].edit_gen.wrapping_add(1);
+        self.tabs[active].note_text_mutated();
         mc_set_primary(ctx, editor_id, primary.head, primary.head);
         // The carets still index into THIS tab's (now-mutated) buffer; refresh the
         // owner so the tab-scope reconcile keeps them alive next frame.

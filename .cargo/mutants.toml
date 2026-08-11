@@ -11,10 +11,36 @@
 #
 # MIXED files (mod.rs, render_support.rs, text_ops_methods.rs, builtins.rs, …)
 # are DELIBERATELY NOT glob-excluded here: they carry real logic that must stay
-# mutation-gated. Their individual UI-render functions are excluded precisely
-# via `#[cfg_attr(test, mutants::skip)]` on the function, each with an ADR-0007
-# justification — never by a broad file/regex glob that could silently hide a
-# logic gap (a green-that-isn't-green).
+# mutation-gated. Their individual UI-render functions are excluded one at a
+# time by NAME in the `exclude_re` array below, each with an ADR-0007
+# justification — never by a whole-file glob that would silently hide the logic
+# sharing the file (a green-that-isn't-green).
+#
+# This comment previously claimed those functions were excluded "precisely via
+# `#[cfg_attr(test, mutants::skip)]` on the function … never by a broad
+# file/regex glob". That was false in both halves, and is corrected here rather
+# than left describing a mechanism the file does not use. There is not one
+# `mutants::skip` attribute anywhere in this tree (`git grep mutants::skip`
+# returns a single hit, and it is a COMMENT); the exclusions are, and always
+# were, `exclude_re` name tokens — exactly the shape the old text disclaimed.
+# A doc that describes the safe design while the file implements the one it
+# warns against is worse than no doc: it retires the reader's suspicion without
+# retiring the risk.
+#
+# What that means for the two residual risks in the array, and what holds them:
+#
+#   * A bare function-name token is a SUBSTRING match. Every name token below is
+#     `\b`-bounded for that reason, so `\bshow_minimap\b` cannot also swallow a
+#     `show_minimap_legend` added later. Where a bare word is shared across files
+#     (`show`) the token is additionally file-qualified.
+#   * `'<impl eframe::App for ScribeApp>'` is a genuine blanket over every method
+#     of that impl — present AND future. It is kept (all three of
+#     clear_color/save/ui are live-frame/eframe-host only, with no headless
+#     observable), but it is no longer unbounded in time: the test
+#     `the_eframe_app_blanket_pardon_covers_only_the_documented_methods` in
+#     crates/scribe-app/tests/mutation_pardons_are_not_stale.rs pins that impl's
+#     method set, so adding a fourth method turns the suite RED and forces the
+#     pardon decision to be made explicitly instead of inherited.
 
 exclude_globs = [
   # egui/eframe per-frame render + modal painting (no testable logic)
@@ -57,6 +83,52 @@ additional_cargo_test_args = [
 # footgun for ad-hoc local runs.
 test_tool = "nextest"
 
+# HOW TO ANCHOR A PARDON (read before adding one)
+#
+# `exclude_re` is matched against the mutant NAME exactly as `cargo mutants
+# --list` prints it: `path/to/file.rs:LINE:COL: <description>`. Anchor on the
+# DESCRIPTION, never on the LINE.
+#
+# A line number is not a stable key. Any edit ABOVE it slides the anchor onto a
+# different statement, and the pardon then suppresses the wrong mutant — or
+# nothing at all — while still looking like coverage. That is not hypothetical:
+# `text_ops_methods.rs:418` drifted to 423 and landed on a comment;
+# `md_preview.rs:279` slid onto `None => MdBlock::ListItem {` and `:289` onto a
+# doc comment; and the migration pass that wrote this header found EIGHT MORE
+# anchors already matching zero mutants and one (`drag_scroll.rs:189`) silently
+# pardoning an unrelated `page_key_assist` mutant.
+#
+# Get the authoritative description from the tool, not from memory:
+#
+#     cargo mutants --list --no-config --line-col true -f <path/to/file.rs>
+#
+# then regex-escape the description text and use that as the entry.
+#
+# When a bare description would match SEVERAL mutants and over-suppress a
+# neighbour the tests actually kill, pin the mutant's COLUMN and leave the LINE
+# as `\d+` — e.g. `'find_in_files\.rs:\d+:32: replace > with (==|<|>=) in
+# walk_project'`. A column does not move when something ABOVE it is edited, so
+# it closes the VERTICAL half of the rotation class, and the pardon stays
+# exactly as tight as a line anchor was. Over-suppression is worse than
+# rotation: never widen a description to swallow a mutant you did not mean to
+# pardon.
+#
+# A COLUMN IS NOT ROTATION-PROOF. An earlier version of this header claimed the
+# rotation class was "still closed" once the line was wildcarded. It is not:
+# re-indenting the line (wrapping the block in an `if`) or renaming an
+# identifier to the LEFT of the pardoned operator moves the column, and the
+# anchor then matches nothing — or comes to rest on a DIFFERENT operator at the
+# same column and silently pardons the wrong mutant. That is the original
+# `drag_scroll.rs:189` -> `page_key_assist` failure reproduced horizontally.
+#
+# So every pardon that pins a coordinate — LINE-pinned or COLUMN-pinned — must
+# be registered in `POSITIONAL_ANCHORS` in
+# `crates/scribe-app/tests/mutation_pardons_are_not_stale.rs`, together with the
+# source text that must still sit at each pinned column. That test verifies both
+# axes on every run and REJECTS any unregistered coordinate anchor, in any regex
+# spelling (escaped colons, character classes, parenthesised or `\d`-substituted
+# numbers, and a bare `:LINE:COL:` with no filename all classify the same).
+
 # Pardoned mutants (equivalent or untestable — never a floor-lowering shortcut):
 #
 # - `action_log::path -> Option<&'static PathBuf>` body mutants (`-> None`,
@@ -77,6 +149,17 @@ test_tool = "nextest"
 #   telemetry-disabled suppresses) with a capturing sink. The `\(\)` bound matches
 #   the wrapper's whole-body mutant ONLY, never `log_outcome_with` (the `_with`
 #   breaks the ` with ` match). See crates/scribe-app/src/reporting.rs.
+#   FILE-QUALIFIED as of this pass. The justification above reasons entirely
+#   about reporting.rs, but scribe-app has TWO free `fn log_outcome` returning
+#   `()` — reporting.rs:81 (this thin wrapper) and issue_intake.rs:308, which is
+#   NOT a wrapper: it carries its own `S4F3_DISABLE_TELEMETRY` gate and then
+#   calls `action_log::record`. cargo-mutants names free functions bare, so the
+#   old unqualified `'replace log_outcome with \(\)'` matched BOTH and silently
+#   stretched a reporting.rs rationale over an unrelated function. Scoping it to
+#   reporting.rs is a TIGHTENING, not a widening. It may surface a survivor on
+#   issue_intake::log_outcome — that gate is genuinely testable (inject a sink,
+#   as reporting.rs does) and the honest signal is a real test gap, not a
+#   pardon. Do NOT re-broaden this pattern to silence it.
 # - effects.rs CRT/VHS paint functions (6): each takes `ctx: &egui::Context` and
 #   paints directly (`ctx.layer_painter(...).rect_filled/circle_filled/line_segment`);
 #   their internal alpha/phase/drift/position arithmetic is observable ONLY through
@@ -99,15 +182,49 @@ test_tool = "nextest"
 # ONE function in ONE file (no substring/cross-file collision). `show` is
 # file-scoped because the bare word is shared by settings.rs and md_preview.rs.
 exclude_re = [
+  # hit_test.rs `classify`: `caption_height > 0` vs `>= 0` are equivalent.
+  # `classify` early-returns Client unless `geo.client.contains(x, y)`, and
+  # `contains` requires `y >= client.top` — so the third conjunct
+  # `y < client.top + caption_height` already IMPLIES `caption_height > 0`.
+  # The guard is a redundant short-circuit: the two differ only at ch == 0,
+  # where conjunct 3 is false either way. Confirmed empirically over 952,560
+  # classify calls (both modes x caption_height in {-3,-1,0,1,2,34} x 3 client
+  # rects incl. negative/offset tops x maximized x border in {0,1,8} x 3
+  # max-button variants x boundary x/y): byte-identical output.
+  # NOTE: this rests on the `!geo.client.contains(x, y)` early return. If that
+  # guard is ever removed, DROP this pardon — it would start hiding a real bug.
+  'hit_test\.rs.*replace > with >= in classify',
+  # scribe-win32-chrome/src/lib.rs: the `#[cfg(windows)]` thin wrappers that
+  # delegate to `imp`. Not compiled on the ubuntu mutation runner, so 100% of
+  # their mutants are vacuous MISSES no test could ever kill — the same
+  # condition ci.yml already excludes `imp.rs` and `integration/windows.rs` for.
+  # Bounded to `with \(\)` deliberately: each has a `#[cfg(not(windows))]` stub
+  # with an EMPTY body, which generates no `with ()` mutant of its own, so these
+  # patterns cannot reach a compiled definition. The two `-> bool` members of
+  # this family are NOT listed here — their stubs return a real value and DO
+  # generate mutants that are currently caught, so they are re-exported from
+  # `imp.rs` instead (see `the_non_windows_stubs_are_never_mutation_excluded`).
+  'replace set_maximize_button_rect with \(\)',
+  'replace clear_maximize_button_rect with \(\)',
+  'replace set_hit_test_mode with \(\)',
+  'replace set_snap_support_enabled with \(\)',
+  'replace show_system_menu with \(\)',
+  'replace apply_rounded_corners with \(\)',
+  'replace set_backdrop with \(\)',
   "replace path -> Option<&'static PathBuf>",
-  'replace log_outcome with \(\)',
-  "paint_crt_scanlines",
-  "paint_flicker",
-  "paint_vhs_tracking",
-  "paint_wired_mesh",
-  "paint_caret_trail",
-  "paint_boot_glitch",
-  "paint_squiggle",  # render_support.rs spellcheck-underline paint: painter.line_segment only (GPU pixels, no return/observable state) — ADR-0007 egui-paint
+  'reporting\.rs.*replace log_outcome with \(\)',
+  # `\b`-bounded like every other name token in this array. These seven were the
+  # only unbounded SUBSTRINGS left: as a bare `"paint_flicker"` the token would
+  # also have swallowed a `paint_flicker_overlay` added later, pardoning a
+  # function nobody justified. Note the LITERAL quotes — in a TOML *basic*
+  # string `"\b"` is a backspace escape, not a regex word boundary.
+  '\bpaint_crt_scanlines\b',
+  '\bpaint_flicker\b',
+  '\bpaint_vhs_tracking\b',
+  '\bpaint_wired_mesh\b',
+  '\bpaint_caret_trail\b',
+  '\bpaint_boot_glitch\b',
+  '\bpaint_squiggle\b',  # render_support.rs spellcheck-underline paint: painter.line_segment only (GPU pixels, no return/observable state) — ADR-0007 egui-paint
   # settings.rs settings-panel render surfaces
   '\brender_sections\b',
   '\brender_update_status\b',
@@ -171,76 +288,430 @@ exclude_re = [
   # CrashConsentState dialog queue (needs a Report spool fixture + private-field
   # observation). No clean headless observable for the whole-fn no-op (ADR-0007).
   'replace ScribeApp::drain_crash_spool with \(\)',
-  # start_lsp_for_active guard `self.lsp.is_some() && self.lsp_lang == Some(lang)`
-  # (1396:31 && / 1396:59 ==): the is_some() branch is UNREACHABLE-as-true
-  # headlessly — LspClient is only constructed by `LspClient::spawn`, which
-  # launches a live LSP subprocess. The `&&` short-circuits with lsp==None so the
-  # `==` never evaluates either. ADR-0007 (requires a live OS process).
-  'app/mod\.rs:1396:',
+  # start_lsp_for_active guard `self.lsp.is_some() && self.lsp_lang == Some(lang)`:
+  # the is_some() branch is UNREACHABLE-as-true headlessly — LspClient is only
+  # constructed by `LspClient::spawn`, which launches a live LSP subprocess. The
+  # `&&` short-circuits with lsp==None so the `==` never evaluates either.
+  # ADR-0007 (requires a live OS process). Description-anchored: the old
+  # ':1396:' anchor had rotated (the guard now sits ~110 lines lower) and was
+  # matching nothing at all.
+  'replace && with \|\| in ScribeApp::start_lsp_for_active',
+  'replace == with != in ScribeApp::start_lsp_for_active',
   # egui TextFormat struct-field deletes: only change painted-glyph font/colour
   # (ADR-0007). These carry NO `in <fn>` suffix in the match string, so a
   # function-name token cannot catch them — match the field-delete shape.
   # eframe trait methods (clear_color/save/ui): live-frame/eframe-host only.
   '<impl eframe::App for ScribeApp>',
 
-  # Traced EQUIVALENT mutants (unobservable — line-scoped so the surrounding
-  # tested logic in each mixed function stays gated; each line is stable because
-  # every test module sits BELOW these logic lines):
-  'action_log\.rs:59:',             # record() -> process-global first-caller-wins OnceLock cache (see path/log_outcome)
-  'app/builtins\.rs:126:',          # FoldAll active<len: active invariantly clamped to len-1; ==len unreachable
-  'app/drag_scroll\.rs:189:',       # edge_autoscroll boundary: depth 0 both ways -> 0.0
-  'app/drag_scroll\.rs:191:',
-  'app/drag_scroll\.rs:208:',       # caret_edge_nudge boundary: caret==limit -> 0.0 both ways
-  'app/drag_scroll\.rs:210:',
-  'app/file_ops\.rs:47:19:',        # apply_buffer_transform active<len: same invariant as builtins 126
-  'app/mod\.rs:107:',               # tab_index_after_move: idx==src guarded before this line
+  # Traced EQUIVALENT mutants (unobservable). Every entry below is anchored on
+  # the mutant DESCRIPTION printed by `cargo mutants --list`, or — where a bare
+  # description would over-suppress a tested neighbour — on the mutant's COLUMN
+  # with the LINE left as `\d+`. Neither form rotates when code above it moves.
+  # See the "HOW TO ANCHOR A PARDON" header above before adding one.
+  #
+  # action_log record() -> process-global first-caller-wins OnceLock cache
+  # (same argument as `path` / `log_outcome` above):
+  'replace record with \(\)',
+  # execute_builtin `active < len` guards (FoldAll AND SortLines): active is
+  # invariantly clamped to len-1, so ==len is unreachable and the </==/>/<=
+  # variants agree. One description covers BOTH occurrences, which is exactly
+  # the union of the two anchors it replaces (':126:' FoldAll and ':147:27:'
+  # SortLines) — a merge, not a widening. execute_builtin has no other `<`.
+  'replace < with (==|>|<=) in ScribeApp::execute_builtin',
+  # execute_builtin `... && !tab.doc.is_read_only_large()` (skip sort on a huge
+  # read-only buffer): is_read_only_large is true ONLY for files >=
+  # LARGE_FILE_THRESHOLD = 256 MiB, so for every unit-testable buffer it is
+  # false and the `&&`/`||` branches are identical. Only a 256 MiB read-only
+  # file (not unit-feasible) distinguishes them. Sole `&&` in the function.
+  'replace && with \|\| in ScribeApp::execute_builtin',
+  # edge_autoscroll_step over_bottom/over_top boundary: at depth 0 both the
+  # original `>` and the mutated comparison end at t == 0.0 -> 0.0. These are
+  # the function's only `>` comparisons, so the description covers exactly the
+  # pair of lines the old ':189:'/':191:' anchors named (both had rotated —
+  # ':189:' was pardoning an unrelated page_key_assist mutant).
+  'replace > with (==|<|>=) in edge_autoscroll_step',
+  # caret_edge_nudge boundary: at caret==limit both predicates fall through to
+  # the same 0.0. Description-anchored; the old ':208:'/':210:' pair had rotated
+  # onto a blank line and a doc comment.
+  'replace < with <= in caret_edge_nudge',
+  'replace > with >= in caret_edge_nudge',
+  # apply_buffer_transform `active < len` (same len-1-clamp invariant as
+  # execute_builtin) and its `&& !is_read_only_large()` guard (same 256 MiB
+  # argument). Each is the only mutant of its shape in the function; the
+  # `delete !` on the same line is deliberately NOT pardoned.
+  'replace < with (==|>|<=) in ScribeApp::apply_buffer_transform',
+  'replace && with \|\| in ScribeApp::apply_buffer_transform',
+  # tab_index_after_move: idx==src is guarded before this expression, so the
+  # comparison and the decrement are both unobservable there.
+  'replace < with (==|>|<=) in tab_index_after_move',
+  'replace - with (\+|/) in tab_index_after_move',
   'replace < with <= in ensure_readable_tone',  # bg_l<0.5 vs <=0.5 differ only at bg_l==0.5 exactly, unreachable from u8 channels (== and > ARE tested)
-  'render_support\.rs:458:',        # highlight_job tail-append is defensive: syntect spans always cover the full line (byte==line.len()), so the tail branch never fires; the </>/==/&&->|| variants only toggle firing an EMPTY tail (no-op)
+  # highlight_job tail-append is defensive: syntect spans always cover the full
+  # line (byte==line.len()), so the tail branch never fires; the </>/==/&&->||
+  # variants only toggle firing an EMPTY tail (no-op). `$`-anchored so it cannot
+  # reach the nested `highlight_job::append_split` mutants, which stay gated
+  # apart from the single one pardoned on its own merits below.
+  'replace && with \|\| in highlight_job$',
+  'replace < with (==|>|<=) in highlight_job$',
   'replace > with >= in highlight_job::append_split',  # None-branch next-boundary filter: a url starting AT pos would put pos INSIDE it (in_url=Some), so the None branch never sees st==pos -> `>` and `>=` are identical (== and < variants ARE killed)
   'replace match guard \*k == key with false in make_layouter',  # job-cache guard -> false = cache NEVER hits = always recompute highlight_job (deterministic, same output) = performance-equivalent (the 664 galley-cache correctness IS tested)
-  'app/text_ops_methods\.rs:360:',  # move_cursor_line trailing-"" drop: only text=="" distinguishes, then no-op
-  'app/text_ops_methods\.rs:418:',  # duplicate_cursor_line: insert(ln+1,copy)==insert(ln,copy) (author-documented)
-  'app/text_ops_methods\.rs:799:',  # join_cursor_line_with_next: same trailing-"" equivalence
-  'change_bar\.rs:54:',             # changed_mask idx<n: new_index() in [0,n-1]; boundary unreachable
-  'datetime\.rs:34:',               # format_iso8601_utc else-branch dead for all u64 secs (z>=719_468)
-  'editor_features\.rs:264:',       # label_for_def trim disjunction redundant with the following split([...])
-  'filetree\.rs:194:',              # dir_children depth+1: reachable only via 64-deep open CollapsingHeaders
-  'filetree\.rs:197:',              # dir_children selected: only tints selectable_label (paint)
-  'find_in_files\.rs:103:',         # walk_project files_seen: only observable at the 20_000-file cap
-  'find_in_files\.rs:108:',         # walk_project batch>remaining -> >=: truncate-to-equal is a no-op
-  'find_in_files\.rs:77:44:',       # walk_project outer ||: inner line-84 cap backstops identical output
-  'issue_intake\.rs:187:',          # title_tail_from >80 -> >=: both branches equal at count==80
-  'md_preview\.rs:279:',            # parse Heading-Start runs.clear(): runs always empty at a block Start (defensive)
-  'md_preview\.rs:289:',            # parse Paragraph-Start runs.clear(): same
-  'md_preview\.rs:628:',            # is_safe_link path-sep break: the un-broken char is not a valid scheme char anyway
-  'multi_cursor\.rs:232:',          # apply_edit Delete head<total -> <=: EOF caret sorts last; shift never propagates
-  'multi_cursor\.rs:419:',          # reconcile_carets !is_primary tiebreak: retain-primary swap compensates
-  'session_path_guard\.rs:109:',    # is_unc_path delete Some('.') arm: falls through to identical _ => true
-  'to_markdown\.rs:249:',           # parse_csv CRLF \n lookahead: the extra [""] record is dropped by csv_to_md filter
-  'to_markdown\.rs:310:',           # longest_backtick_run > -> >=: idempotent longest=current when equal
-  # col-scoped (the SAME line also carries tested LOGIC at a different column):
-  'app/builtins\.rs:147:27:',       # SortLines active<len: same len-1-clamp invariant as 126 (147:45 read-only-large guard is pardoned below)
-  'app/multi_cursor_glue\.rs:77:13:',  # mc_reconcile is_active()||!secondaries: unreachable divergence (77:16/78:13 tested)
-  'app/multi_cursor_glue\.rs:94:13:',  # mc_record same predicate (95:13 tested)
+  'replace && with \|\| in ScribeApp::move_cursor_line',  # move_cursor_line trailing-"" drop: only text=="" distinguishes, then no-op
+  # duplicate_cursor_line: `copy == lines[ln]`, so insert(ln+1,copy) and
+  # insert(ln,copy) build element-wise identical vectors and join() the same.
+  # Anchored on the mutant DESCRIPTION, not a line: the old ':418:' anchor
+  # rotated onto a comment when a refactor moved the statement to 423, and the
+  # mutant silently came back.
+  'replace \+ with \* in ScribeApp::duplicate_cursor_line',
+  'replace && with \|\| in ScribeApp::join_cursor_line_with_next',  # same trailing-"" equivalence
+  'replace < with (==|>|<=) in changed_mask',  # changed_mask idx<n: new_index() in [0,n-1]; boundary unreachable
+  # format_iso8601_utc else-branch is dead for all u64 secs (z>=719_468). The
+  # `>=` is unique in the function; the `-` and `/` halves are COLUMN-pinned
+  # because their bare descriptions also match the eight other arithmetic ops in
+  # the same function, which ARE tested.
+  'replace >= with < in format_iso8601_utc',
+  'datetime\.rs:\d+:40: replace - with (\+|/) in format_iso8601_utc',
+  'datetime\.rs:\d+:52: replace / with (%|\*) in format_iso8601_utc',
+  # label_for_def trim disjunction redundant with the following split([...]).
+  # All of label_for_def's mutants live in that one predicate, so the two
+  # descriptions cover exactly what the old ':264:' line anchor did.
+  'replace \|\| with && in label_for_def',
+  'replace == with != in label_for_def',
+  'replace \+ with (-|\*) in dir_children',  # dir_children depth+1: reachable only via 64-deep open CollapsingHeaders
+  'filetree\.rs:\d+:54: replace == with != in dir_children',  # dir_children selected: only tints selectable_label (paint). COLUMN-pinned: the `==` pair earlier in the same fn IS tested.
+  'find_in_files\.rs:\d+:28: replace \+= with (-=|\*=) in walk_project',  # walk_project files_seen: only observable at the 20_000-file cap. COLUMN-pinned: the other `+=` in the fn IS tested.
+  'find_in_files\.rs:\d+:32: replace > with (==|<|>=) in walk_project',  # walk_project batch>remaining -> >=: truncate-to-equal is a no-op. COLUMN-pinned: the earlier `>` in the fn IS tested.
+  'replace \|\| with && in walk_project',  # walk_project outer ||: the inner file-count cap backstops identical output. Sole `||` in the fn.
+  'replace > with (==|<|>=) in title_tail_from',  # title_tail_from >80 -> >=: both branches equal at count==80
+  # Re-anchored on the mutant DESCRIPTION after both line anchors rotated during
+  # the markdown work (:279 slid onto `None => MdBlock::ListItem {`, :289 onto a
+  # doc comment). A description anchor cannot rotate.
+  'delete match arm Event::Start\(Tag::Heading\{\.\.\}\) in parse',   # runs always empty at a block Start (defensive)
+  'delete match arm Event::Start\(Tag::Paragraph\) in parse',        # same
+  # is_safe_link_scheme path-separator break: with `&&` the break never fires,
+  # but the un-broken char is not a valid scheme char either, so the very next
+  # arm breaks anyway. COLUMN-pinned to that predicate's three `||`: the bare
+  # description also matches the whitespace/control strip and the dangerous-
+  # scheme deny-list, both of which are real XSS logic that MUST stay gated.
+  # The `==` variants on the same line are NOT pardoned (they would let
+  # `javascript:` through, which the tests do catch). The old ':628:' anchor had
+  # already rotated to matching nothing.
+  'md_preview\.rs:\d+:(21|33|45): replace \|\| with && in is_safe_link_scheme',
+  'replace < with (==|>|<=) in MultiCursor::apply_edit',  # apply_edit Delete head<total -> <=: EOF caret sorts last; shift never propagates
+  # reconcile_carets !is_primary tiebreak: the retain-primary swap compensates.
+  # The whole-fn replacements are named by the return type; the `!` half is
+  # COLUMN-pinned because the other `delete !` in the same fn IS tested.
+  'replace reconcile_carets -> Vec<\(Caret, bool\)> with ',
+  'multi_cursor\.rs:\d+:69: delete ! in reconcile_carets',
+  '''delete match arm Some\('\.'\) in is_unc_path''',  # is_unc_path: falls through to the identical `_ => true` arm. Quoted-char form kept so it cannot also match the sibling `Some('?')` arm, which IS tested.
+  'replace > with (==|<|>=) in longest_backtick_run',  # longest_backtick_run > -> >=: idempotent longest=current when equal
   # session_persist content_sig loop: whether a NON-dirty tab (clean-saved or
   # empty-untitled) contributes to the change-detection hash. Including it (mutant)
   # can at most cause a SPURIOUS extra backup, never a MISSED one — a non-dirty
   # tab's content is stable, so real edits (a dirty tab) still change the sig
-  # (pinned by backup_content_sig_tracks_a_dirty_tabs_edits, which kills 54:37).
-  'app/session_persist\.rs:54:64:',
-  'app/session_persist\.rs:54:67:',
+  # (pinned by backup_content_sig_tracks_a_dirty_tabs_edits, which kills the
+  # sibling `||` on the same line). COLUMN-pinned: persist_session_and_autosave
+  # carries four other `&&` / two other `delete !` mutants that ARE tested.
+  'app/session_persist\.rs:\d+:64: replace && with \|\| in ScribeApp::persist_session_and_autosave',
+  'app/session_persist\.rs:\d+:67: delete ! in ScribeApp::persist_session_and_autosave',
   # auto-save dirty filter `path.is_some() && is_dirty()` -> `||`: at most spuriously
   # saves a CLEAN file-backed tab (save_active rewrites identical bytes -> no
   # observable change) or attempts an untitled tab (no path -> save_active cannot
   # write). Neither is an observable correctness difference for the "flush dirty
-  # FILE-BACKED buffers" contract (74:38/80:20 ARE tested).
-  'app/session_persist\.rs:78:68:',
-  # `... && !tab.doc.is_read_only_large()` guards (skip transform/sort on a huge
-  # read-only buffer): is_read_only_large is true ONLY for files >=
-  # LARGE_FILE_THRESHOLD = 256 MiB, so for every unit-testable buffer it is false
-  # and the `&&`/`||` branches are identical. Only a 256 MiB read-only file (not
-  # unit-feasible) distinguishes them. The active<len half is the same len-clamp
-  # invariant already exercised.
-  'app/file_ops\.rs:47:37:',
-  'app/builtins\.rs:147:45:',
+  # FILE-BACKED buffers" contract (the sibling predicates ARE tested).
+  'app/session_persist\.rs:\d+:68: replace && with \|\| in ScribeApp::persist_session_and_autosave',
+
+  # --- Wave-2 pardons (survivor-anchored, deliberately NOT whole-function) ---
+  #
+  # Every entry below was cross-checked against the recovered CI survivor list
+  # before it was written: it pardons ONLY mutants that were actually observed
+  # MISSED. Where the wave-2 design proposed a whole-FUNCTION token, the token
+  # was NARROWED to the observed survivors instead, because the measurement
+  # said the broad form would have un-gated mutants the tests currently KILL —
+  # `\brender_blocks\b` would have swallowed 13 of them, `\brender_runs_inner\b`
+  # 9, `\brender_table\b` 4, and `\brender_notes_pane\b` 2 plus the one real,
+  # killable gap at notes_ui.rs:506:75 that the design explicitly left open.
+  # That is floor-lowering wearing a pardon's clothes, and this file's own
+  # header forbids it: over-suppression is worse than rotation. Narrowing is a
+  # TIGHTENING, not a widening — the same move the reporting.rs entry above
+  # documents.
+  #
+  # tray.rs: `mod imp` is `#[cfg(windows)]` (tray.rs:195) and the mutation
+  # runner is ubuntu-latest, so these are generated from SOURCE but never
+  # compiled there — the same vacuous-MISSED condition ci.yml already excludes
+  # integration/windows.rs for. No Linux test can kill them. Their real
+  # coverage is `classify_menu` / `apply_toggle` / `toggle_from_ctx`, which are
+  # NOT cfg-gated and ARE mutation-tested here. A pardon whose premise is a cfg
+  # gate needs that premise pinned, so
+  # `tray_imp_is_cfg_gated_so_the_mutation_pardon_stays_honest` (tray.rs) fails
+  # the suite the moment the gate is removed — forcing these entries out rather
+  # than letting them silently start hiding compiled, untested code.
+  'tray\.rs.*\bimp::icon\b',
+  'tray\.rs.*\bimp::init\b',
+  # single_instance.rs `open_lock`: TWO twins, `#[cfg(windows)]` (227) and
+  # `#[cfg(not(windows))]` (249), whose mutant descriptions are byte-identical
+  # AND share column 5 — so neither a description nor a column anchor can tell
+  # them apart. That is fine here, because NEITHER twin can ever be real signal,
+  # and the proof does not depend on which platform runs:
+  #
+  #   * Where the body is NOT compiled (the other-platform twin — on the ubuntu
+  #     runner that is the `#[cfg(windows)]` one at 227, the one CI actually
+  #     reported MISSED) the mutation lands inside an item that never reaches the
+  #     build. Vacuous; no test can kill it.
+  #   * Where the body IS compiled, the mutant does not build: `Startup` derives
+  #     only `Debug`, so `Ok(Default::default())` has no `Default` impl to call.
+  #     UNVIABLE, which cargo-mutants reports separately and never as a survivor.
+  #
+  # So a description anchor over-suppresses nothing, and no positional
+  # registration is needed. Confirmed by applying the real mutant to the WINDOWS
+  # twin on a Windows host, where that body IS compiled: it failed to build
+  # (`Startup: !Default`) rather than surviving. Control, on the same host, that
+  # the pardon is not hiding an untested body: `LockVerdict::Busy =>
+  # Ok(Startup::Secondary)` was rewritten to `Err(err)` and
+  # `a_second_acquire_while_the_first_is_held_is_secondary` KILLED it.
+  #
+  # `the_open_lock_twins_stay_cfg_split_so_the_pardon_stays_honest` pins both
+  # halves of the premise (the cfg split, and `Startup`'s lack of a `Default`),
+  # so merging the twins or deriving `Default` turns the suite RED and forces
+  # this entry out instead of letting it start hiding compiled, killable code.
+  'single_instance\.rs.*replace open_lock -> io::Result<Startup> with Ok\(Default::default\(\)\)',
+  # The OUTER `tray::init`'s `#[cfg(not(windows))]` body is `let _ = ctx;` — no
+  # return value, no side effect — so `with ()` is provably equivalent on the
+  # runner's target. Bounded to `with \(\)` deliberately, exactly like the
+  # scribe-win32-chrome wrappers above.
+  #
+  # SPELLING, and why this line changed. It read `replace tray::init with \(\)`
+  # and matched NOTHING: cargo-mutants names a FREE function bare, so the mutant
+  # it prints is `tray.rs:185:5: replace init with ()`. The pardon was therefore
+  # inert and `185:5` kept coming back as a survivor on every CI shard — the
+  # exact "anchor matching zero mutants" failure this file's header warns about,
+  # reproduced by a module-qualified name rather than by a rotated line. Verified
+  # with the tool, not from memory: `cargo mutants --list -f tray.rs` returned
+  # 13 WITH the config and 16 without, i.e. the config removed only the three
+  # `imp::` entries and left this one. The bare-name form below removes exactly
+  # `185:5` (13 -> 12) and nothing else; in particular it cannot reach
+  # `149:5 replace apply_toggle with ()`, whose description does not contain
+  # "replace init with". `tray_imp_is_cfg_gated_so_the_mutation_pardon_stays_honest`
+  # now pins this spelling so the qualified form cannot come back.
+  'tray\.rs.*replace init with \(\)',
+  # md_preview.rs table Start-arms: both clears are DEFENSIVE. `t.row` is
+  # `mem::take`n at End(TableHead)/End(TableRow) and `runs` at End(TableCell),
+  # so both buffers are already empty at every Start and deleting either arm is
+  # byte-identical on any balanced pulldown-cmark stream. NOT argued from the
+  # source alone: each arm was deleted locally (sha256 recorded before/after, so
+  # the deletion provably landed) and all 84 md_preview tests stayed green.
+  # NOTE: this rests on those three `mem::take`s. If any becomes a non-draining
+  # read, DROP this pardon — the arms would start carrying state.
+  'md_preview\.rs.*delete match arm Event::Start\(Tag::TableHead\)',
+  'md_preview\.rs.*delete match arm Event::Start\(Tag::TableCell\)',
+  # Paint-only siblings added by this PR — the same ADR-0007 egui-paint class as
+  # `\bpaint_squiggle\b` above: the body is painter.rect_filled / line_segment /
+  # text, the return is `()`, and nothing outside GPU pixels changes. Whole-
+  # function tokens are used for exactly these two because EVERY mutant they
+  # currently generate is a confirmed survivor (18/18 and 13/13), so the broad
+  # form suppresses nothing that is killed today. The pure logic each one once
+  # inlined is EXTRACTED and separately tested — `mark_lane`/`mark_y`/
+  # `merge_marks` (overview_mark_tests) out of the first, `ws_marker`
+  # (grid_methods_tests) out of the second — so neither pardon hides a logic gap.
+  '\bpaint_overview_marks\b',
+  '\bpaint_whitespace_markers\b',
+  # paint_secondary_carets is the SAME class but gets survivor-anchored entries
+  # rather than a whole-function token: 4 of its 10 current mutants
+  # (`replace + with *` at two columns) were never observed MISSED, and 12 of
+  # the 24 CI shards were cancelled at the 100-minute timeout, so "absent from
+  # the survivor list" does NOT mean "caught" — it means UNKNOWN. Pardoning an
+  # unknown is pardoning without evidence. Those four stay gated until a
+  # complete run reports them; the six below were observed surviving.
+  # (`same_galley_row` was lifted out of this body and IS tested.)
+  'replace paint_secondary_carets with \(\)',
+  'delete ! in paint_secondary_carets',
+  'replace \+ with - in paint_secondary_carets',
+  # md_preview.rs render_runs_inner: `\brender_runs\b` above CANNOT match it —
+  # the next character is `_`, which IS a word character, so the boundary never
+  # applies. The fix is a SECOND EXPLICIT ENTRY; never unbound `render_runs`,
+  # which would silently re-widen every other `\b`-bounded token in this array.
+  # The second entry is description-anchored rather than a bare
+  # `\brender_runs_inner\b`, because 9 of that function's 16 mutants are killed
+  # today (the `>` at :1217 and the `<` at :1230 families) and a whole-function
+  # token would un-gate all nine. These two descriptions cover the fn's only
+  # `||` and its only three `&&`, i.e. exactly 4 of its 7 survivors. The three
+  # surviving `delete !` on the same line are deliberately NOT pardoned: their
+  # description and their columns both collide with the killed `delete !` at
+  # :1201/:1203, and there is no anchor that separates them without
+  # over-suppressing. They stay honestly red.
+  'replace \|\| with && in render_runs_inner',
+  'replace && with \|\| in render_runs_inner',
+  # md_preview.rs render_blocks / render_table: one survivor each, both inside
+  # egui Grid/indent emission. Description-anchored to that single survivor —
+  # the sibling operators at the SAME line and column (`< with ==`/`< with >`,
+  # `+= with -=`) are killed today and must stay gated.
+  'replace < with <= in render_blocks',
+  'replace \+= with \*= in render_table',
+  # notes_ui.rs tag-tree indent: `node.depth as f32 * TAG_TREE_INDENT` feeds
+  # `ui.add_space` only (painted pixels). These are the function's ONLY `*`
+  # mutants, so the description cannot reach anything else — in particular it
+  # does NOT touch `notes_ui.rs:506:75` (`selected_tag == node.tag`), which
+  # drives `selectable_label` and is a REAL, killable gap awaiting an
+  # egui_kittest fixture. Pardoning that one by using a whole-function token
+  # here would have hidden it.
+  'replace \* with (\+|/) in ScribeApp::render_notes_pane',
+
+  # rope_editor/mod.rs `line_span`: the last-line boundary test. Two of the
+  # eleven mutants on this condition are EQUIVALENT, and the equivalence is a
+  # proof, not a difficulty argument.
+  #
+  #     let end = if line + 1 < rope.len_lines() { rope.line_to_char(line + 1) }
+  #               else { n };                            // n = rope.len_chars()
+  #
+  # `line` comes from `rope.char_to_line(c)`, so `0 <= line <= len_lines() - 1`
+  # and `line < len_lines()` is ALWAYS true. Therefore:
+  #   * `+ 1` -> `* 1` turns the condition into `line < len_lines()`, and
+  #   * `<`   -> `<=`  turns it into `line + 1 <= len_lines()`,
+  # and BOTH differ from the original in exactly one case: `line + 1 ==
+  # len_lines()`, i.e. the cursor is on the last line. In that case the original
+  # takes the else branch and yields `len_chars()`, while the mutants take the
+  # then branch and yield `line_to_char(len_lines())`. Ropey defines those to be
+  # the same value, so the output is identical for every input. []
+  #
+  # That premise is asserted, not assumed: `line_to_char_past_the_last_line_is_
+  # len_chars` pins it over empty / no-trailing-newline / trailing-newline
+  # ropes, so if ropey ever changes the equivalence fails loudly.
+  #
+  # COLUMN-pinned, not description-pinned, because 9 of the 11 line_span mutants
+  # ARE killed by the existing tests (the `+ -> -`, `< -> ==`, `< -> >` and the
+  # four whole-body tuple mutants) — verified by running each as a control. A
+  # bare `in line_span` description would suppress all of them. Registered in
+  # POSITIONAL_ANCHORS.
+  'rope_editor/mod\.rs:\d+:23: replace \+ with \* in line_span',
+  'rope_editor/mod\.rs:\d+:27: replace < with <= in line_span',
+
+  # integration/macos.rs `bundle_info_plist` + `register`: the two items carrying
+  # `#[cfg(target_os = "macos")]`. Not compiled on the ubuntu mutation runner, so
+  # 100% of their mutants are vacuous MISSES no test could ever kill — the same
+  # condition ci.yml already excludes `integration/windows.rs` and
+  # `scribe-win32-chrome/src/imp.rs` for.
+  #
+  # This is a per-ITEM pardon, NOT the whole file, and the distinction is
+  # load-bearing: `mod macos` is `#[cfg(any(test, target_os = "macos"))]`, so the
+  # module DOES compile everywhere under test and its pure half is real signal.
+  # Of the 11 mutants in the file, 7 (`summarize_bundle` x5, `declares_uti` x2)
+  # are compiled and killed by the tests below; only these 4 are vacuous. A
+  # file-glob exclusion would silently drop those 7 — the "green that isn't
+  # green" this config's header warns about.
+  #
+  # Premise pinned by `the_mac_only_items_stay_cfg_gated_so_the_mutation_pardon_
+  # stays_honest`: if either item loses its gate the test fails and these entries
+  # must be dropped, rather than quietly covering compiled code.
+  'macos\.rs.*bundle_info_plist',
+  'macos\.rs.*replace register -> RegisterReport',
+
+  # diagnostics_overlay `diagnostic_spans` / `row_segments` empty-input guards.
+  # Both are FAST PATHS, and `|| -> &&` in either is EQUIVALENT: for every input
+  # combination that widening the guard lets through, the body reaches the same
+  # empty result on its own.
+  #
+  #   * `diagnostic_spans(text, diags)` — with `text` empty the body's own
+  #     `if start >= text.len() { continue; }` is `start >= 0`, true for EVERY
+  #     usize, so every diagnostic is dropped before it can be pushed. With
+  #     `diags` empty the loop body never runs. Either way: `Vec::new()`.
+  #   * `row_segments(text, spans, visible)` — with `spans` empty the inner loop
+  #     never runs; with `visible` empty the outer loop never runs; with `text`
+  #     empty every line is `>= line_count()` (break) or has the empty byte
+  #     range `(0, 0)`, where `s >= e` skips every span. Either way: `Vec::new()`.
+  #
+  # DESCRIPTION-anchored, so neither entry can rotate on either axis and neither
+  # needs a POSITIONAL_ANCHORS registration. Each is also PRECISE: `||` appears
+  # exactly once in `diagnostic_spans` and exactly twice — both on the same
+  # guard line, both equivalent for the reason above — in `row_segments`, so
+  # nothing a test kills is swept up. Verified with the tool, not from memory:
+  # `cargo mutants --list` reports both functions' `||` mutants without these
+  # entries and none with them.
+  #
+  # Premise pinned by `the_empty_input_guards_are_fast_paths_the_body_would_
+  # reach_anyway`, which asserts the empty result for each condition on its own
+  # — so if a future edit gives either guard real behaviour, the test fails and
+  # these entries must be dropped rather than quietly covering live code.
+  # Control-checked rather than trusted: `>= -> >` in the same
+  # `start >= text.len()` bounds check, and `>= -> >` in `row_segments`'s
+  # `s >= e`, were each applied for real and came back KILLED, so the suite
+  # demonstrably exercises both bodies and these two are not hiding behind
+  # untested code.
+  'replace \|\| with && in diagnostic_spans',
+  'replace \|\| with && in row_segments',
+
+  # keymap `is_cut_command` / `is_copy_command` / `is_paste_command`: the
+  # `keycode == Key::Delete/Insert` term inside each predicate's
+  # `cfg!(target_os = "windows") && …` arm. `cfg!` is a COMPILE-TIME constant,
+  # so on the ubuntu mutation runner that arm is `false && …` and the comparison
+  # is never evaluated — flipping it to `!=` cannot change any observable
+  # behaviour on that host. Vacuous there, and killable only on Windows, which
+  # this job does not run.
+  #
+  # COLUMN-pinned, not description-pinned, and that distinction is load-bearing:
+  # each predicate ALSO opens with a bare `keycode == Key::Cut/Copy/Paste` whose
+  # `== -> !=` mutant carries a BYTE-IDENTICAL description and IS killed (by
+  # `clipboard_predicates_match_their_own_key_and_nothing_else`). A bare
+  # `in is_cut_command` would suppress that real kill too. Registered in
+  # POSITIONAL_ANCHORS.
+  'keymap\.rs:\d+:71: replace == with != in is_cut_command',
+  'keymap\.rs:\d+:70: replace == with != in is_copy_command',
+  'keymap\.rs:\d+:71: replace == with != in is_paste_command',
+
+  # md_preview/math.rs `read_group`: the `entry < src.len()` half of the
+  # advance-clamp guard. EQUIVALENT by a reachability proof, not a difficulty
+  # argument.
+  #
+  #     let entry = *i;
+  #     let group = read_group_inner(src, i);
+  #     if entry < src.len() && *i <= entry { *i = entry.saturating_add(1); }
+  #
+  # The clamp body is DEAD while `read_group_inner` is correct. Whenever
+  # `entry < src.len()` there is a character to consume, and every path through
+  # the inner function then advances by at least one: the leading whitespace
+  # skip either consumes characters or leaves one at `*i`; each arm reachable
+  # from there (`{`, `\`, a single character) increments before returning; and
+  # the `None` arm is reachable only once the skip has consumed the rest. So
+  # `*i <= entry` is false whenever the bound is true, and the clamp never
+  # fires. `entry` is only ever a cursor into `src`, so `entry <= src.len()`
+  # always holds and `entry > src.len()` is false for every input — the mutant
+  # therefore stops a clamp that already never fired, which is no change at all.
+  #
+  # DESCRIPTION-anchored, so it cannot rotate on either axis and needs no
+  # POSITIONAL_ANCHORS entry. `$`-terminated deliberately: without it the
+  # pattern would also swallow `read_group_inner`'s own `< with >` at the
+  # end-of-input bound, which IS killed. `read_group` is the only function of
+  # that name in the workspace (`grep -rn "fn read_group"`), so the bare
+  # description cannot reach another file.
+  #
+  # PRECISE, verified with the tool rather than from memory: the same `<`
+  # carries `== ` and `<=` mutants that are NOT pardoned and ARE killed — both
+  # make the clamp fire at end-of-input and run the cursor to `src.len() + 1`.
+  # The `&&` and the `<=` later on the same line are likewise unpardoned and
+  # killed (both make it fire on a CORRECT parse and rewind the cursor). That is
+  # why the bound was NOT rewritten to dodge the mutant the way the `entry + 1`
+  # step was (spelled `saturating_add`, generating nothing): removing the `<`
+  # would have deleted two working mutants to hide one equivalent sibling.
+  #
+  # Control-checked rather than trusted. All FOUR unpardoned mutants at this
+  # site were applied to real source and run: `< with ==` (1 failure) and
+  # `< with <=` (1) are caught by `read_group_advances_past_every_first_
+  # character`; `<= with >` (10) and `&& with ||` (10) are caught across the
+  # math suite. The clamp body was additionally replaced by a `panic!` and the
+  # whole md_preview corpus still passed 97/97 — the reachability premise above
+  # measured, not assumed. So this entry hides no untested code.
+  'replace < with > in read_group$',
+
+  # --- The ONLY three literal-line anchors that survive, and why -------------
+  # Each pardons a mutant whose NAME is byte-identical to a NEIGHBOUR in the
+  # same function at the SAME column — so neither the description nor the column
+  # can tell them apart, and widening to cover the neighbour would suppress a
+  # mutant the tests actually kill (over-suppression is worse than rotation).
+  # These three are FROZEN: `mutation_pardons_are_not_stale` carries them in
+  # `POSITIONAL_ANCHORS` together with the exact source text that must still
+  # start at each anchored line AND column, and REJECTS every other literal-line
+  # anchor. Do not add a fourth without demonstrating the same impossibility.
+  # (The ten COLUMN-pinned anchors above are registered there too — a wildcarded
+  # line does not exempt an anchor from horizontal-rotation verification.)
+  'app/multi_cursor_glue\.rs:77:13:',  # mc_reconcile_owner `is_active() || !secondaries.is_empty()`: unreachable divergence. The `||` on the NEXT line (also column 13, identical description) guards column_anchor and IS tested.
+  'app/multi_cursor_glue\.rs:94:13:',  # mc_record_owner: same predicate, same name+column collision with the tested `||` below it.
+  'to_markdown\.rs:249:37:',           # parse_csv CRLF `\n` lookahead: the extra [""] record is dropped by the csv_to_md filter. Name- AND column-identical to the escaped-quote lookahead earlier in parse_csv, which IS tested.
 ]

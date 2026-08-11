@@ -80,10 +80,13 @@ fn side_bar_shrinks_below_longest_title_via_resize() {
          truncate: start={start_w:.1} end={end_w:.1}"
     );
     // The title's natural width is well over 280px; a truncating bar collapses to
-    // hug the minimal tab affordances (~96px). Assert it landed far below the
-    // title width — the behaviour that was impossible before truncation.
+    // hug the minimal tab affordances — grip + truncated title + pin/close. The
+    // pin and close glyphs are now WCAG-2.5.8 24px hit targets (the tab-hover fix),
+    // so the minimal width is ~166px, up from the old ~96px undersized buttons.
+    // The invariant is unchanged: it must land FAR below the full-title width that
+    // an un-truncated label would demand — proving truncation enabled the shrink.
     assert!(
-        end_w < 140.0,
+        end_w < 200.0,
         "a truncating side bar must collapse below the full-title width (it can't \
          before the fix): end={end_w:.1}"
     );

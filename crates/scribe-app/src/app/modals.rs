@@ -333,14 +333,14 @@ impl ScribeApp {
             Some(Decision::Submit) => {
                 let req = self.issue_intake.request(&repo, renderer);
                 let outcome = crate::issue_intake::open_or_copy(&req);
-                crate::issue_intake::log_outcome(&outcome);
+                crate::issue_intake::log_outcome(&outcome, crate::action_log::record);
                 self.issue_intake.last_outcome = Some(outcome);
                 self.issue_intake.open = false;
             }
             Some(Decision::Email) => {
                 let req = self.issue_intake.request(&repo, renderer);
                 let outcome = crate::issue_intake::open_mailto(&alias, &req.title, &req.body);
-                crate::issue_intake::log_outcome(&outcome);
+                crate::issue_intake::log_outcome(&outcome, crate::action_log::record);
                 self.issue_intake.last_outcome = Some(outcome);
                 self.issue_intake.open = false;
             }

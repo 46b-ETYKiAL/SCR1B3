@@ -18,8 +18,15 @@ use std::sync::mpsc::Receiver;
 use scribe_core::update::{self, ReleaseInfo};
 
 /// GitHub repo coordinates for the Releases API. Public values.
+///
+/// These MUST track the repository's current name. GitHub answers a request for
+/// a repo's FORMER name with a `301` to the numeric `/repositories/{id}/…`
+/// form, and the update check forbids redirects (see
+/// [`scribe_core::update::net`]) — so a stale name here silently breaks the
+/// update check for every installed copy. Pinned by
+/// [`tests::the_update_check_targets_the_repos_current_name`].
 pub const UPDATE_OWNER: &str = "46b-ETYKiAL";
-pub const UPDATE_REPO: &str = "Itasha.Corp_S4F3-SCR1B3";
+pub const UPDATE_REPO: &str = "SCR1B3";
 
 /// This build's Rust target triple, baked by `build.rs` (`SCR1B3_TARGET`), used
 /// to pick the matching `scr1b3-<target>.tar.gz` release asset. Falls back to an
@@ -302,6 +309,27 @@ pub struct Updater {
     /// `ReleaseInfo` carried no index (a hand-built fixture; the production
     /// resolver always sets it).
     pending_release_index: Option<u64>,
+    /// Does the app hold unsaved edits right now? Republished by the host every
+    /// frame (`frame_tick`, immediately before [`poll`](Self::poll)).
+    ///
+    /// This is the gate on the IRREVERSIBLE half of an apply. `request_restart_close`
+    /// is already a close REQUEST the unsaved-changes guard adjudicates — but by
+    /// the time it is sent, the apply has ALREADY happened: the running exe has
+    /// been swapped and its replacement spawned, or the elevated installer has
+    /// been launched `-Wait` and is about to replace the files under us. Cancel
+    /// on the resulting prompt therefore could not mean what it says, and on the
+    /// installer path setup.exe could replace or kill the app while the modal was
+    /// still on screen. Both apply sites are reachable with NO user present —
+    /// `handle_update_msg` auto-chains `Downloaded(Ok)` / `InstallerReady(Ok)`
+    /// straight into them from `poll`, which the host drains every frame — so the
+    /// user may be mid-sentence.
+    ///
+    /// So the apply itself, not just the close, has to be behind the flag.
+    pub unsaved_work: bool,
+    /// Set when an apply was HELD because [`unsaved_work`](Self::unsaved_work)
+    /// was set. The host drains it into its own toast on the next frame — a hold
+    /// the user is never told about is indistinguishable from a broken button.
+    pub unsaved_hold_notice: Option<String>,
 }
 
 impl Updater {
@@ -316,6 +344,59 @@ impl Updater {
         if let Some(idx) = self.pending_release_index.take() {
             update::update_state::record_applied_index_for_current_exe(idx);
         }
+    }
+
+    /// Should this apply be HELD because the user has unsaved work?
+    ///
+    /// Sits at the top of BOTH apply routes, above every irreversible step: the
+    /// exe swap + replacement spawn, and the elevated `-Wait` installer launch.
+    /// It has to be there rather than at the close, because
+    /// `request_restart_close` runs AFTER the apply has already happened — at
+    /// which point "Cancel" on the unsaved-changes prompt cannot undo a swapped
+    /// binary, and a running setup.exe can replace or kill the app while the
+    /// prompt is still on screen.
+    ///
+    /// The held state is left EXACTLY as it was (`ReadyToApply` /
+    /// `ReadyToRunInstaller`), never `Failed`: nothing failed, and the user must
+    /// be able to save and click again. The only side effect is the notice the
+    /// host turns into a toast.
+    fn hold_for_unsaved_work(&mut self, route: &'static str) -> bool {
+        if !self.unsaved_work {
+            return false;
+        }
+        tracing::info!("update apply held ({route}): the app holds unsaved work");
+        self.unsaved_hold_notice =
+            Some("Save your open files first — installing the update restarts SCR1B3.".to_string());
+        true
+    }
+
+    /// Ask the APP to close so a staged update can finish applying.
+    ///
+    /// This is the ONE place in the updater that may take the window away.
+    /// Every path that refuses or fails an apply — a call from the wrong state,
+    /// the anti-rollback downgrade refusal, a failed installer launch, a failed
+    /// in-place swap — sits ABOVE it and is therefore provably close-free
+    /// (`a_refused_*` / `a_failed_*` in `updater_restart_close_tests.rs` assert
+    /// that on the emitted `ViewportCommand`s, and
+    /// `the_updater_has_exactly_one_place_that_can_take_the_window_away` pins
+    /// the chokepoint itself).
+    ///
+    /// It is deliberately a close REQUEST, never a bare "destroy this window".
+    /// The host round-trips `ViewportCommand::Close` back in as the NEXT frame's
+    /// `close_requested()` — `egui_winit::process_viewport_commands` turns the
+    /// command into a `ViewportEvent::Close` on the viewport's `ViewportInfo`,
+    /// and eframe rebuilds `raw_input.viewports` from that info — so the app
+    /// receives exactly the signal an OS ✕ / Alt+F4 delivers. That is what puts
+    /// an update restart behind `frame_tick`'s unsaved-changes guard: with dirty
+    /// buffers the guard raises the Save / Discard / Cancel prompt instead of
+    /// destroying the window, and any close that does proceed still HIDES one
+    /// frame before it destroys (the T19.1 DWM-ghost fix).
+    ///
+    /// The corollary the updater must respect: "I asked to close" is NOT "we
+    /// closed". The app can refuse, and with unsaved work it does — so nothing
+    /// here may assume the process is about to end.
+    fn request_restart_close(ctx: &egui::Context) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
     }
 
     /// True while a network/apply operation is in flight (used to disable the
@@ -442,7 +523,10 @@ impl Updater {
     }
 
     /// Launch the staged, verified self-elevating installer in SILENT mode and
-    /// close the app so it can replace the files in place. The helper (see
+    /// ask the app to close (via
+    /// [`request_restart_close`](Self::request_restart_close) — a REQUEST the
+    /// unsaved-changes close guard adjudicates) so it can replace the files in
+    /// place. The helper (see
     /// [`launch_installer_elevated`]) shows ONE UAC prompt, runs the installer
     /// with no window and no click-through, waits for it, then relaunches
     /// SCR1B3 — so from the user's view a machine-wide update is as seamless as
@@ -468,6 +552,13 @@ impl Updater {
             self.state = UpdateState::Failed(e);
             return;
         }
+        // Everything above is reversible: a refusal only sets `Failed`. Below
+        // this line the apply becomes IRREVERSIBLE — an elevated setup.exe runs
+        // `-Wait` and replaces the files under us, and it can do that while an
+        // unsaved-changes prompt is still on screen. Hold here, above it.
+        if self.hold_for_unsaved_work("installer") {
+            return;
+        }
         // Launch with a UAC elevation prompt — the setup.exe is
         // requireAdministrator, so a plain CreateProcess fails with os error 740.
         // The staging dir is NOT cleaned here: the installer is running FROM it;
@@ -481,7 +572,7 @@ impl Updater {
                 // its manifest release_index as the new anti-rollback floor.
                 self.commit_applied_index();
                 self.state = UpdateState::Applied { version };
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                Self::request_restart_close(ctx);
             }
             Err(e) => {
                 tracing::error!(
@@ -497,7 +588,9 @@ impl Updater {
     }
 
     /// Swap the running executable for the staged, verified binary and best-
-    /// effort relaunch. On success the caller should close the window.
+    /// effort relaunch, then ask the app to close via
+    /// [`request_restart_close`](Self::request_restart_close) — a REQUEST the
+    /// unsaved-changes close guard adjudicates, not a bare destroy.
     pub fn apply_and_restart(&mut self, ctx: &egui::Context) {
         let UpdateState::ReadyToApply { staged, version } = &self.state else {
             return;
@@ -516,6 +609,14 @@ impl Updater {
                 current_version()
             );
             self.state = UpdateState::Failed(e);
+            return;
+        }
+        // Everything above is reversible: a refusal only sets `Failed`. Below
+        // this line the apply becomes IRREVERSIBLE — the running exe is swapped
+        // and its replacement spawned BEFORE any close is adjudicated, so a
+        // later "Cancel" on the unsaved-changes prompt could not undo it. Hold
+        // here, above it.
+        if self.hold_for_unsaved_work("in-place swap") {
             return;
         }
         // ReadyToApply is only ever reached on a WRITABLE install (start_download
@@ -547,7 +648,7 @@ impl Updater {
                         tracing::info!("update applied: v{version} swapped in and relaunching");
                         self.commit_applied_index();
                         self.state = UpdateState::Applied { version };
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        Self::request_restart_close(ctx);
                     }
                     Err(e) => {
                         // The verified update was installed but wouldn't start.
@@ -696,12 +797,41 @@ impl Updater {
     }
 }
 
+/// The update-restart close contract: which paths may take the window away, and
+/// what the app does with the request when they do. Kept in its own file because
+/// it drives the REAL `ScribeApp::frame_tick`, not just this module's state.
+#[cfg(test)]
+#[path = "updater_restart_close_tests.rs"]
+mod restart_close_tests;
+
 #[cfg(test)]
 mod tests {
+    /// Serialises the tests that MUTATE the shared staging directory.
+    ///
+    /// `staging_dir()` is one fixed path per process (`%TEMP%/scr1b3-update`),
+    /// so two tests that create and reap it race. That is not theoretical:
+    /// `cleanup_after_update_removes_the_staging_dir` creates the dir and then
+    /// writes a file into it, and if
+    /// `cleanup_after_update_is_idempotent_and_never_errors` reaps it in
+    /// between, the write `.unwrap()` panics. Pre-existing; it surfaces under
+    /// parallel load, which is why a plain `cargo test` failed here while
+    /// running the test alone always passed.
+    ///
+    /// Poison-tolerant so one failure does not cascade into the other test
+    /// reporting a poisoned mutex instead of its own result.
+    static STAGING_DIR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn staging_guard() -> std::sync::MutexGuard<'static, ()> {
+        STAGING_DIR_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     use super::*;
 
     #[test]
     fn cleanup_after_update_removes_the_staging_dir() {
+        let _staging = staging_guard();
         // cleanup_after_update's first duty is reaping the staging tree (via
         // clean_staging_dir). The `replace with ()` mutant on EITHER function
         // leaves it. Existing idempotent test only asserts no-panic. Kills 49:5, 62:5.
@@ -712,6 +842,45 @@ mod tests {
         assert!(
             !staging.exists(),
             "cleanup_after_update must remove the staging directory"
+        );
+    }
+
+    #[test]
+    fn the_update_check_targets_the_repos_current_name() {
+        // THE regression this pins: the GitHub repository was renamed, and the
+        // update check composes its URL from UPDATE_OWNER/UPDATE_REPO. GitHub
+        // answers a FORMER-name request with a 301 to the numeric
+        // `/repositories/{id}/…` form — and `fetch_releases_at` forbids
+        // redirects (a security control: no off-GitHub bounce may serve forged
+        // release JSON). So a stale name here does not degrade the check, it
+        // BREAKS it outright, for every installed copy, while this file still
+        // reads as correct.
+        //
+        // Asserting the whole composed URL (not just the constant) is the
+        // point: it is the exact string that goes on the wire.
+        assert_eq!(
+            update::releases_api_url(UPDATE_OWNER, UPDATE_REPO),
+            "https://api.github.com/repos/46b-ETYKiAL/SCR1B3/releases?per_page=100",
+            "the update check must name the repository's CURRENT name — a former \
+             name 301s, and the redirect ban (correctly) turns that into a failed check"
+        );
+    }
+
+    #[test]
+    fn the_documented_endpoint_and_the_live_query_name_the_same_repo() {
+        // The repo name lives in TWO places: this crate's UPDATE_REPO (which
+        // builds the live request) and scribe-core's RELEASES_ENDPOINT (the
+        // constant ADR-0004 and PRIVACY.md point at so the single outbound host
+        // is auditable in source). That duplication is the root cause of the
+        // rename breakage — one copy can rot while the other looks right, and
+        // nothing noticed. Bind them: a future rename that updates only one
+        // side fails here instead of shipping.
+        let live = update::releases_api_url(UPDATE_OWNER, UPDATE_REPO);
+        assert!(
+            live.starts_with(scribe_core::update::RELEASES_ENDPOINT),
+            "the documented endpoint ({}) must be the prefix of the live query ({live}) — \
+             they name the same repo or the audit trail is a lie",
+            scribe_core::update::RELEASES_ENDPOINT
         );
     }
 
@@ -1335,6 +1504,7 @@ mod tests {
 
     #[test]
     fn cleanup_after_update_is_idempotent_and_never_errors() {
+        let _staging = staging_guard();
         // Best-effort housekeeping: removing a (possibly absent) staging dir and
         // a (possibly absent) `.bak` must be a silent no-op when there is nothing
         // to remove, and must be safe to call repeatedly. It returns () and must

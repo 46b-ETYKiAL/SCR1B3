@@ -305,23 +305,34 @@ impl ScribeApp {
                         } else {
                             egui_phosphor::thin::PUSH_PIN
                         };
-                        if ui
-                            .add(egui::Button::new(glyph).frame(false).small())
-                            .on_hover_text(pin_label)
-                            .clicked()
+                        if super::chrome::tab_glyph_button(
+                            ui,
+                            glyph,
+                            muted,
+                            Color32::WHITE,
+                            accent.linear_multiply(0.22),
+                        )
+                        .on_hover_text(pin_label)
+                        .clicked()
                         {
                             toggle_pin = Some(i);
                         }
                     }
                     if !pinned
-                        && ui
-                            .add(
-                                egui::Button::new(egui_phosphor::thin::X)
-                                    .frame(false)
-                                    .small(),
-                            )
-                            .on_hover_text("Close tab (or middle-click)")
-                            .clicked()
+                        && super::chrome::tab_glyph_button(
+                            ui,
+                            egui_phosphor::thin::X,
+                            muted,
+                            // Destructive-✕ convention: the glyph goes red under the
+                            // pointer, with a red-tinted veil. A frameless egui Button
+                            // painted no fill in ANY state and baked its glyph colour
+                            // at construction, so the close ✕ had no hover at all —
+                            // the exact defect the pin fix left behind on this control.
+                            Color32::from_rgb(0xF2, 0x55, 0x55),
+                            Color32::from_rgb(0xE8, 0x11, 0x23).linear_multiply(0.22),
+                        )
+                        .on_hover_text("Close tab (or middle-click)")
+                        .clicked()
                     {
                         close = Some(i);
                     }
@@ -690,10 +701,15 @@ impl ScribeApp {
                         } else {
                             egui_phosphor::thin::PUSH_PIN
                         };
-                        if ui
-                            .add(egui::Button::new(glyph).frame(false).small())
-                            .on_hover_text(pin_label)
-                            .clicked()
+                        if super::chrome::tab_glyph_button(
+                            ui,
+                            glyph,
+                            muted,
+                            Color32::WHITE,
+                            accent.linear_multiply(0.22),
+                        )
+                        .on_hover_text(pin_label)
+                        .clicked()
                         {
                             toggle_pin = Some(i);
                         }
@@ -702,14 +718,20 @@ impl ScribeApp {
                     // refuses middle-click / context Close) so it can't be closed by
                     // accident; unpin first (#R5).
                     if !pinned
-                        && ui
-                            .add(
-                                egui::Button::new(egui_phosphor::thin::X)
-                                    .frame(false)
-                                    .small(),
-                            )
-                            .on_hover_text("Close tab (or middle-click)")
-                            .clicked()
+                        && super::chrome::tab_glyph_button(
+                            ui,
+                            egui_phosphor::thin::X,
+                            muted,
+                            // Destructive-✕ convention: the glyph goes red under the
+                            // pointer, with a red-tinted veil. A frameless egui Button
+                            // painted no fill in ANY state and baked its glyph colour
+                            // at construction, so the close ✕ had no hover at all —
+                            // the exact defect the pin fix left behind on this control.
+                            Color32::from_rgb(0xF2, 0x55, 0x55),
+                            Color32::from_rgb(0xE8, 0x11, 0x23).linear_multiply(0.22),
+                        )
+                        .on_hover_text("Close tab (or middle-click)")
+                        .clicked()
                     {
                         close = Some(i);
                     }

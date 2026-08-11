@@ -30,24 +30,93 @@ impl ScribeApp {
         self.status = format!("go to line {line_1based}");
     }
 
+    /// Apply an optional CLI `PATH:LINE[:COLUMN]` jump target (from `scr1b3
+    /// file:42:10`) to the first opened tab.
+    ///
+    /// Scrolls the requested 1-based line into view on the first rendered frame
+    /// by reusing the same [`goto_line`](Self::goto_line) scroll pipe the
+    /// go-to-line command, bookmark navigation, and find-in-files "open result"
+    /// all drive. The column is surfaced in the status hint; the app's jump
+    /// convention across every existing surface is line-scroll (the caret is
+    /// owned by the egui text widget and settles on the first frame), so line
+    /// placement is exactly what "open at line N" means here. A `None` jump (no
+    /// target, or a non-`Launch` action) is a no-op — the load-bearing negative
+    /// that proves the wire fires only when a jump was parsed.
+    pub(super) fn apply_cli_jump(&mut self, jump: Option<(usize, Option<usize>)>) {
+        let Some((line, col)) = jump else {
+            return;
+        };
+        // A 1-based line of 0 is not a real position (e.g. `file:0`); ignore it
+        // rather than scrolling to a phantom line above the first.
+        if line == 0 || self.tabs.is_empty() {
+            return;
+        }
+        self.active = 0;
+        self.goto_line(line);
+        if let Some(c) = col {
+            self.status = format!("go to line {line}:{c}");
+        }
+    }
+
+    /// The find bar's live `scribe_core::search::Query` — the SINGLE place the
+    /// bar's `regex` / `case_sensitive` / `whole_word` toggles become engine
+    /// flags. Every find-bar-owned surface (`find_matches_active`, navigation,
+    /// both Replace buttons) builds its query here, so the toggles can never
+    /// drift apart between "what is highlighted" and "what gets replaced".
+    ///
+    /// Cutting any field here (e.g. reverting one to a hard-coded `false`) is
+    /// caught by `find_toggle_tests` — those drive the flag through the real UI
+    /// checkbox and assert the observable match/replace outcome moves.
+    pub(super) fn find_query_flags(&self) -> scribe_core::search::Query {
+        scribe_core::search::Query {
+            pattern: self.find_query.clone(),
+            regex: self.find_regex,
+            case_sensitive: self.find_case_sensitive,
+            whole_word: self.find_whole_word,
+        }
+    }
+
+    /// The find bar's inline error text (`Some` when the current query is an
+    /// invalid regex), as computed by the last [`Self::find_matches_active`].
+    pub(super) fn find_error_text(&self) -> Option<String> {
+        self.find_error.borrow().clone()
+    }
+
     /// #R6 — all matches of the current find query in the active buffer (empty
     /// when there is no query / no buffer / the regex is invalid).
     ///
+    /// An invalid regex yields an EMPTY match list and latches the compile error
+    /// into [`Self::find_error`] for the bar's inline error line. It must never
+    /// panic, and it must never silently fall back to a substring search — a
+    /// half-typed `(foo` reporting literal hits for `(foo` would be a lie about
+    /// what the user asked for.
+    ///
     /// P-01 / 4-02 R2 — memoized in `find_cache`, keyed by
-    /// `(query, active tab edit_gen, doc_id)`. This function is called every
-    /// frame the find bar is open (counter, highlight-all overlay, navigation);
-    /// the cache makes the full-document rescan + regex recompile happen ONLY
-    /// when the query, the buffer (`edit_gen`), or the active tab (`doc_id`)
-    /// actually changed. On an idle frame the cached matches are cloned out and
+    /// `(query, mode flags, active tab edit_gen, doc_id)`. This function is
+    /// called every frame the find bar is open (counter, highlight-all overlay,
+    /// navigation); the cache makes the full-document rescan + regex recompile
+    /// happen ONLY when the query, the MODE (regex / match-case / whole-word),
+    /// the buffer (`edit_gen`), or the active tab (`doc_id`) actually changed.
+    /// The mode is in the key because the same pattern denotes a different match
+    /// set under a different mode — omitting it would make a toggle look dead. On an idle frame the cached matches are cloned out and
     /// `find_all` is never re-invoked. Mirrors the `spell_cache` /
     /// `ensure_change_states` generation-keyed idiom.
     pub(super) fn find_matches_active(&self) -> Vec<scribe_core::search::Match> {
         if self.find_query.is_empty() || self.active >= self.tabs.len() {
+            *self.find_error.borrow_mut() = None;
             return Vec::new();
         }
         let tab = &self.tabs[self.active];
-        let key =
-            crate::find_cache::FindCacheKey::new(&self.find_query, tab.edit_gen, tab.doc_id.raw());
+        let key = crate::find_cache::FindCacheKey::new(
+            &self.find_query,
+            (
+                self.find_regex,
+                self.find_case_sensitive,
+                self.find_whole_word,
+            ),
+            tab.edit_gen,
+            tab.doc_id.raw(),
+        );
         // Cache HIT: query, edit generation, and active document all unchanged
         // since the cached entry — reuse the matches, no rescan, no recompile.
         if let Some(entry) = self.find_cache.borrow().as_ref() {
@@ -58,11 +127,21 @@ impl ScribeApp {
         // Cache MISS: recompute once and store under the new key.
         self.find_recompute_count
             .set(self.find_recompute_count.get().wrapping_add(1));
-        let q = scribe_core::search::Query {
-            pattern: self.find_query.clone(),
-            ..Default::default()
+        let q = self.find_query_flags();
+        // An invalid regex is a first-class, USER-VISIBLE outcome: report it on
+        // the bar (empty match set + inline error). `unwrap_or_default` alone
+        // would swallow the compile error and show a bare "no matches", which
+        // reads as "your pattern is fine, the text has none".
+        let matches = match scribe_core::search::find_all(&tab.text, &q) {
+            Ok(m) => {
+                *self.find_error.borrow_mut() = None;
+                m
+            }
+            Err(e) => {
+                *self.find_error.borrow_mut() = Some(format!("bad regex: {e}"));
+                Vec::new()
+            }
         };
-        let matches = scribe_core::search::find_all(&tab.text, &q).unwrap_or_default();
         *self.find_cache.borrow_mut() = Some(crate::find_cache::FindCacheEntry {
             key,
             matches: matches.clone(),

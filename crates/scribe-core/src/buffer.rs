@@ -88,6 +88,33 @@ impl Buffer {
     /// Open a file. Files at or above [`MMAP_THRESHOLD`] open as
     /// [`Buffer::Mmap`]; smaller files load into a `Rope`.
     ///
+    /// # STATUS: implemented and tested, but NOT WIRED into the app's open path
+    ///
+    /// Every caller of this function today is a test or the `file_load` bench.
+    /// The editor never reaches it: [`crate::Document::open`] loads the file and
+    /// `ScribeApp` keeps the result as a `String` per tab, from which the rope
+    /// editor builds a [`Buffer::from_text`]. So the lazy-mmap browse mode below
+    /// — the entire reason this type exists — is currently unreachable in a real
+    /// session, and a multi-GB file still pays a full decode at open time.
+    ///
+    /// This is recorded rather than hidden. The claim "no production caller" is
+    /// ENFORCED by `scribe-app/tests/public_api_dormancy.rs`: if anyone wires
+    /// this up, that guard fails and points back at this comment, so the status
+    /// cannot rot into a lie either way.
+    ///
+    /// Wiring it is not a one-line change, which is why it has not happened by
+    /// accident. It requires the tab model to stop materialising a decoded
+    /// `String` at open time — `ScribeApp::open_path`
+    /// (`scribe-app/src/app/mod.rs`), [`crate::Document`] itself
+    /// (`scribe-core/src/document.rs`), and the rope-editor hand-off in
+    /// `scribe-app/src/app/frame_tick.rs` all read `tab.text` directly. Until
+    /// those move together, calling `Buffer::open` from the open path would just
+    /// promote straight back to a rope and buy nothing.
+    ///
+    /// The safety contract in the `unsafe` block below is written for a live
+    /// browse session; re-read it before wiring, because a `Buffer::Mmap` that
+    /// outlives its tab is exactly the case it rules out.
+    ///
     /// On a successful mmap, the file handle is closed (memmap2 keeps its
     /// own internal handle); the caller never sees the `File`. The rope path
     /// decodes through `crate::encoding` (BOM + chardetng), so non-UTF-8 files

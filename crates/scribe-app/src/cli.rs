@@ -123,6 +123,16 @@ pub fn split_path_jump(arg: &str) -> (PathBuf, Option<(usize, Option<usize>)>) {
 pub fn help_text() -> String {
     let name = env!("CARGO_PKG_NAME");
     let bin = "scr1b3";
+    // Show the REAL resolved config path rather than a hand-written one. The old
+    // text named `~/.config/scr1b3/config.toml` etc. — wrong on every platform:
+    // the actual file is `scr1b3.toml` inside the `com.ItashaCorp.scr1b3`
+    // ProjectDirs dir, so a user who created the file the help named found the
+    // editor never read it. Deriving from `config_file_path()` means the help
+    // cannot drift from the loader again. `SCR1B3_CONFIG_DIR` overrides it.
+    let config_line = match scribe_core::Config::config_file_path() {
+        Some(p) => p.display().to_string(),
+        None => "(could not resolve a per-user config directory)".to_string(),
+    };
     format!(
         "{name} — a fast, GPU-rendered, telemetry-free code editor in Rust.\n\
          \n\
@@ -138,11 +148,10 @@ pub fn help_text() -> String {
                               to a position on open (e.g. src/main.rs:42:10).\n\
          \n\
          CONFIG:\n    \
-             ~/.config/scr1b3/config.toml         (Linux)\n    \
-             ~/Library/Application Support/scr1b3 (macOS)\n    \
-             %APPDATA%\\scr1b3\\config.toml         (Windows)\n\
+             {config_line}\n    \
+             (override the directory with the SCR1B3_CONFIG_DIR environment variable)\n\
          \n\
-         More: https://github.com/46b-ETYKiAL/Itasha.Corp_S4F3-SCR1B3\n\
+         More: https://github.com/46b-ETYKiAL/SCR1B3\n\
          "
     )
 }
@@ -296,6 +305,29 @@ mod tests {
         assert!(h.contains("USAGE"));
         assert!(h.contains("--help"));
         assert!(h.contains("PATH"));
+    }
+
+    /// The CONFIG section must name the REAL config file, not a hand-written path
+    /// that drifts from the loader. The old text said `config.toml` under a
+    /// `scr1b3` dir; the loader reads `scr1b3.toml` under `com.ItashaCorp.scr1b3`.
+    /// Assert against the SAME `config_file_path()` the app loads from, so the two
+    /// can never disagree again, and explicitly reject the stale filename.
+    #[test]
+    fn help_config_line_matches_the_real_config_path() {
+        let h = help_text();
+        assert!(
+            !h.contains("config.toml"),
+            "help must not name the stale `config.toml`; the real file is scr1b3.toml"
+        );
+        if let Some(p) = scribe_core::Config::config_file_path() {
+            assert!(
+                h.contains(&p.display().to_string()),
+                "help CONFIG line must show the real resolved path {}",
+                p.display()
+            );
+            // The real file basename is scr1b3.toml on every platform.
+            assert!(p.ends_with("scr1b3.toml"));
+        }
     }
 
     #[test]

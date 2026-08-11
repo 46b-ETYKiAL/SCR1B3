@@ -40,9 +40,11 @@ The name is a nod to *Serial Experiments Lain*. Good tools don't call attention 
 ## Installation
 
 Download the build for your platform from the
-[**Releases**](https://github.com/46b-ETYKiAL/Itasha.Corp_S4F3-SCR1B3/releases)
-page — that is the single maintained install channel. Every release ships a
-`.sha256` checksum next to each artifact; verify it before running.
+[**Releases**](https://github.com/46b-ETYKiAL/SCR1B3/releases)
+page — that is the single maintained install channel. Every release ships one
+signed `SHA256SUMS` manifest (plus `SHA256SUMS.minisig`) covering every
+artifact, and a `.minisig` signature next to each artifact; verify before
+running.
 
 ### Windows
 
@@ -67,8 +69,8 @@ tar -xzf scr1b3-aarch64-apple-darwin.tar.gz && ./scr1b3
 Requires a [Rust toolchain](https://rustup.rs/) (the pinned version is in `rust-toolchain.toml`).
 
 ```bash
-git clone https://github.com/46b-ETYKiAL/Itasha.Corp_S4F3-SCR1B3
-cd Itasha.Corp_S4F3-SCR1B3
+git clone https://github.com/46b-ETYKiAL/SCR1B3
+cd SCR1B3
 cargo build --release
 # binary at target/release/scr1b3
 ```
@@ -131,7 +133,7 @@ SCR1B3 reads a single live-reloading TOML file from your OS config directory. A 
 
 ## Theming
 
-Themes use a Helix-style three-namespace TOML schema (`[palette]` / `[ui]` / `[syntax]`) with palette-name references and `#RRGGBB` / `#RRGGBBAA` literals. SCR1B3 ships **34 built-in themes**. The calm canon is `itasha-corp` (default, house brand), `wired-noir` (brand canon), `phosphor-amber` (BBS heritage), `lain-mauve` (Wired violet), `ghost-paper` (light, WCAG AA), `a11y-high-contrast` (WCAG AAA-target for low-vision users), and the accessibility variants `wired-colorblind` (deuteranopia/protanopia-safe) and `itasha-void-high-contrast` (high-contrast void); the rest are the itasha-neon, heritage-alt, and Wave-4 families (see [THEMING.md](THEMING.md) for the full list). Pick one from **Settings → Appearance → Theme**, drop a user theme in `<config_dir>/themes/` to override, or click **Export to user theme** to fork the active theme to disk and edit it by hand (the live-reload watcher applies your changes immediately). Broken themes fall back to `wired-noir` so the editor never blanks. A live window colour tint (Settings → Window: enable + colour + strength) blends over the app background in real time. The optional motion settings (master switch, intensity, cursor blink) live in `[motion]` and are OFF by default. (A CRT / scanline post-process pass was scaffolded but not shipped — see THEMING.md.) Full guide: **[THEMING.md](THEMING.md)**.
+Themes use a Helix-style three-namespace TOML schema (`[palette]` / `[ui]` / `[syntax]`) with palette-name references and `#RRGGBB` / `#RRGGBBAA` literals. SCR1B3 ships **34 built-in themes**. The calm canon is `itasha-corp` (default, house brand), `wired-noir` (brand canon), `phosphor-amber` (BBS heritage), `lain-mauve` (Wired violet), `ghost-paper` (light, WCAG AA), `a11y-high-contrast` (WCAG AAA-target for low-vision users), and the accessibility variants `wired-colorblind` (deuteranopia/protanopia-safe) and `itasha-void-high-contrast` (high-contrast void); the rest are the itasha-neon, heritage-alt, and Wave-4 families (see [THEMING.md](THEMING.md) for the full list). Pick one from **Settings → Appearance → Theme**, drop a user theme in `<config_dir>/themes/` to override, or click **Export to user theme** to fork the active theme to disk and edit it by hand (the live-reload watcher applies your changes immediately). Broken themes fall back to `wired-noir` so the editor never blanks. A live window colour tint (Settings → Window: enable + colour + strength) blends over the app background in real time. The motion settings (master switch, intensity, cursor blink) live in `[motion]`, alongside the CRT/retro ambience overlays — scanlines, flicker, VHS tracking and the Wired ambient mesh. Subtle motion is ON by default; each CRT/VHS overlay is individually OFF by default, and all motion is suppressed when your OS asks for reduced motion (WCAG 2.3.3). These are painter overlays, not a GPU shader pass, so the shader-only effects (phosphor glow, bloom, curvature, chromatic aberration) are not implemented — see [THEMING.md](THEMING.md#crt-effects-shipped-as-painter-overlays-not-a-gpu-shader). Full guide: **[THEMING.md](THEMING.md)**.
 
 ## Plugins
 
@@ -150,7 +152,7 @@ SCR1B3 supports a user plugin system with a **capability-consent model**: plugin
 
 ## Status
 
-<img src="https://img.shields.io/github/last-commit/46b-ETYKiAL/Itasha.Corp_S4F3-SCR1B3?style=flat-square&color=00fffe" alt="Last commit timestamp for SCR1B3" />
+<img src="https://img.shields.io/github/last-commit/46b-ETYKiAL/SCR1B3?style=flat-square&color=00fffe" alt="Last commit timestamp for SCR1B3" />
 
 > [!TIP]
 > This project is open source under the MIT OR Apache-2.0 license. Contributions welcome.

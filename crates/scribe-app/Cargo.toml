@@ -28,6 +28,12 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 rfd = "0.17"          # native OS file dialogs (native-feel)
 arboard = "3"         # OS clipboard read for palette-driven Paste (egui exposes no read API; already in tree via eframe)
+# PNG encoder for clipboard-image attachments (`arboard::get_image` hands back
+# raw RGBA, so a note app needs an encoder to land it in the vault). Already a
+# PRODUCTION crate in the graph — `arboard` depends on `image`, which depends on
+# `png` — so this direct dependency adds ZERO new crates and reuses the existing
+# `safe-to-deploy` cargo-vet exemption. Pure Rust, no network, no telemetry.
+png = "0.18"
 notify = { workspace = true }                 # config/theme live-reload
 mimalloc = "0.1"                               # global allocator — ~20% faster on egui/editor alloc churn (egui docs); unsafe is in-crate, app stays #![forbid(unsafe_code)]
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
@@ -40,6 +46,25 @@ toml.workspace = true
 # raw-window-handle (0.6) so the trait/types line up. Handle extraction is safe
 # (no `unsafe`), so the app keeps `#![forbid(unsafe_code)]`.
 raw-window-handle = "0.6"
+
+# Windows-only: the system-tray icon + its right-click menu (single left-click
+# minimize/restore). Scoped to `cfg(windows)` DELIBERATELY — on Linux `tray-icon`
+# needs GTK3 + libxdo (a large new native surface for a feature the Linux desktop
+# increasingly serves via a different protocol), and on macOS the dock already
+# provides minimize/restore. The tray is a Windows-shell affordance, so the
+# dependency is a Windows-shell dependency.
+#
+# `default-features = false` drops the `libxdo` feature (Linux-only anyway) and
+# the optional PNG decoding — we hand it a raw RGBA buffer decoded by the same
+# `eframe::icon_data::from_png_bytes` the window icon already uses, so no second
+# image decoder enters the graph.
+#
+# Pinned EXACT (`=`) per the production-dependency pinning policy: this crate
+# owns a process-wide event handler and a shell icon, so an unattended patch bump
+# is a behaviour change in the OS integration layer, not a transparent fix.
+# License MIT OR Apache-2.0 (deny.toml allow-list). No network, no telemetry.
+[target.'cfg(windows)'.dependencies]
+tray-icon = { version = "=0.24.2", default-features = false }
 
 [dev-dependencies]
 tempfile = "3"

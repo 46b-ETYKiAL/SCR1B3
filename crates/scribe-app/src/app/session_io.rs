@@ -20,12 +20,21 @@ impl ScribeApp {
         if text != self.tabs[active].text {
             self.tabs[active].set_text(text.clone());
         }
-        // Sync editable text into the document model, then persist.
-        self.tabs[active].doc.set_text(&text);
+        // An untitled buffer has nowhere to save TO — hand off to Save-As, which
+        // does its own `doc.set_text` in `commit_save_as` once a path is picked.
+        //
+        // This check MUST come before the sync below. `is_dirty()` is
+        // `text != doc.text()`, so syncing first marked the buffer CLEAN — and
+        // then the user could cancel the Save-As picker, leaving an unsaved
+        // buffer with no `*` marker, nothing on disk, and (once the close guard
+        // existed) a "Save and close" that silently became a discard. The doc
+        // model must not be told about a save that has not happened.
         if self.tabs[active].doc.path().is_none() {
             self.save_as_active();
             return;
         }
+        // Sync editable text into the document model, then persist.
+        self.tabs[active].doc.set_text(&text);
         match self.tabs[active].doc.save() {
             Ok(lossy) => {
                 self.status = format!("saved {}", self.tabs[active].doc.file_name());

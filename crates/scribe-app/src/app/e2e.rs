@@ -837,6 +837,119 @@ fn follow_os_theme_switches_with_os() {
     );
 }
 
+/// The Settings theme picker carries the SAME defect Cycle Theme was already
+/// fixed for. With `follow_os_theme` on — the SHIPPED DEFAULT — a picked theme
+/// is not authoritative: on a light OS `effective_theme_name` returns
+/// `ghost-paper` unconditionally. So picking a theme in Settings advanced the
+/// config, persisted it, repainted the IDENTICAL theme, and left the picker
+/// displaying a theme the window was not showing.
+///
+/// An explicit pick TAKES OWNERSHIP — the same rule the command surfaces
+/// already follow. The "Follow OS dark/light" checkbox that turns back off sits
+/// on the same page, directly below, so the change is visible and reversible
+/// where it happened.
+#[test]
+fn picking_a_theme_in_settings_takes_ownership_from_follow_os() {
+    let mut cfg = Config::default();
+    cfg.editor.first_run_completed = true;
+    cfg.appearance.frameless = false;
+    assert!(
+        cfg.appearance.follow_os_theme,
+        "precondition — the SHIPPED default follows the OS theme; if this flips, \
+         this test is guarding nothing"
+    );
+    assert_eq!(
+        cfg.appearance.theme, "itasha-corp",
+        "precondition — the combo's selected text (and so the label clicked \
+         below) is the default theme name"
+    );
+    let mut h = egui_kittest::Harness::builder()
+        .with_size(egui::Vec2::new(1280.0, 940.0))
+        .build_state(
+            |ctx, app: &mut ScribeApp| app.frame_tick(ctx),
+            ScribeApp::new_test(cfg),
+        );
+    h.ctx.set_theme(egui::Theme::Light);
+    h.state_mut().settings_open = true;
+    h.run();
+    h.run();
+    assert_eq!(
+        h.state().theme.name,
+        "ghost-paper",
+        "precondition — a light OS resolves to the bundled light theme, so a \
+         picked dark theme has something to override"
+    );
+
+    // The real user path: open the theme dropdown and pick a DARK theme. The
+    // picker is the only ComboBox on the page, so the role identifies it
+    // without depending on the currently-selected name.
+    h.get_by_role(egui::accesskit::Role::ComboBox).click();
+    h.run();
+    h.get_by_label("wired-noir").click();
+    h.run();
+
+    let app = h.state();
+    assert_eq!(
+        app.config.appearance.theme, "wired-noir",
+        "the pick must be recorded in the config"
+    );
+    assert!(
+        !app.config.appearance.follow_os_theme,
+        "an explicit pick in Settings must TAKE OWNERSHIP of the theme — with \
+         the automatic mode still on, the OS keeps overriding the pick and the \
+         picker shows a theme the window is not painting"
+    );
+    assert_eq!(
+        app.theme.name, "wired-noir",
+        "and the window must actually PAINT what was picked, not the OS-resolved \
+         substitute"
+    );
+}
+
+/// The ▶ arrow beside the dropdown is the SAME explicit pick by another
+/// control, so it must take ownership too — otherwise the row's two halves
+/// disagree about whether the user's choice counts.
+#[test]
+fn stepping_the_theme_arrow_in_settings_takes_ownership_from_follow_os() {
+    let mut cfg = Config::default();
+    cfg.editor.first_run_completed = true;
+    cfg.appearance.frameless = false;
+    assert!(
+        cfg.appearance.follow_os_theme,
+        "precondition — the SHIPPED default follows the OS theme"
+    );
+    let mut h = egui_kittest::Harness::builder()
+        .with_size(egui::Vec2::new(1280.0, 940.0))
+        .build_state(
+            |ctx, app: &mut ScribeApp| app.frame_tick(ctx),
+            ScribeApp::new_test(cfg),
+        );
+    h.ctx.set_theme(egui::Theme::Light);
+    h.state_mut().settings_open = true;
+    h.run();
+    h.run();
+    let before = h.state().config.appearance.theme.clone();
+
+    // The ▶ caret is the only one on the page — it belongs to the theme row.
+    h.get_by_label(egui_phosphor::thin::CARET_RIGHT).click();
+    h.run();
+
+    let app = h.state();
+    assert_ne!(
+        app.config.appearance.theme, before,
+        "the arrow must advance the theme"
+    );
+    assert!(
+        !app.config.appearance.follow_os_theme,
+        "stepping the theme with the arrow is an explicit pick and must TAKE \
+         OWNERSHIP, exactly as choosing from the dropdown beside it does"
+    );
+    assert_eq!(
+        app.theme.name, app.config.appearance.theme,
+        "and the window must paint the theme the arrow landed on"
+    );
+}
+
 /// Phase 18 T18.2 — flipping `editor.grid_enabled` on creates the
 /// tile-tree at the top of the next frame and the central panel
 /// renders without panicking. Three frames are enough to exercise
@@ -1177,6 +1290,115 @@ fn line_gutter_empty_when_line_numbers_off() {
     app.tabs[0].text = "a\nb\nc\n".into();
     run_frames(&mut app, 2);
     assert!(app.line_gutter.is_empty());
+}
+
+/// A `line_gutter` populated by a TextEdit frame must be CLEARED the moment the
+/// editable rope arm takes over the surface.
+///
+/// This is the root cause of the stale external gutter. `line_gutter` is written
+/// only by the two TextEdit arms and cleared by nothing, so switching to the
+/// rope path left the previous galley's per-line screen Ys in place — which the
+/// external gutter panel then painted numbers, bookmark dots and change bars at,
+/// beside the rope editor's own correct gutter.
+///
+/// It is not only a paint bug: `goto_line` and `scroll_to_offset`
+/// (`find_nav.rs`) PREFER `line_gutter` over their line-height estimate, so a
+/// stale entry scrolls to the previous buffer's Y. On a rope surface the
+/// estimate is exactly right (`editor_size * line_height` IS `gutter_row_h`, the
+/// pitch `RopeEditor::show_rows` lays out with), so an empty vector is the
+/// correct state, not merely a safe one.
+#[test]
+fn line_gutter_is_cleared_when_the_rope_arm_takes_over() {
+    let mut cfg = Config::default();
+    cfg.editor.first_run_completed = true;
+    cfg.editor.show_line_numbers = true;
+    cfg.editor.experimental_rope_editor = false; // start on the TextEdit arm
+    let mut app = ScribeApp::new_test(cfg);
+    app.tabs[0].text = (0..200)
+        .map(|i| format!("line {i:04}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    run_frames(&mut app, 3);
+    assert!(
+        !app.line_gutter.is_empty(),
+        "precondition: the TextEdit arm must have populated the gutter (got {} \
+         rows) — without this the assertion below passes for the wrong reason",
+        app.line_gutter.len()
+    );
+
+    // The user flips the experimental toggle (or, equivalently, opens a buffer
+    // past `rope_editor_auto_threshold_bytes`). Same tab, same text.
+    app.config.editor.experimental_rope_editor = true;
+    run_frames(&mut app, 3);
+
+    assert!(
+        app.tabs[0].rope_state.is_some(),
+        "precondition: the rope arm must be the one rendering — `rope_state` is \
+         created by `show_editable`'s caller and by nothing else this test does"
+    );
+    assert!(
+        app.line_gutter.is_empty(),
+        "the rope arm draws its own gutter and never writes `line_gutter`; \
+         leaving {} stale row Ys in it paints a second, frozen gutter beside \
+         the real one AND sends go-to-line to the previous buffer's Y",
+        app.line_gutter.len()
+    );
+}
+
+/// …and the external gutter SidePanel must not render at all on the rope path.
+///
+/// `SidePanel::show` stores a `PanelState` under the panel's own id, so
+/// `PanelState::load` is `Some` only if the panel actually rendered in that
+/// context. One fresh `egui::Context` per probe is what makes that decidable.
+///
+/// The CONTROL half is load-bearing: the identical app on the TextEdit arm must
+/// yield `Some(..)`. Without it this test would pass if the probe simply never
+/// worked.
+#[test]
+fn the_external_gutter_panel_does_not_render_on_the_rope_path() {
+    fn gutter_panel_rendered(experimental_rope: bool) -> bool {
+        let mut cfg = Config::default();
+        cfg.editor.first_run_completed = true;
+        cfg.editor.show_line_numbers = true;
+        cfg.editor.experimental_rope_editor = experimental_rope;
+        let mut app = ScribeApp::new_test(cfg);
+        app.tabs[0].text = "alpha\nbeta\ngamma\ndelta\n".to_string();
+
+        // One context for the whole probe, so a panel shown on any frame is
+        // observable on the last.
+        let ctx = egui::Context::default();
+        for _ in 0..3 {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(1100.0, 720.0),
+                )),
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| app.frame_tick(ctx));
+        }
+        if experimental_rope {
+            assert!(
+                app.tabs[0].rope_state.is_some(),
+                "precondition: the rope arm must be the one rendering"
+            );
+        }
+        egui::PanelState::load(&ctx, egui::Id::new("line-gutter")).is_some()
+    }
+
+    assert!(
+        gutter_panel_rendered(false),
+        "CONTROL: the TextEdit arm must still show the external gutter panel — \
+         if this fails the probe is broken, not the app"
+    );
+    assert!(
+        !gutter_panel_rendered(true),
+        "the editable rope editor draws its OWN gutter; the external \
+         `line-gutter` SidePanel rendering beside it is a second gutter painted \
+         from a `line_gutter` no rope arm writes (stale numbers/bookmarks/change \
+         bars), or — with no TextEdit frame ever run — a dead filled strip"
+    );
 }
 
 #[test]
@@ -3153,6 +3375,8 @@ fn status_bar_encoding_language_and_diagnostics_labels_present() {
         uri: "inmemory://scratch".into(),
         line: 0,
         character: 0,
+        end_line: 0,
+        end_character: 2,
         severity: 1,
         message: "boom".into(),
     });
@@ -3829,5 +4053,358 @@ fn replace_in_active_empty_pattern_early_returns_without_touching_status() {
     assert_eq!(
         app.status, status_before,
         "empty-pattern replace must EARLY-RETURN, never run the body (kills || -> &&)"
+    );
+}
+
+// ---- palette / context-menu clipboard actions reach the ACTIVE editor ----
+//
+// `execute_builtin(Copy|Cut|Paste|Undo|Redo)` records a pending action that
+// `drain_pending_editor_action` delivers at the top of the next frame. There
+// are two central-editor render paths with DIFFERENT widget ids, and delivery
+// has to pick the right one:
+//
+//   * the egui `TextEdit`, keyed `Id::new("scr1b3-central-editor").with(doc_id)`
+//   * the in-house rope editor, keyed `ui.id().with("scr1b3-rope-editable")`,
+//     which auto-engages past `rope_editor_auto_threshold_bytes`
+//
+// The drain used to focus a THIRD, un-salted id (`Id::new("scr1b3-central-editor")`)
+// that belongs to no widget at all - so the action was delivered nowhere on
+// either path, while still yanking focus off the editor the user was in. These
+// tests assert the OBSERVABLE OUTCOME (the buffer actually changes / focus is
+// actually kept), not that a pending flag was set: a "pending action is Some"
+// assertion is exactly what let the defect ship.
+
+/// A primary click at `pos` (press + release), as a raw event pair.
+fn click_events(pos: egui::Pos2) -> Vec<egui::Event> {
+    vec![
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        },
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        },
+    ]
+}
+
+/// An app whose active tab renders through the rope editor, with the rope
+/// built and the caret state live (two frames: build, then settle).
+fn rope_app(text: &str) -> (Driver, ScribeApp) {
+    let mut cfg = Config::default();
+    cfg.editor.first_run_completed = true;
+    cfg.editor.experimental_rope_editor = true;
+    let mut app = ScribeApp::new_test(cfg);
+    app.tabs[0].text = text.to_string();
+    let d = Driver::new();
+    d.idle(&mut app);
+    d.idle(&mut app);
+    assert!(
+        app.tabs[0].rope_state.is_some(),
+        "precondition: the rope path is the one rendering this tab"
+    );
+    assert!(
+        app.active_editor_is_rope(),
+        "precondition: delivery must classify this tab as the rope path"
+    );
+    (d, app)
+}
+
+/// Select `[a, b)` in the rope editor's own caret state.
+fn rope_select(app: &mut ScribeApp, a: usize, b: usize) {
+    let st = app.tabs[0]
+        .rope_state
+        .as_mut()
+        .expect("rope state built by rope_app");
+    st.edit.anchor = a;
+    st.edit.cursor = b;
+    st.edit.goal_col = None;
+}
+
+/// ROPE PATH - a SAME-LENGTH selection replacement must reach `tab.text`.
+///
+/// `show_editable` syncs `tab.text` from the rope only when `EventOutcome::
+/// mutated` is set, and `mutated` used to be derived from `rope.len_chars() !=
+/// len_before`. `editing::insert` deletes the selection before inserting, so
+/// selecting "hello" and typing five characters left the length identical, the
+/// flag false, and the sync skipped. The rope held the edit and PAINTED it
+/// while `tab.text` still held the pre-edit content.
+///
+/// Three separate things are lost by that one flag, so all three are asserted
+/// here -- repairing only the save would still lose the edit on close:
+///
+///   1. the SAVE writes `tab.text`, i.e. pre-edit content;
+///   2. `is_dirty()` compares `text` against the document, so it reports FALSE
+///      and the close guard discards the tab with no "unsaved changes" prompt;
+///   3. the hot-exit backup gates on `is_dirty()`, so the tab is skipped and
+///      the edit is absent from crash recovery too.
+///
+/// The length-CHANGING control below runs the identical harness. It must pass
+/// while the same-length case fails, which is what distinguishes "this path is
+/// broken" from "this harness is broken".
+#[test]
+fn same_length_rope_edit_reaches_text_and_marks_the_tab_dirty() {
+    // Focus the editor, THEN select, then type — the order a user produces and
+    // the order the keyboard path requires (an unfocused editor never receives
+    // the Text event, and the focusing click clears any pre-set selection).
+    fn typed_over_selection(replacement: &str) -> ScribeApp {
+        let (d, mut app) = rope_app("hello world");
+        d.frame(
+            &mut app,
+            egui::Modifiers::NONE,
+            click_events(egui::pos2(300.0, 300.0)),
+        );
+        rope_select(&mut app, 0, 5);
+        d.frame(
+            &mut app,
+            egui::Modifiers::NONE,
+            vec![egui::Event::Text(replacement.to_string())],
+        );
+        app
+    }
+
+    // --- CONTROL: a length-CHANGING replacement through the same harness.
+    let app = typed_over_selection("goodbye");
+    assert_eq!(
+        app.tabs[0].text, "goodbye world",
+        "CONTROL - a length-changing replacement must reach `text`; if this \
+         fails the assertion below proves nothing"
+    );
+
+    // --- THE DEFECT: same length, same harness, same code path.
+    let app = typed_over_selection("HELLO");
+
+    let rope = app.tabs[0]
+        .rope_buf
+        .as_ref()
+        .and_then(scribe_core::buffer::Buffer::as_rope)
+        .map(std::string::ToString::to_string)
+        .expect("precondition - the rope path holds the buffer");
+    assert_eq!(
+        rope, "HELLO world",
+        "precondition - the rope really did take the edit (it is what the user \
+         can SEE on screen)"
+    );
+    assert_eq!(
+        app.tabs[0].text, "HELLO world",
+        "the rope holds the edit and paints it, but `tab.text` was never synced \
+         - a save would write the PRE-EDIT content"
+    );
+    assert!(
+        app.tabs[0].is_dirty(),
+        "the tab must be dirty after an edit: `is_dirty()` compares `text`, so \
+         a stale `text` makes the close guard discard the edit with NO prompt \
+         and makes the hot-exit backup skip the tab entirely"
+    );
+}
+
+/// ROPE PATH - a palette `Cut` must actually remove the selected text.
+#[test]
+fn palette_cut_on_rope_path_removes_the_selected_text() {
+    let (d, mut app) = rope_app("hello world");
+    rope_select(&mut app, 0, 6);
+    app.execute_builtin(BuiltinCommand::Cut);
+    d.idle(&mut app); // drain -> inject -> show_editable applies -> text syncs
+    assert_eq!(
+        app.tabs[0].text, "world",
+        "palette Cut on the rope path must delete the selection from the buffer"
+    );
+}
+
+/// ROPE PATH - a palette `Undo` / `Redo` must actually move the buffer.
+#[test]
+fn palette_undo_redo_on_rope_path_moves_the_buffer() {
+    let (d, mut app) = rope_app("");
+    // Click into the editor, then type through it, so there is a genuine
+    // undo entry recorded by the rope editor's own history.
+    d.frame(
+        &mut app,
+        egui::Modifiers::NONE,
+        click_events(egui::pos2(300.0, 300.0)),
+    );
+    d.frame(
+        &mut app,
+        egui::Modifiers::NONE,
+        vec![egui::Event::Text("abc".to_string())],
+    );
+    assert_eq!(app.tabs[0].text, "abc", "precondition: the typing landed");
+    app.execute_builtin(BuiltinCommand::Undo);
+    d.idle(&mut app);
+    assert_eq!(
+        app.tabs[0].text, "",
+        "palette Undo on the rope path must revert the typing run"
+    );
+    app.execute_builtin(BuiltinCommand::Redo);
+    d.idle(&mut app);
+    assert_eq!(
+        app.tabs[0].text, "abc",
+        "palette Redo on the rope path must re-apply it"
+    );
+}
+
+/// ROPE PATH - delivering an action must NOT steal keyboard focus. The old
+/// drain called `request_focus` on an id no widget owns, which blurred the
+/// editor the user was working in for no benefit.
+#[test]
+fn palette_action_on_rope_path_keeps_editor_focus() {
+    let (d, mut app) = rope_app("hello world");
+    d.frame(
+        &mut app,
+        egui::Modifiers::NONE,
+        click_events(egui::pos2(300.0, 300.0)),
+    );
+    let focused_before = d.ctx.memory(egui::Memory::focused);
+    assert!(
+        focused_before.is_some(),
+        "precondition: something in the editor holds focus"
+    );
+    rope_select(&mut app, 0, 5);
+    app.execute_builtin(BuiltinCommand::Copy);
+    d.idle(&mut app);
+    assert_eq!(
+        d.ctx.memory(egui::Memory::focused),
+        focused_before,
+        "delivering a palette action must not move keyboard focus"
+    );
+}
+
+/// Number of actions parked on the active tab's rope queue. An action parked
+/// there while some OTHER surface is rendering is delivered to nobody: the
+/// queue is drained only by `show_editable`, so it would sit there forever -
+/// the same silent-no-op the mode-aware drain exists to prevent.
+fn parked_on_rope_queue(app: &ScribeApp) -> usize {
+    app.tabs[app.active]
+        .rope_state
+        .as_ref()
+        .map_or(0, scribe_render::RopeEditorState::injected_len)
+}
+
+/// GRID PATH - the tiling grid renders its panes as `TextEdit`s and never calls
+/// `show_editable`, so an action must NOT be parked on the tab's rope queue even
+/// though `experimental_rope_editor` is on. Without the grid guard in
+/// `active_editor_is_rope` the action is queued on a state nothing drains and
+/// the command is a silent no-op again.
+#[test]
+fn palette_action_in_grid_mode_is_never_parked_on_the_rope_queue() {
+    let mut cfg = Config::default();
+    cfg.editor.first_run_completed = true;
+    cfg.editor.grid_enabled = true;
+    cfg.editor.experimental_rope_editor = true;
+    let mut app = ScribeApp::new_test(cfg);
+    app.tabs[0].text = "hello world".to_string();
+    let d = Driver::new();
+    d.idle(&mut app);
+    d.idle(&mut app);
+    assert!(
+        app.grid_tree.is_some(),
+        "precondition: the grid owns the central surface"
+    );
+    app.execute_builtin(BuiltinCommand::Cut);
+    d.idle(&mut app);
+    assert_eq!(
+        parked_on_rope_queue(&app),
+        0,
+        "the grid renders TextEdit panes - an action parked on the rope queue \
+         is delivered to nobody"
+    );
+}
+
+/// FOLD PATH - the folded preview is its own (non-rope) read-only surface, so an
+/// action must not be parked on the rope queue there either.
+#[test]
+fn palette_action_in_fold_view_is_never_parked_on_the_rope_queue() {
+    let mut cfg = Config::default();
+    cfg.editor.first_run_completed = true;
+    cfg.editor.experimental_rope_editor = true;
+    let mut app = ScribeApp::new_test(cfg);
+    app.tabs[0].text = "# h\n\nbody\n".to_string();
+    let d = Driver::new();
+    d.idle(&mut app);
+    app.fold_view = true;
+    d.idle(&mut app);
+    app.execute_builtin(BuiltinCommand::Copy);
+    d.idle(&mut app);
+    assert!(app.fold_view, "precondition: the fold preview is rendering");
+    assert_eq!(
+        parked_on_rope_queue(&app),
+        0,
+        "the fold preview never calls show_editable - an action parked on the \
+         rope queue is delivered to nobody"
+    );
+}
+
+/// TEXTEDIT PATH - a palette `Cut` must actually remove the selected text.
+/// The drain has to focus the editor id SALTED with the active tab's `doc_id`
+/// (what `frame_tick` builds the widget with); the un-salted id names no widget,
+/// so the event went nowhere.
+#[test]
+fn palette_cut_on_textedit_path_removes_the_selected_text() {
+    let mut cfg = Config::default();
+    cfg.editor.first_run_completed = true;
+    cfg.editor.experimental_rope_editor = false;
+    let mut app = ScribeApp::new_test(cfg);
+    app.tabs[0].text = "hello world".to_string();
+    let d = Driver::new();
+    d.idle(&mut app);
+    d.idle(&mut app); // editor auto-focuses
+    assert!(
+        !app.active_editor_is_rope(),
+        "precondition: this tab renders through the egui TextEdit"
+    );
+    let id = central_editor_id(&app);
+    set_selection(&d.ctx, id, 0, 6);
+    app.execute_builtin(BuiltinCommand::Cut);
+    d.idle(&mut app);
+    assert_eq!(
+        app.tabs[0].text, "world",
+        "palette Cut on the TextEdit path must delete the selection"
+    );
+}
+
+/// The rope editor's right-click menu offers the clipboard/history actions and
+/// a pick reaches the buffer. The rope path had NO context menu at all - the
+/// TextEdit path's menu lives in a branch the rope path returns before.
+#[test]
+fn rope_context_menu_cut_removes_the_selected_text() {
+    let mut cfg = Config::default();
+    cfg.appearance.frameless = false;
+    cfg.editor.first_run_completed = true;
+    cfg.editor.experimental_rope_editor = true;
+    let mut app = ScribeApp::new_test(cfg);
+    app.tabs[0].text = "hello world".to_string();
+    let mut h = egui_kittest::Harness::builder()
+        .with_size(egui::Vec2::new(900.0, 600.0))
+        .build_state(|ctx, app: &mut ScribeApp| app.frame_tick(ctx), app);
+    h.run();
+    h.run();
+    {
+        let st = h.state_mut().tabs[0]
+            .rope_state
+            .as_mut()
+            .expect("rope path is rendering");
+        st.edit.anchor = 0;
+        st.edit.cursor = 6;
+    }
+    // Right-click inside the editor body to open the context menu.
+    for pressed in [true, false] {
+        h.input_mut().events.push(egui::Event::PointerButton {
+            pos: egui::pos2(400.0, 300.0),
+            button: egui::PointerButton::Secondary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        });
+    }
+    h.run();
+    h.get_by_label("Cut").click();
+    h.run(); // the pick is published to ctx-data
+    h.run(); // drained by the app and applied by the editor
+    assert_eq!(
+        h.state().tabs[0].text,
+        "world",
+        "the rope editor's right-click Cut must delete the selection"
     );
 }

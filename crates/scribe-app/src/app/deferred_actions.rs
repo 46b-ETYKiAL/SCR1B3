@@ -64,6 +64,9 @@ impl ScribeApp {
         }
         if let Some(builtin) = run_builtin {
             self.execute_builtin(builtin);
+            // Same-frame, so a palette theme change repaints now rather than
+            // waiting for the next frame's `drain_pending_editor_action`.
+            self.drain_pending_theme_reapply(ctx);
             self.palette_open = false;
         }
         if save_cfg {
@@ -72,7 +75,12 @@ impl ScribeApp {
         if act.open_folder {
             if let Some(folder) = super::dialogs::pick_folder() {
                 self.status = format!("folder: {}", folder.display());
-                self.file_tree_root = Some(folder);
+                // Through `open_folder_root`, never a raw `file_tree_root`
+                // write: the helper is what records the recent-folders MRU and
+                // persists it. This site assigned the field directly, so a user
+                // who only ever opens folders from the toolbar saw "Open recent
+                // folder" stay permanently empty and read the feature as dead.
+                self.open_folder_root(folder);
             }
         }
         // F-006 wave-1 fixes from docs/audits/overlooked-surfaces-2026-05-29.md.
@@ -128,16 +136,13 @@ impl ScribeApp {
             self.join_cursor_line_with_next();
         }
         if act.cycle_theme {
-            let names = scribe_core::theme::Theme::builtin_names();
-            if !names.is_empty() {
-                let cur = &self.config.appearance.theme;
-                let idx = names.iter().position(|n| *n == cur.as_str()).unwrap_or(0);
-                let next = names[(idx + 1) % names.len()].to_string();
-                self.config.appearance.theme = next.clone();
-                self.reapply_theme(ctx);
-                self.save_config();
-                self.status = format!("theme: {next}");
-            }
+            // Was a byte-for-byte copy of the `BuiltinCommand::CycleTheme` arm
+            // in `builtins.rs`, differing only in that this one called
+            // `reapply_theme` — which is exactly how the palette entry came to
+            // persist a theme it never painted. Delegating removes the second
+            // copy, so the two surfaces cannot drift apart again.
+            self.execute_builtin(BuiltinCommand::CycleTheme);
+            self.drain_pending_theme_reapply(ctx);
         }
         // Font zoom (Ctrl+= / Ctrl+- / Ctrl+0 / Ctrl+scroll).
         if let Some(z) = act.font_zoom {

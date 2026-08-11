@@ -27,33 +27,145 @@
 //! ## The fix (canonical: melak47/BorderlessWindow, MS DWM sample, Tao/Tauri,
 //! Electron)
 //!
-//! CLEAR the caption-button style bits with `SetWindowLongPtrW(GWL_STYLE, …)` +
-//! `SetWindowPos(SWP_FRAMECHANGED)` — see [`imp::CAPTION_BUTTON_STYLES`]. With
-//! the bits gone, DWM draws no native buttons, in opaque OR transparent mode,
-//! and winit's transparency is left untouched. The strip is re-applied every
-//! frame because winit re-derives styles from its `WindowFlags` on some
-//! resize/restore paths (cheap: it only writes when a bit is actually present).
+//! Reconcile the window style with `SetWindowLongPtrW(GWL_STYLE, …)` +
+//! `SetWindowPos(SWP_FRAMECHANGED)` so DWM stops compositing the native
+//! min/max/close, and let the `WM_NCCALCSIZE`-returns-0 subclass leave no
+//! non-client strip for the OS to paint into. winit's transparency is left
+//! untouched. The reconcile runs every frame because winit re-derives styles
+//! from its `WindowFlags` on some resize/restore paths; it is cheap because it
+//! writes only when the current style actually differs from the desired one.
 //!
-//! The `WM_NCCALCSIZE` subclass is RETAINED, but ONLY for its other job: clamping
-//! a borderless MAXIMIZE to the monitor work area (and an auto-hide taskbar) so
-//! it doesn't cover the taskbar. Resize and drag are egui-owned
+//! ## Which bits are cleared — and why `WS_MAXIMIZEBOX` is NOT
+//!
+//! An earlier revision of this crate cleared
+//! `WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_CAPTION` unconditionally.
+//! That was too broad and cost real functionality: **Windows gates Aero Snap on
+//! `WS_MAXIMIZEBOX`**, so clearing it disabled drag-to-edge snapping,
+//! drag-to-top-maximize, `Win`+`Left`/`Right`/`Up`, Snap Assist **and the
+//! Windows 11 Snap Layouts flyout** — the last of which this crate elsewhere
+//! goes to some length to enable. `WS_MINIMIZEBOX` likewise gates `Win`+`Down`
+//! and the taskbar minimize/restore animation, and `WS_SYSMENU` gates
+//! `Alt`+`Space`.
+//!
+//! So the default is now the narrow strip: only `WS_CAPTION` — the bit that
+//! actually asks for a caption STRIP — is cleared, and the three
+//! window-management bits are RETAINED (see [`imp::SNAP_RETAINED_STYLES`]).
+//! [`set_snap_support_enabled`]`(false)` restores the old full strip for the case
+//! documented there.
+//!
+//! The `WM_NCCALCSIZE` subclass also does its other job: clamping a borderless
+//! MAXIMIZE to the monitor work area (and an auto-hide taskbar) so it doesn't
+//! cover the taskbar. Resize and drag are egui-owned
 //! (`ViewportCommand::BeginResize` — winit #4186 — and `StartDrag`), so the NC
 //! area is otherwise unused.
 //!
-//! Trade-off of clearing `WS_SYSMENU`: Alt+Space and the taskbar right-click
-//! system menu go away; the custom titlebar already provides min/max/close.
+//! ## What is verified, and what is NOT
+//!
+//! Everything in this crate that is a **pure decision** — the hit-test
+//! classification, the system-menu enable table, the style reconciliation, the
+//! DPI mapping, the `LPARAM` unpacking, the `HT*`/`SC_*` constant values — is
+//! unit-tested and runs on every host.
+//!
+//! What CANNOT be tested here, and is therefore **not claimed to work**, is
+//! anything that requires a real window on real Windows 11: whether the Snap
+//! Layouts flyout actually appears over the published rect, whether retaining
+//! the snap bits re-admits doubled caption buttons on a transparent window,
+//! whether Mica actually composites, and whether the rounded corners take. Those
+//! need a rendered frame on the target OS; this crate's tests prove the inputs
+//! to those behaviours are correct, not the behaviours themselves.
+//!
+//! [`notify_assoc_changed`] belongs to that second list, and unusually it is
+//! unverifiable even WITH a real window: `SHChangeNotify` returns nothing, so
+//! whether the shell received or acted on the event is not observable from this
+//! process at all. Its caller tests the DECISION (notify iff a registration
+//! actually landed); nothing tests the refresh.
+//!
+//! ## Extensions: Snap Layouts, system menu, rounded corners, backdrop
+//!
+//! Everything above is unchanged. Layered on top:
+//!
+//! * **`WM_NCHITTEST`** — the subclass now answers it, returning `HTMAXBUTTON`
+//!   over the app-published maximize-button rect ([`set_maximize_button_rect`]).
+//!   That reply is the ONLY trigger for the Windows 11 **Snap Layouts** flyout.
+//!   `DwmDefWindowProc` is consulted FIRST for the caption-button message set,
+//!   per the MS custom-frame guidance, so DWM renders the flyout itself.
+//! * **Drag/resize ownership** — deliberately left with egui
+//!   ([`hit_test::HitTestMode::MaximizeButtonOnly`], the default): every point
+//!   except the maximize button answers `HTCLIENT`, so
+//!   `scribe-app/src/app/chrome.rs`'s `resize_dir_at` / `handle_frameless_resize`
+//!   and `ViewportCommand::StartDrag` keep working untouched. Two systems both
+//!   answering "is this a resize edge?" is a real bug source (the OS modal resize
+//!   loop eats the button-up egui's state machine waits for), so exactly one owns
+//!   it. [`hit_test::HitTestMode::FullNonClient`] is available for ports that
+//!   want the opposite split — an app selecting it MUST disable its egui-space
+//!   resize handler.
+//! * **`HTMAXBUTTON` consequence** — Windows then routes clicks over that rect as
+//!   `WM_NCLBUTTONDOWN`/`UP`, so egui never sees them. The subclass handles those
+//!   itself and posts `WM_SYSCOMMAND(SC_MAXIMIZE|SC_RESTORE)`, and tracks hover
+//!   for [`maximize_button_hovered`] so the app can still paint its hover state.
+//! * **System menu** — [`show_system_menu`] pops the real `GetSystemMenu` popup
+//!   with correct per-state greying ([`system_menu::menu_state`]).
+//! * **Rounded corners** — `DWMWA_WINDOW_CORNER_PREFERENCE = DWMWCP_ROUND`,
+//!   applied once from [`ensure_caption_stripped`]. Windows 10 rejects the
+//!   attribute with an `HRESULT` we ignore, so it degrades to today's square
+//!   window; it can never fail the app.
+//! * **Backdrop (Mica/Acrylic)** — [`set_backdrop`], DEFAULT-OFF. See its doc for
+//!   why it is opt-in rather than on.
+//!
+//! ## Call-site status (honest inventory)
+//!
+//! `scribe-app` currently calls [`ensure_caption_stripped`], [`set_main_hwnd`],
+//! [`allow_foreground_handoff`] and — from
+//! `scribe-app/src/integration/windows_entries.rs`, after a registration pass
+//! that actually landed — [`notify_assoc_changed`]. Inside this crate,
+//! [`apply_rounded_corners`] and the backdrop push are called from
+//! `imp::ensure_borderless`, so they run on the app's existing per-frame call.
+//!
+//! The Snap-Layouts and system-menu entry points —
+//! [`set_maximize_button_rect`], [`clear_maximize_button_rect`],
+//! [`maximize_button_hovered`], [`show_system_menu`], [`set_hit_test_mode`],
+//! [`set_snap_support_enabled`], [`set_backdrop`] — are implemented and tested
+//! but have **no caller in this repository yet**. They are the API the titlebar
+//! in `scribe-app/src/app/chrome.rs` must call for the flyout and the system
+//! menu to become reachable; until it does, `WM_NCHITTEST` never sees a
+//! published rect and answers `HTCLIENT` everywhere, which is exactly today's
+//! behaviour. This paragraph exists so the gap is visible rather than implied.
+
+pub mod hit_test;
+pub mod system_menu;
+
+pub use hit_test::{HitTestMode, RectPx};
+
+/// Which DWM system backdrop material the window requests.
+///
+/// Mirrors `DWM_SYSTEMBACKDROP_TYPE`. `None` is the default and is what ships:
+/// see [`set_backdrop`] for the honest status of the others.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Backdrop {
+    /// No DWM material — the window paints its own background (today's shipped
+    /// behaviour).
+    #[default]
+    None,
+    /// `DWMSBT_MAINWINDOW` — Mica.
+    Mica,
+    /// `DWMSBT_TRANSIENTWINDOW` — Acrylic.
+    Acrylic,
+    /// `DWMSBT_TABBEDWINDOW` — Mica Alt.
+    MicaAlt,
+}
 
 /// Ensure THIS process's main top-level window draws no system caption buttons
-/// over the custom titlebar, by clearing the caption-button window styles
-/// (`WS_SYSMENU|WS_MINIMIZEBOX|WS_MAXIMIZEBOX`) winit leaves on the undecorated
-/// window, and installing a one-time `WM_NCCALCSIZE` subclass that clamps a
-/// borderless maximize to the monitor work area. Windows-only; a no-op
-/// everywhere else.
+/// over the custom titlebar, by reconciling the window style (clearing
+/// `WS_CAPTION`, and — unless [`set_snap_support_enabled`] is off — RETAINING
+/// the snap-gating `WS_SYSMENU|WS_MINIMIZEBOX|WS_MAXIMIZEBOX`) and installing a
+/// one-time subclass that answers `WM_NCHITTEST` and clamps a borderless
+/// maximize to the monitor work area. Also applies the rounded-corner and
+/// backdrop DWM attributes. Windows-only; a no-op everywhere else.
 ///
-/// Safe + cheap to call every frame: the HWND is cached, the subclass installs
-/// once, and the style-strip only writes when a caption-button bit is actually
-/// present (so it self-heals if winit re-asserts the styles, at near-zero cost
-/// otherwise).
+/// Safe + cheap to call every frame: the HWND is cached, the subclass and the
+/// corner attribute apply once, and the style reconcile writes only when the
+/// current style differs from the desired one (so it self-heals if winit
+/// re-asserts styles, at near-zero cost otherwise).
 #[cfg(windows)]
 pub fn ensure_caption_stripped() {
     imp::ensure_borderless();
@@ -77,6 +189,31 @@ pub fn set_main_hwnd(hwnd: isize) {
 /// No-op on non-Windows platforms.
 #[cfg(not(windows))]
 pub fn set_main_hwnd(_hwnd: isize) {}
+
+/// Whether the OS is currently requesting REDUCED MOTION (WCAG 2.3.3). On Windows
+/// this reads `SPI_GETCLIENTAREAANIMATION`: when the user has disabled animations
+/// in Settings ▸ Accessibility ▸ Visual effects (or "Show animations in Windows"),
+/// the flag is `FALSE`, which we report as reduced-motion `true`. The app gates
+/// its animations through `MotionConfig::effective_enabled(this)`, so the OS
+/// accessibility preference overrides the in-app toggle. Fast (a registry-cached
+/// read); safe to call per frame.
+// The Windows body is RE-EXPORTED from `imp` rather than wrapped here.
+// A `#[cfg(windows)] pub fn` wrapper is not compiled on the ubuntu mutation
+// runner, so every mutant of it is a vacuous MISS — but it shares its NAME
+// with the `#[cfg(not(windows))]` stub below, whose mutants are REAL and are
+// caught by `off_windows_the_query_stubs_answer_false`. A name-keyed
+// exclusion could not separate the two and would have silenced the real one.
+// Re-exporting moves the Windows definition into `imp.rs`, which is already
+// excluded as a whole file, and leaves the compiled stub under full coverage.
+#[cfg(windows)]
+pub use imp::os_reduced_motion;
+
+/// Non-Windows: no OS signal is consulted, so motion follows the in-app toggle
+/// only (reduced-motion `false` means "the OS is not forcing motion off").
+#[cfg(not(windows))]
+pub fn os_reduced_motion() -> bool {
+    false
+}
 
 /// Hand THIS process's foreground right to any process about to be spawned, so a
 /// just-launched child (the self-updater's relaunched binary, or the elevated
@@ -112,439 +249,468 @@ pub fn allow_foreground_handoff() {
 #[cfg(not(windows))]
 pub fn allow_foreground_handoff() {}
 
+// ---------------------------------------------------------------------------
+// Snap Layouts: publishing the maximize-button rect
+// ---------------------------------------------------------------------------
+
+/// Publish the app's maximize/restore caption-button rect so `WM_NCHITTEST` can
+/// answer `HTMAXBUTTON` over it — the ONLY thing that makes Windows 11 show the
+/// **Snap Layouts** flyout.
+///
+/// Coordinates are **physical pixels in client space** (origin = the window's
+/// top-left client pixel). egui works in logical points, so scale first:
+///
+/// ```no_run
+/// # let (rect, ppp) = (egui_stub::Rect, 1.0_f32);
+/// # mod egui_stub { pub struct Rect; }
+/// # fn demo(r: (f32, f32, f32, f32), ppp: f32) {
+/// let p = scribe_win32_chrome::hit_test::logical_rect_to_physical(r.0, r.1, r.2, r.3, ppp);
+/// scribe_win32_chrome::set_maximize_button_rect(p.left, p.top, p.right, p.bottom);
+/// # }
+/// ```
+///
+/// Cheap and idempotent — call it every frame from the titlebar layout so the
+/// rect follows resizes, DPI changes and toolbar-size changes. An empty or
+/// inverted rect is treated as "no button" (never hit), so a stale publish can
+/// only cost the flyout, never mis-claim a region. Windows-only; a no-op
+/// everywhere else.
 #[cfg(windows)]
-mod imp {
-    use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+pub fn set_maximize_button_rect(left: i32, top: i32, right: i32, bottom: i32) {
+    imp::set_maximize_button_rect(hit_test::RectPx::new(left, top, right, bottom));
+}
 
-    use windows_sys::Win32::Foundation::{BOOL, HWND, LPARAM, LRESULT, RECT, WPARAM};
-    use windows_sys::Win32::Graphics::Gdi::{
-        GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
-    };
-    use windows_sys::Win32::System::Threading::GetCurrentProcessId;
-    use windows_sys::Win32::UI::Shell::{
-        DefSubclassProc, SHAppBarMessage, SetWindowSubclass, ABM_GETSTATE, ABS_AUTOHIDE, APPBARDATA,
-    };
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        AllowSetForegroundWindow, EnumWindows, GetClientRect, GetWindowLongPtrW, GetWindowRect,
-        GetWindowThreadProcessId, IsWindowVisible, SetWindowLongPtrW, SetWindowPos, GWL_STYLE,
-        NCCALCSIZE_PARAMS, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
-        WM_NCCALCSIZE, WS_CAPTION, WS_MAXIMIZE, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_SYSMENU,
-    };
+/// No-op on non-Windows platforms.
+#[cfg(not(windows))]
+pub fn set_maximize_button_rect(_left: i32, _top: i32, _right: i32, _bottom: i32) {}
 
-    /// The window-style bits that make DWM draw the native min/max/close caption
-    /// buttons. winit leaves `WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX` set on
-    /// an UNDECORATED window — it only strips `WS_CAPTION`/`WS_SIZEBOX` (winit
-    /// #2754). On a transparent (DWM blur-behind) window those buttons are DWM-
-    /// composited and show THROUGH as a doubled set over our custom titlebar.
-    /// Clearing these bits is the canonical fix (melak47/BorderlessWindow, the MS
-    /// DWM custom-frame sample, Tao/Tauri, Electron); `WM_NCCALCSIZE` cannot
-    /// remove them because they are composited by DWM, not part of the standard
-    /// non-client frame (MS WM_NCCALCSIZE docs). `WS_CAPTION` is included for
-    /// completeness — clearing an already-absent bit is a no-op.
-    const CAPTION_BUTTON_STYLES: u32 = WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_CAPTION;
+/// Retract the published maximize-button rect (e.g. while fullscreen, or when
+/// the frameless titlebar is not shown). Windows-only; a no-op elsewhere.
+#[cfg(windows)]
+pub fn clear_maximize_button_rect() {
+    imp::set_maximize_button_rect(hit_test::RectPx::default());
+}
 
-    /// Whether any caption-button style bit is currently set on `style`.
-    fn caption_button_styles_present(style: u32) -> bool {
-        style & CAPTION_BUTTON_STYLES != 0
-    }
+/// No-op on non-Windows platforms.
+#[cfg(not(windows))]
+pub fn clear_maximize_button_rect() {}
 
-    /// `style` with every caption-button bit cleared; all other bits preserved.
-    fn style_without_caption_buttons(style: u32) -> u32 {
-        style & !CAPTION_BUTTON_STYLES
-    }
+/// Whether the pointer is currently over the published maximize-button rect
+/// **as Windows sees it**.
+///
+/// Once `WM_NCHITTEST` answers `HTMAXBUTTON`, Windows delivers
+/// `WM_NCMOUSEMOVE`/`WM_NCLBUTTON*` for that region instead of client-area
+/// events, so egui's own `Response::hovered()` goes permanently false there and
+/// the button stops painting its hover fill. Read this and OR it into the
+/// button's hover state to restore that. Always `false` off-Windows.
+// The Windows body is RE-EXPORTED from `imp` rather than wrapped here.
+// A `#[cfg(windows)] pub fn` wrapper is not compiled on the ubuntu mutation
+// runner, so every mutant of it is a vacuous MISS — but it shares its NAME
+// with the `#[cfg(not(windows))]` stub below, whose mutants are REAL and are
+// caught by `off_windows_the_query_stubs_answer_false`. A name-keyed
+// exclusion could not separate the two and would have silenced the real one.
+// Re-exporting moves the Windows definition into `imp.rs`, which is already
+// excluded as a whole file, and leaves the compiled stub under full coverage.
+#[cfg(windows)]
+pub use imp::maximize_button_hovered;
 
-    /// Cached main-window HWND (0 = not yet found). One window per process.
-    /// Primed by [`set_main_hwnd`] with the real eframe handle when available;
-    /// falls back to the `EnumWindows` guess only if never primed.
-    static CACHED_HWND: AtomicIsize = AtomicIsize::new(0);
-    /// Set once the NC subclass is successfully installed (install is one-shot).
-    static SUBCLASSED: AtomicBool = AtomicBool::new(false);
-    /// Set once the one-shot diagnostic file has been written.
-    static DIAG_WRITTEN: AtomicBool = AtomicBool::new(false);
+/// Always `false` on non-Windows platforms.
+#[cfg(not(windows))]
+#[must_use]
+pub fn maximize_button_hovered() -> bool {
+    false
+}
 
-    /// A stable, arbitrary subclass id for our single subclass entry.
-    const SUBCLASS_ID: usize = 0x5C_1B_3E;
+/// Select which regions this crate claims from `WM_NCHITTEST`. Defaults to
+/// [`HitTestMode::MaximizeButtonOnly`], which is what SCR1B3 uses (egui keeps
+/// drag + resize). Windows-only; a no-op elsewhere.
+#[cfg(windows)]
+pub fn set_hit_test_mode(mode: HitTestMode) {
+    imp::set_hit_test_mode(mode);
+}
 
-    /// Prime the cached HWND with the authoritative handle (see the public
-    /// wrapper). Stores only a non-zero value; idempotent.
-    pub fn set_main_hwnd(hwnd: isize) {
-        if hwnd != 0 {
-            CACHED_HWND.store(hwnd, Ordering::Relaxed);
-        }
-    }
+/// No-op on non-Windows platforms.
+#[cfg(not(windows))]
+pub fn set_hit_test_mode(_mode: HitTestMode) {}
 
-    /// `ASFW_ANY`: grant the foreground-set right to ANY process.
+// ---------------------------------------------------------------------------
+// Aero Snap / Win+Arrow: retaining the snap-gating style bits
+// ---------------------------------------------------------------------------
+
+/// Whether to retain `WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX` so Windows
+/// treats the window as snap-eligible. **DEFAULT-ON.**
+///
+/// Aero Snap drag-to-edge, drag-to-top-maximize, `Win`+arrow, Snap Assist and
+/// the Windows 11 Snap Layouts flyout ALL gate on `WS_MAXIMIZEBOX`; `Win`+`Down`
+/// and the taskbar minimize animation gate on `WS_MINIMIZEBOX`; `Alt`+`Space`
+/// gates on `WS_SYSMENU`. Clearing those bits — which this crate used to do
+/// unconditionally — disables every one of those gestures with no way to get
+/// them back, so retaining them is the default.
+///
+/// Passing `false` restores the historical full strip. That escape hatch exists
+/// because of a real, primary-sourced concern recorded in the crate root: on a
+/// winit window made transparent via `DwmEnableBlurBehindWindow` the caption
+/// buttons are DWM-COMPOSITED, and `WM_NCCALCSIZE` is documented as not
+/// affecting frames extended into the client area — so on some Win11 builds and
+/// transparency states, retaining the bits **may** re-admit the doubled native
+/// buttons over the custom titlebar.
+///
+/// **That outcome has not been observed either way by this change** — it cannot
+/// be determined from a unit test and needs a real window on real Win11. If
+/// doubled buttons appear, call this with `false` to get byte-for-byte the old
+/// behaviour (at the cost of snap). The `HTMAXBUTTON` reply from
+/// [`set_maximize_button_rect`] is independent of this switch.
+///
+/// Takes effect immediately when the window is already known, and in BOTH
+/// directions: unlike the old one-way strip, turning this back on restores bits
+/// a previous frame had cleared.
+#[cfg(windows)]
+pub fn set_snap_support_enabled(enabled: bool) {
+    imp::set_snap_support_enabled(enabled);
+}
+
+/// No-op on non-Windows platforms.
+#[cfg(not(windows))]
+pub fn set_snap_support_enabled(_enabled: bool) {}
+
+// ---------------------------------------------------------------------------
+// System menu (Alt+Space / titlebar right-click)
+// ---------------------------------------------------------------------------
+
+/// Pop the native window system menu at `(screen_x, screen_y)` and post the
+/// chosen command as `WM_SYSCOMMAND`.
+///
+/// The app must call this itself: with the titlebar answering `HTCLIENT` (see the
+/// ownership decision in [`hit_test`]) Windows never sees a non-client
+/// right-click, so it never pops the menu on its own. Wire it to a right-click
+/// (and, if desired, `Alt`+`Space`) in the custom titlebar, passing the pointer
+/// position in **screen** coordinates.
+///
+/// Items are enabled/greyed for the current window state via
+/// [`system_menu::menu_state`] — `GetSystemMenu` otherwise returns the default
+/// state, which assumes a restored, resizable window and would offer "Maximize"
+/// on an already-maximized window. Windows-only; a no-op elsewhere.
+#[cfg(windows)]
+pub fn show_system_menu(screen_x: i32, screen_y: i32) {
+    imp::show_system_menu(screen_x, screen_y);
+}
+
+/// No-op on non-Windows platforms.
+#[cfg(not(windows))]
+pub fn show_system_menu(_screen_x: i32, _screen_y: i32) {}
+
+// ---------------------------------------------------------------------------
+// DWM: rounded corners + backdrop material
+// ---------------------------------------------------------------------------
+
+/// Request rounded window corners (`DWMWA_WINDOW_CORNER_PREFERENCE` =
+/// `DWMWCP_ROUND`).
+///
+/// Called automatically (once) by [`ensure_caption_stripped`], so an app that
+/// already calls that per frame needs no change. Exposed for ports that do not.
+/// Windows 10 does not know the attribute and returns a failing `HRESULT`, which
+/// is ignored — the window stays square exactly as it is today. No version probe
+/// is needed or performed: the API's own rejection IS the clean degrade.
+#[cfg(windows)]
+pub fn apply_rounded_corners() {
+    imp::apply_rounded_corners();
+}
+
+/// No-op on non-Windows platforms.
+#[cfg(not(windows))]
+pub fn apply_rounded_corners() {}
+
+/// Request a DWM system backdrop material (`DWMWA_SYSTEMBACKDROP_TYPE`).
+///
+/// **Ships DEFAULT-OFF ([`Backdrop::None`]) and is NOT verified to composite.**
+/// The DWM side is implemented and the attribute is set, but for the material to
+/// be visible the app's own painted surface must be non-opaque all the way
+/// through `egui-wgpu`'s composite-alpha path — SCR1B3 paints an opaque
+/// `panel_fill` unless `effective_translucent()` is on, and `wgpu`'s selected
+/// `CompositeAlphaMode` is negotiated per adapter. Whether Mica actually shows
+/// through cannot be established from a unit test, and this agent has not seen a
+/// rendered frame. Treat it as an opt-in to evaluate, not a shipped feature.
+///
+/// Applied immediately if the window is known, and re-applied on the next
+/// [`ensure_caption_stripped`] otherwise. Windows-only; a no-op elsewhere.
+#[cfg(windows)]
+pub fn set_backdrop(backdrop: Backdrop) {
+    imp::set_backdrop(backdrop);
+}
+
+/// No-op on non-Windows platforms.
+#[cfg(not(windows))]
+pub fn set_backdrop(_backdrop: Backdrop) {}
+
+// ---------------------------------------------------------------------------
+// Shell notification: "file associations changed"
+// ---------------------------------------------------------------------------
+
+/// Tell the Windows shell that this app's file associations changed, so Explorer
+/// re-reads them instead of serving stale icons and verbs.
+///
+/// Registering associations writes registry keys; it does not tell the shell to
+/// look at them. Until something invalidates the shell's cached association
+/// data, Explorer can keep showing the previous icon and the previous
+/// "Open with" entry for a type SCR1B3 has just claimed. `SHCNE_ASSOCCHANGED`
+/// is the documented invalidation. (`scribe-app` used to get this refresh only
+/// as a SIDE EFFECT of deep-linking the user into the Default Apps window; the
+/// SILENT startup re-registration got no refresh at all.)
+///
+/// **Fire-and-forget: there is no success to report.** The underlying
+/// `SHChangeNotify` returns nothing, sets no last-error, and hands the event to
+/// the shell's asynchronous notification queue — so whether Explorer actually
+/// refreshed is NOT observable from this process. This returns `()`, and no
+/// caller can branch on whether it "worked"; a boolean here would be a
+/// fabricated success signal. See `imp::notify_assoc_changed` for the
+/// flag/null-pointer rationale.
+///
+/// Windows-only; a no-op everywhere else.
+// The Windows body is RE-EXPORTED from `imp` rather than wrapped here, for the
+// reason recorded on `STUBS_THAT_MUST_STAY_GATED`: a `#[cfg(windows)] pub fn`
+// wrapper would need a name-keyed mutation pardon, and re-exporting instead puts
+// the definition inside `imp.rs`, which is already excluded as a whole file.
+#[cfg(windows)]
+pub use imp::notify_assoc_changed;
+
+/// No-op on non-Windows platforms (there is no Windows shell to notify).
+#[cfg(not(windows))]
+pub fn notify_assoc_changed() {}
+
+/// The Windows-only implementation, in its own file so a single `#[cfg(windows)]`
+/// governs all of it — see `imp.rs` for why that matters to the mutation gate.
+#[cfg(windows)]
+mod imp;
+
+/// Cross-platform tests for the crate root.
+///
+/// `imp.rs` has its own `#[cfg(all(windows, test))] mod tests`; this module is
+/// the half that runs on EVERY host — which is the half the ubuntu mutation
+/// runner can actually use.
+#[cfg(test)]
+mod tests {
+    /// The Windows-only public wrappers whose mutants the ubuntu gate excludes.
+    /// On that runner the function is not compiled, so mutating it changes
+    /// nothing that builds and every mutant is a 100% false MISS. This list
+    /// MIRRORS ci.yml — the tests below fail if the premise behind any entry
+    /// stops holding, so the exclusion cannot rot into a real blind spot.
     ///
-    /// ## Why `ASFW_ANY` and not a specific PID (S-03 least-privilege review)
-    ///
-    /// `AllowSetForegroundWindow` takes a single PID and MUST be called BEFORE
-    /// the spawn, while THIS process still owns the foreground — once the caller
-    /// loses the foreground the API no-ops (MS docs), and the grant must already
-    /// be in place before the child's `SetForegroundWindow` fires. At every call
-    /// site (`updater.rs` install + relaunch) the eventual foreground-setter's
-    /// PID is therefore NOT yet available:
-    ///
-    /// * Elevated install: the real installer is a GRANDCHILD (PowerShell → UAC
-    ///   `consent.exe` → `setup.exe`); the PID we get from spawning `powershell`
-    ///   is not the installer's, so a PID-specific grant would target the wrong
-    ///   process.
-    /// * In-place relaunch: the child is spawned AFTER this call (it cannot be
-    ///   spawned first — the grant has to precede the child's foreground-set, and
-    ///   this process must still own the foreground when the grant is made), so
-    ///   the child PID does not exist at the moment the grant is needed.
-    ///
-    /// `ASFW_ANY` is the only grant that satisfies the pre-spawn ordering. It is
-    /// an ACCEPTED, time-bounded, narrowly-scoped grant — NOT an always-on one:
-    /// it is issued ONLY from the two `updater.rs` spawn sites, each immediately
-    /// before a `spawn()`, never from the main loop or any per-frame path. Its
-    /// effect is inherently short-lived: Windows consumes the delegated right on
-    /// the next `SetForegroundWindow` (or it lapses when this process loses the
-    /// foreground a moment later as the relaunch/close proceeds). It does not
-    /// persist a standing capability.
-    const ASFW_ANY: u32 = 0xFFFF_FFFF;
+    /// Keyed by function NAME, deliberately not by line number. A line-number
+    /// key rotates: insert one comment anywhere above and every entry points at
+    /// a different function. Most such shifts would land on the opposite `#[cfg]`
+    /// and fail loudly, but a shift that happens to land on a same-gated
+    /// neighbour would keep passing while silently checking the wrong function —
+    /// a guard that reads green having verified nothing.
+    const MUTATION_EXCLUDED_WRAPPERS: [&str; 10] = [
+        "ensure_caption_stripped",
+        "set_main_hwnd",
+        "allow_foreground_handoff",
+        "set_maximize_button_rect",
+        "clear_maximize_button_rect",
+        "set_hit_test_mode",
+        "set_snap_support_enabled",
+        "show_system_menu",
+        "apply_rounded_corners",
+        "set_backdrop",
+    ];
 
-    /// Delegate this (currently-foreground) process's right to set the foreground
-    /// window to any soon-to-be-spawned process. See the public wrapper.
-    pub fn allow_foreground_handoff() {
-        // SAFETY: a single Win32 call with a constant `u32` argument (no pointers,
-        // no handles). No-ops harmlessly if this process is not the foreground.
-        unsafe {
-            AllowSetForegroundWindow(ASFW_ANY);
-        }
-    }
+    /// The `#[cfg(not(windows))]` stubs whose Windows halves are RE-EXPORTS
+    /// (`#[cfg(windows)] pub use imp::NAME;`) rather than wrappers, so they are
+    /// deliberately absent from [`MUTATION_EXCLUDED_WRAPPERS`]. Two distinct
+    /// reasons put a name here, and both end in the same structure:
+    ///
+    /// * `os_reduced_motion` / `maximize_button_hovered` return a REAL value, so
+    ///   the stub IS compiled on the ubuntu runner and its mutants are real
+    ///   signal that `off_windows_the_query_stubs_answer_false` kills. A
+    ///   name-keyed exclusion cannot tell a vacuous `#[cfg(windows)]` wrapper
+    ///   from the real stub sharing its name, so excluding them by name would
+    ///   have silenced mutants that are currently CAUGHT.
+    /// * `notify_assoc_changed` returns `()` and its stub body is EMPTY, so it
+    ///   generates no mutant of its own — but a `#[cfg(windows)]` wrapper would
+    ///   have needed a new name-keyed pardon in `.cargo/mutants.toml`.
+    ///   Re-exporting needs none: the definition lands inside `imp.rs`, which is
+    ///   already excluded as a whole file. Fewer pardons, same coverage.
+    ///
+    /// Either way the Windows definition lives in the already-excluded `imp.rs`
+    /// and the exclusion surface does not grow.
+    const STUBS_THAT_MUST_STAY_GATED: [&str; 3] = [
+        "os_reduced_motion",
+        "maximize_button_hovered",
+        "notify_assoc_changed",
+    ];
 
-    /// `EnumWindows` callback: record the first visible top-level window owned by
-    /// this process into the `*mut isize` passed via `lparam`, then stop.
-    unsafe extern "system" fn enum_cb(hwnd: HWND, lparam: LPARAM) -> BOOL {
-        let mut pid = 0u32;
-        GetWindowThreadProcessId(hwnd, &mut pid);
-        if pid == GetCurrentProcessId() && IsWindowVisible(hwnd) != 0 {
-            *(lparam as *mut isize) = hwnd as isize;
-            return 0; // FALSE → stop enumerating
+    /// Every `#[cfg(..)]` attribute governing a top-level `fn <name>` in `src`.
+    ///
+    /// Returns one entry per definition, so a cfg-PAIR yields both halves and a
+    /// caller can assert the pair is exactly `{windows, not(windows)}`.
+    fn governing_cfgs_for(src: &str, name: &str) -> Vec<String> {
+        let lines: Vec<&str> = src.split('\n').collect();
+        let sig = format!("pub fn {name}(");
+        let mut found = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            if !line.starts_with(&sig) {
+                continue;
+            }
+            // Walk back over the attribute/doc-comment block to the `#[cfg(..)]`.
+            let mut j = i;
+            while j > 0 {
+                j -= 1;
+                let l = lines[j];
+                if l.starts_with("#[cfg(") {
+                    found.push(l.to_string());
+                    break;
+                }
+                if !(l.starts_with("#[") || l.starts_with("//")) {
+                    break;
+                }
+            }
         }
-        1 // TRUE → keep going
-    }
-
-    fn find_main_window() -> isize {
-        let mut found: isize = 0;
-        // SAFETY: `enum_cb` only writes the `isize` behind `lparam` (a stack local
-        // that outlives the synchronous EnumWindows call) and reads OS-owned HWNDs.
-        unsafe {
-            EnumWindows(Some(enum_cb), (&mut found as *mut isize) as LPARAM);
-        }
+        assert!(
+            !found.is_empty(),
+            "no `#[cfg(..)]`-governed `pub fn {name}` found — the list in this \
+             module names a function that no longer exists (or was renamed); \
+             update it and .github/workflows/ci.yml together"
+        );
         found
     }
 
-    /// Whether the window is currently maximized (its `WS_MAXIMIZE` style is set).
-    fn is_maximized(hwnd: HWND) -> bool {
-        // SAFETY: `hwnd` is an OS window owned by this process; GWL_STYLE read.
-        let style = unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) } as u32;
-        style & WS_MAXIMIZE != 0
-    }
-
-    /// The work area (screen minus taskbar) of the monitor the window is on.
-    fn monitor_work_area(hwnd: HWND) -> Option<RECT> {
-        // SAFETY: canonical monitor-info query; `mi.cbSize` set before the call.
-        unsafe {
-            let mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
-            if mon.is_null() {
-                return None;
-            }
-            let mut mi: MONITORINFO = std::mem::zeroed();
-            mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
-            if GetMonitorInfoW(mon, &mut mi) != 0 {
-                Some(mi.rcWork)
-            } else {
-                None
-            }
-        }
-    }
-
-    /// Whether any taskbar is in auto-hide mode. A borderless window that
-    /// maximally covers an auto-hide taskbar's edge prevents it from popping up;
-    /// the caller insets that edge by 1px to keep it reachable.
-    fn taskbar_is_autohide() -> bool {
-        // SAFETY: canonical app-bar state query; `cbSize` set before the call.
-        unsafe {
-            let mut abd: APPBARDATA = std::mem::zeroed();
-            abd.cbSize = std::mem::size_of::<APPBARDATA>() as u32;
-            let state = SHAppBarMessage(ABM_GETSTATE, &mut abd) as u32;
-            state & ABS_AUTOHIDE != 0
-        }
-    }
-
-    /// PURE geometry decision for the maximized `WM_NCCALCSIZE` client rect.
+    /// The premise behind the whole-file mutation exclusion of `imp.rs`.
     ///
-    /// A borderless maximize would otherwise cover the taskbar, so a maximized
-    /// window clamps its client rect to the monitor work area. When an auto-hide
-    /// taskbar is present we leave a 1px sliver on the bottom edge (the common
-    /// edge) so it can still pop up.
-    ///
-    /// `proposed` is the OS-proposed client rect (the full window rect); it is
-    /// returned unchanged here — the caller only invokes this on the maximized
-    /// path, where the work-area clamp wins. The non-maximized path returns the
-    /// proposed rect unchanged and never calls this. Keeping `proposed` in the
-    /// signature documents the contract and keeps the function self-describing.
-    fn maximized_client_rect(proposed: RECT, work: RECT, taskbar_autohide: bool) -> RECT {
-        let _ = proposed;
-        let mut work = work;
-        if taskbar_autohide {
-            // Leave a 1px sliver on the bottom so an auto-hide taskbar (the
-            // common edge) can still pop up.
-            work.bottom -= 1;
-        }
-        work
+    /// The gate runs on ubuntu. `imp.rs` is reached ONLY through this one
+    /// `#[cfg(windows)] mod imp;`, so on that host none of its ~1,100 lines are
+    /// compiled: mutating any of them changes nothing that builds, no test can
+    /// fail, and every mutant reports MISSED. Excluding the file drops 100%
+    /// false positives — but ONLY while that gate holds. Make the module
+    /// cross-platform and its mutants become real signal, at which point the
+    /// `--exclude` in `.github/workflows/ci.yml` would start hiding genuine
+    /// gaps. Fail here so that cannot happen quietly.
+    #[test]
+    fn the_windows_only_module_is_cfg_gated_so_the_mutation_exclusion_stays_honest() {
+        let src = include_str!("lib.rs");
+        // ASSEMBLED, never written as a literal. This test reads its OWN file,
+        // so a literal needle would sit in the source and `matches` would count
+        // the needle itself — passing no matter what the real declaration said.
+        let needle = ["#[cfg(", "windows", ")]\n", "mod imp;"].concat();
+        assert_eq!(
+            src.matches(needle.as_str()).count(),
+            1,
+            "`mod imp;` is no longer exactly `#[cfg(windows)]`-gated (or this \
+             test now self-matches). If that module compiles off Windows its \
+             mutants are real signal: DROP the `--exclude \
+             '**/scribe-win32-chrome/src/imp.rs'` from the mutation job in \
+             .github/workflows/ci.yml rather than leaving a blind spot."
+        );
     }
 
-    /// The `WM_NCCALCSIZE` subclass: turn the whole window into client area so
-    /// the OS reserves no non-client strip (hence draws no caption buttons),
-    /// while keeping a maximized window inside the monitor work area.
-    unsafe extern "system" fn nc_subclass_proc(
-        hwnd: HWND,
-        msg: u32,
-        wparam: WPARAM,
-        lparam: LPARAM,
-        _id: usize,
-        _ref: usize,
-    ) -> LRESULT {
-        if msg == WM_NCCALCSIZE && wparam != 0 {
-            // wParam == TRUE: `lparam` is `*mut NCCALCSIZE_PARAMS`. Returning 0
-            // with `rgrc[0]` (the proposed client rect) left as the full window
-            // rect makes the entire window client area → no NC caption strip →
-            // no system min/max/close, opaque or transparent.
-            if is_maximized(hwnd) {
-                // A borderless maximize would otherwise cover the taskbar. Clamp
-                // the client rect to the monitor work area via the pure decision.
-                if let Some(work) = monitor_work_area(hwnd) {
-                    let params = lparam as *mut NCCALCSIZE_PARAMS;
-                    let proposed = (*params).rgrc[0];
-                    (*params).rgrc[0] =
-                        maximized_client_rect(proposed, work, taskbar_is_autohide());
-                }
-            }
-            return 0;
-        }
-        DefSubclassProc(hwnd, msg, wparam, lparam)
-    }
-
-    /// Install the NC subclass on `hwnd` and force a frame recalculation so the
-    /// new (zero) non-client area takes effect immediately. Returns whether the
-    /// subclass was installed.
-    fn install_nc_subclass(hwnd: isize) -> bool {
-        // SAFETY: `hwnd` is an OS window owned by this process; this is the
-        // canonical comctl32 subclass install + a frame-changed re-layout.
-        unsafe {
-            let h = hwnd as HWND;
-            let ok = SetWindowSubclass(h, Some(nc_subclass_proc), SUBCLASS_ID, 0) != 0;
-            if ok {
-                // "The new client area is not visible until the client region
-                // needs to be resized" — trigger it once.
-                SetWindowPos(
-                    h,
-                    std::ptr::null_mut(),
-                    0,
-                    0,
-                    0,
-                    0,
-                    SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
-                );
-            }
-            ok
-        }
-    }
-
-    /// Clear the caption-button window styles winit leaves on the undecorated
-    /// window, then force a frame recalculation so DWM stops compositing the
-    /// native min/max/close. Only acts when a bit is actually set, so it is cheap
-    /// to call every frame AND self-heals if winit re-asserts the styles on a
-    /// resize/restore (winit re-derives styles from its `WindowFlags`). Leaves
-    /// winit's `DwmEnableBlurBehindWindow` transparency untouched — unlike the old
-    /// `DWMNCRP_DISABLED` attempt, which fought it.
-    fn strip_caption_styles(hwnd: isize) {
-        // SAFETY: `hwnd` is an OS window owned by this process; GWL_STYLE
-        // read/write + a frame-changed re-layout — the canonical borderless
-        // technique (melak47/BorderlessWindow, MS DWM custom-frame sample).
-        unsafe {
-            let h = hwnd as HWND;
-            let style = GetWindowLongPtrW(h, GWL_STYLE) as u32;
-            if !caption_button_styles_present(style) {
-                return; // already stripped — nothing to do this frame.
-            }
-            SetWindowLongPtrW(h, GWL_STYLE, style_without_caption_buttons(style) as isize);
-            SetWindowPos(
-                h,
-                std::ptr::null_mut(),
-                0,
-                0,
-                0,
-                0,
-                SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
-            );
-        }
-    }
-
-    pub fn ensure_borderless() {
-        let mut hwnd = CACHED_HWND.load(Ordering::Relaxed);
-        if hwnd == 0 {
-            // Not primed with the real eframe handle yet — fall back to the guess.
-            hwnd = find_main_window();
-            CACHED_HWND.store(hwnd, Ordering::Relaxed);
-        }
-        // Install the subclass exactly once (early frames may run before the
-        // window exists; we retry each frame until it does, then stop). The
-        // subclass now exists ONLY for the maximized→work-area clamp (so a
-        // borderless maximize doesn't cover the taskbar); it is NOT what removes
-        // the caption buttons.
-        if hwnd != 0 && !SUBCLASSED.load(Ordering::Relaxed) && install_nc_subclass(hwnd) {
-            SUBCLASSED.store(true, Ordering::Relaxed);
-        }
-        // THE caption-button fix: strip the residual `WS_SYSMENU|WS_MINIMIZEBOX|
-        // WS_MAXIMIZEBOX` styles every frame (self-healing against winit
-        // re-asserting them). This is what actually removes the doubled native
-        // min/max/close that show through a transparent window — `WM_NCCALCSIZE`
-        // structurally cannot (DWM-composited; see CAPTION_BUTTON_STYLES).
-        if hwnd != 0 {
-            strip_caption_styles(hwnd);
-        }
-        // One-shot diagnostic: after the subclass is installed, record whether the
-        // non-client strip is actually gone (client rect == window rect). Written
-        // to %TEMP%\scr1b3-caption-diag.txt so a STILL-failing fix can be debugged
-        // from evidence rather than another blind guess.
-        if hwnd != 0
-            && SUBCLASSED.load(Ordering::Relaxed)
-            && !DIAG_WRITTEN.swap(true, Ordering::Relaxed)
-        {
-            write_diag(hwnd);
-        }
-    }
-
-    /// Build a one-line snapshot of the window's NC state. `nc_strip_gone` is the
-    /// load-bearing signal: when the `WM_NCCALCSIZE` fix works, the client rect
-    /// equals the full window rect (no reserved caption strip).
-    fn nc_state_line(hwnd: isize) -> String {
-        // SAFETY: `hwnd` is an OS window owned by this process; rect + style reads.
-        unsafe {
-            let h = hwnd as HWND;
-            let mut wr: RECT = std::mem::zeroed();
-            let mut cr: RECT = std::mem::zeroed();
-            let gw = GetWindowRect(h, &mut wr);
-            let gc = GetClientRect(h, &mut cr);
-            let win = (wr.right - wr.left, wr.bottom - wr.top);
-            let cli = (cr.right - cr.left, cr.bottom - cr.top);
-            let nc_gone = gw != 0 && gc != 0 && win == cli;
-            let style = GetWindowLongPtrW(h, GWL_STYLE) as u32;
-            // The load-bearing signal post-fix: with the caption-button styles
-            // cleared, DWM draws no native min/max/close. `nc_strip_gone` is now
-            // secondary (it never governed the DWM-composited buttons).
-            let caption_btn_styles = if caption_button_styles_present(style) {
-                "present"
-            } else {
-                "stripped"
-            };
-            format!(
-                "scr1b3 caption diag: hwnd=0x{hwnd:x} subclassed={} style=0x{style:08x} \
-                 caption_btn_styles={caption_btn_styles} win={}x{} client={}x{} \
-                 nc_strip_gone={nc_gone}",
-                SUBCLASSED.load(Ordering::Relaxed),
-                win.0,
-                win.1,
-                cli.0,
-                cli.1
-            )
-        }
-    }
-
-    /// Write the diagnostic line to `%TEMP%\scr1b3-caption-diag.txt` (best-effort).
-    fn write_diag(hwnd: isize) {
-        use std::io::Write;
-        let path = std::env::temp_dir().join("scr1b3-caption-diag.txt");
-        if let Ok(mut f) = std::fs::File::create(&path) {
-            let _ = writeln!(f, "{}", nc_state_line(hwnd));
-        }
-    }
-
-    #[cfg(all(windows, test))]
-    mod tests {
-        use super::*;
-
-        fn rect(left: i32, top: i32, right: i32, bottom: i32) -> RECT {
-            RECT {
-                left,
-                top,
-                right,
-                bottom,
-            }
-        }
-
-        #[test]
-        fn maximized_clamps_to_work_area() {
-            // Proposed = full monitor; work area reserves the bottom (taskbar).
-            let proposed = rect(0, 0, 1920, 1080);
-            let work = rect(0, 0, 1920, 1040);
-            let out = maximized_client_rect(proposed, work, false);
-            // No inset when the taskbar is not auto-hide: returns the work area.
-            assert_eq!(out.left, work.left);
-            assert_eq!(out.top, work.top);
-            assert_eq!(out.right, work.right);
-            assert_eq!(out.bottom, work.bottom);
-        }
-
-        #[test]
-        fn autohide_taskbar_gets_one_px_inset() {
-            let proposed = rect(0, 0, 1920, 1080);
-            let work = rect(0, 0, 1920, 1080);
-            let out = maximized_client_rect(proposed, work, true);
-            // Bottom inset by exactly 1px; other edges identical to the work area.
-            assert_eq!(out.bottom, work.bottom - 1);
-            assert_eq!(out.left, work.left);
-            assert_eq!(out.top, work.top);
-            assert_eq!(out.right, work.right);
-        }
-
-        #[test]
-        fn multi_monitor_offset_preserved() {
-            // A second monitor placed left of / above the primary: negative origin.
-            let proposed = rect(-1920, -120, 0, 960);
-            let work = rect(-1920, -120, 0, 920);
-            let out = maximized_client_rect(proposed, work, false);
-            // Offset coordinates carried through exactly, no inset.
-            assert_eq!(out.left, -1920);
-            assert_eq!(out.top, -120);
-            assert_eq!(out.right, 0);
-            assert_eq!(out.bottom, 920);
-        }
-
-        #[test]
-        fn autohide_inset_preserves_offset_edges() {
-            // Auto-hide inset on an offset monitor still only touches `bottom`.
-            let proposed = rect(-1920, -120, 0, 960);
-            let work = rect(-1920, -120, 0, 920);
-            let out = maximized_client_rect(proposed, work, true);
-            assert_eq!(out.left, -1920);
-            assert_eq!(out.top, -120);
-            assert_eq!(out.right, 0);
-            assert_eq!(out.bottom, 919);
-        }
-
-        #[test]
-        fn caption_button_styles_detected_and_cleared() {
-            // A typical winit undecorated style: the caption-button bits set,
-            // plus an unrelated bit (WS_MAXIMIZE = the maximized STATE) that must
-            // be preserved.
-            let with = WS_CAPTION | WS_SYSMENU | WS_MAXIMIZEBOX | WS_MINIMIZEBOX | WS_MAXIMIZE;
-            assert!(caption_button_styles_present(with));
-
-            let stripped = style_without_caption_buttons(with);
+    #[test]
+    fn every_mutation_excluded_wrapper_has_a_windows_only_body() {
+        let src = include_str!("lib.rs");
+        for name in MUTATION_EXCLUDED_WRAPPERS {
+            let cfgs = governing_cfgs_for(src, name);
             assert!(
-                !caption_button_styles_present(stripped),
-                "all caption-button bits must be cleared"
+                cfgs.iter().any(|c| c == "#[cfg(windows)]"),
+                "ci.yml excludes `{name}` from the ubuntu mutation gate on the \
+                 premise that its body is Windows-only code that runner never \
+                 compiles — and it is not (any more): {cfgs:?}. Fix the list HERE \
+                 and in .github/workflows/ci.yml together, or drop the exclusion: \
+                 a cross-platform body's mutants are real signal."
             );
-            // The unrelated bit survives the strip.
-            assert_eq!(stripped & WS_MAXIMIZE, WS_MAXIMIZE);
-            // Idempotent: stripping an already-clean style changes nothing.
-            assert_eq!(style_without_caption_buttons(stripped), stripped);
-            // A style with none of the bits is reported clean (no needless work).
-            assert!(!caption_button_styles_present(WS_MAXIMIZE));
         }
+    }
+
+    #[test]
+    fn the_non_windows_stubs_are_never_mutation_excluded() {
+        let src = include_str!("lib.rs");
+        for name in STUBS_THAT_MUST_STAY_GATED {
+            let cfgs = governing_cfgs_for(src, name);
+            // The stub half must still exist and still be off-Windows-gated.
+            assert!(
+                cfgs.iter().any(|c| c == "#[cfg(not(windows))]"),
+                "`{name}` no longer has a `#[cfg(not(windows))]` stub: {cfgs:?}. \
+                 The exclusion's honesty depends on the pair staying split — the \
+                 stub is the half the ubuntu runner COMPILES, and \
+                 `off_windows_the_query_stubs_answer_false` is what kills its \
+                 mutants."
+            );
+            // The stub must NOT also have a `#[cfg(windows)] pub fn` twin here.
+            // Such a twin is not compiled on the ubuntu runner, so all of its
+            // mutants are vacuous MISSES — and because it shares this name, no
+            // name-keyed exclusion could suppress them without ALSO suppressing
+            // the stub's mutants, which are real and currently caught. The
+            // Windows half therefore lives in the already-excluded `imp.rs` and
+            // is surfaced by re-export.
+            assert!(
+                !cfgs.iter().any(|c| c == "#[cfg(windows)]"),
+                "`{name}` grew a `#[cfg(windows)] pub fn` twin in lib.rs: {cfgs:?}. \
+                 That twin's mutants are vacuous on the ubuntu gate and cannot be \
+                 excluded by name without silencing the stub's REAL ones. Put the \
+                 Windows body in `imp.rs` and re-export it instead."
+            );
+
+            // …and the re-export must actually be there, or the Windows build
+            // has no definition at all.
+            let reexport = format!("#[cfg(windows)]\npub use imp::{name};");
+            assert!(
+                src.contains(&reexport),
+                "`{name}` has no `#[cfg(windows)] pub use imp::{name};` re-export — \
+                 the Windows target would have no definition for it."
+            );
+        }
+    }
+
+    #[test]
+    fn every_cfg_pair_in_this_file_is_accounted_for_by_the_exclusion_list() {
+        // The rot guard with teeth: a NEW `#[cfg(windows)]` wrapper would add
+        // vacuous MISSES that hold the ubuntu gate permanently red, and a new
+        // `#[cfg(not(windows))]` stub would add real mutants that need killing.
+        // Either way the author must revisit ci.yml — so make adding one fail
+        // here until they do.
+        let src = include_str!("lib.rs");
+        let windows_gated = src.lines().filter(|l| *l == "#[cfg(windows)]").count();
+        let stub_gated = src.lines().filter(|l| *l == "#[cfg(not(windows))]").count();
+        assert_eq!(
+            stub_gated, 13,
+            "the number of off-Windows stubs changed; each new one that returns \
+             a REAL value carries a mutant that needs a killing assertion in \
+             this module (an EMPTY `-> ()` stub body generates none)"
+        );
+        // Every `#[cfg(windows)]` in this file is accounted for by exactly one of
+        // three roles, so a NEW one cannot appear without failing here:
+        //   * one per excluded wrapper (vacuous on ubuntu — excluded by name),
+        //   * one on `mod imp;` (the whole file is excluded),
+        //   * one per re-exported stub pair (`pub use imp::NAME;`) — the Windows
+        //     definition lives inside the already-excluded `imp.rs`, which is how
+        //     those two avoid needing a name-keyed exclusion that would also
+        //     silence their compiled stubs.
+        let reexported = STUBS_THAT_MUST_STAY_GATED.len();
+        assert_eq!(
+            windows_gated,
+            MUTATION_EXCLUDED_WRAPPERS.len() + 1 + reexported,
+            "expected one `#[cfg(windows)]` per excluded wrapper ({}), plus the one \
+             on `mod imp;`, plus one per re-exported stub pair ({reexported}); \
+             update BOTH this list and ci.yml",
+            MUTATION_EXCLUDED_WRAPPERS.len()
+        );
+    }
+
+    /// Kills the only two mutants in this file that the ubuntu mutation runner
+    /// can actually reach: `os_reduced_motion -> true` (lib.rs:201) and
+    /// `maximize_button_hovered -> true` (lib.rs:301). Both stubs return
+    /// `false`, and both `false`s are load-bearing: a `true` from the first
+    /// silently disables every animation in the app off Windows, and a `true`
+    /// from the second pins the maximize button in its hover fill forever.
+    #[cfg(not(windows))]
+    #[test]
+    fn off_windows_the_query_stubs_answer_false() {
+        assert!(
+            !super::os_reduced_motion(),
+            "off Windows no OS accessibility signal is consulted, so \
+             reduced-motion must be `false` and the in-app motion toggle decides \
+             on its own"
+        );
+        assert!(
+            !super::maximize_button_hovered(),
+            "off Windows `WM_NCHITTEST` never runs, so the maximize button is \
+             never reported as OS-hovered"
+        );
     }
 }

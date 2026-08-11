@@ -75,23 +75,81 @@ pub fn find_all(text: &str, q: &Query) -> Result<Vec<Match>> {
 }
 
 /// Replace all **non-empty** matches. For regex queries, `$1` capture refs in
-/// `replacement` are honored (regex crate semantics).
+/// `replacement` are honored (regex crate semantics); for LITERAL queries the
+/// replacement is substituted verbatim (a `$1` in the replacement text stays
+/// `$1` — see [`replace_n`]).
+///
+/// Zero-width matches are skipped per the module-level empty-match policy, so
+/// the replacement is never injected between characters.
+///
+/// # STATUS: no production caller — this is the library half of the API pair
+///
+/// The editor never calls this. Its one replace call site
+/// (`scribe-app/src/app/find_replace.rs`) passes a dynamic `Option<usize>` limit
+/// — `Some(1)` for "Replace next", `None` for "Replace all" — so it always calls
+/// [`replace_n`] directly. This wrapper's callers are the crate's criterion
+/// bench (`benches/search.rs`) and the proptest / miri / correctness integration
+/// suites.
+///
+/// It is kept, rather than deleted, because it is the unbounded half of the
+/// `replace_all` / `replace_n` pair that mirrors the `regex` crate's own
+/// `replace_all` / `replacen` shape — the spelling a reader of this module
+/// expects to find. It carries no external risk: `scribe-core` is a
+/// workspace-internal crate (not published), and the Rhai plugin surface exposes
+/// no search API, so nothing outside this repository can depend on it.
+///
+/// The "no production caller" claim is ENFORCED, not asserted: see
+/// `scribe-app/tests/public_api_dormancy.rs`. Wire this into the app and that
+/// guard fails, demanding this note be corrected.
+pub fn replace_all(text: &str, q: &Query, replacement: &str) -> Result<String> {
+    replace_n(text, q, replacement, None)
+}
+
+/// Replace at most `max` **non-empty** matches (`None` = every match), left to
+/// right. `Some(1)` is the "Replace next" semantics the find bar's single-step
+/// replace button drives; `None` is [`replace_all`].
+///
+/// # Capture expansion is gated on `q.regex`
+///
+/// For a **regex** query, `$1` / `${name}` refs in `replacement` expand with the
+/// regex crate's normal semantics — this is what makes capture-group replacement
+/// (`(\w+)@(\w+)` -> `$2.$1`) work from the find bar.
+///
+/// For a **literal** query the user did not opt into regex syntax, so a `$` in
+/// the replacement must land verbatim: replacing `a` with `$1` in a literal
+/// search must produce the two characters `$1`, not an empty expansion of a
+/// non-existent capture group. The `$` is therefore escaped (`$` -> `$$`, the
+/// regex crate's literal-dollar form) before expansion. Without this gate a
+/// literal replace silently ate `$`-bearing replacement text.
 ///
 /// Zero-width matches are skipped per the module-level empty-match policy, so
 /// the replacement is never injected between characters. The substitution is
 /// driven manually (rather than via [`regex::Regex::replace_all`]) so each
-/// match can be filtered on its span before deciding whether to substitute;
-/// `Captures::expand` provides the same `$N` / `${name}` expansion semantics as
-/// the built-in replacer.
-pub fn replace_all(text: &str, q: &Query, replacement: &str) -> Result<String> {
-    if q.pattern.is_empty() {
+/// match can be filtered on its span — and counted against `max` — before
+/// deciding whether to substitute; `Captures::expand` provides the same
+/// `$N` / `${name}` expansion semantics as the built-in replacer.
+pub fn replace_n(text: &str, q: &Query, replacement: &str, max: Option<usize>) -> Result<String> {
+    if q.pattern.is_empty() || max == Some(0) {
         return Ok(text.to_string());
     }
     let re = build_regex(q)?;
+    // Literal queries never expand capture refs — escape `$` so `expand` emits
+    // the replacement verbatim.
+    let owned;
+    let replacement: &str = if q.regex {
+        replacement
+    } else {
+        owned = replacement.replace('$', "$$");
+        &owned
+    };
 
     let mut out = String::with_capacity(text.len());
     let mut last_end = 0usize;
+    let mut done = 0usize;
     for caps in re.captures_iter(text) {
+        if max.is_some_and(|m| done >= m) {
+            break;
+        }
         // The overall match is group 0; it always exists for a successful
         // capture, so the `unwrap`-free `get(0)` is guaranteed `Some`.
         let m = caps
@@ -108,6 +166,7 @@ pub fn replace_all(text: &str, q: &Query, replacement: &str) -> Result<String> {
         out.push_str(&text[last_end..m.start()]);
         caps.expand(replacement, &mut out);
         last_end = m.end();
+        done += 1;
     }
     out.push_str(&text[last_end..]);
     Ok(out)
@@ -329,6 +388,130 @@ mod tests {
         };
         let out = replace_all("a@b c@d", &query, "$2.$1").unwrap();
         assert_eq!(out, "b.a d.c");
+    }
+
+    // --- `replace_n` bound + literal-`$` gating -----------------------------
+
+    #[test]
+    fn replace_n_one_substitutes_only_the_first_match() {
+        // "Replace next" semantics: exactly one substitution, the rest verbatim.
+        let out = replace_n("alpha alpha alpha", &q("alpha"), "beta", Some(1)).unwrap();
+        assert_eq!(out, "beta alpha alpha");
+    }
+
+    #[test]
+    fn replace_n_none_is_replace_all() {
+        assert_eq!(
+            replace_n("alpha alpha", &q("alpha"), "beta", None).unwrap(),
+            replace_all("alpha alpha", &q("alpha"), "beta").unwrap()
+        );
+    }
+
+    #[test]
+    fn replace_n_zero_is_identity() {
+        assert_eq!(
+            replace_n("alpha alpha", &q("alpha"), "beta", Some(0)).unwrap(),
+            "alpha alpha"
+        );
+    }
+
+    /// The `Some(0)` short-circuit is a DISJUNCT, not a conjunct.
+    ///
+    /// `if q.pattern.is_empty() || max == Some(0)` returns before `build_regex`
+    /// even runs, so "replace at most zero" is a total no-op — it never
+    /// compiles, never scans, and therefore cannot fail. Flip that `||` to
+    /// `&&` and the guard only fires when BOTH hold: a `Some(0)` call with a
+    /// real pattern falls through and compiles the regex.
+    ///
+    /// Every other observable is identical under the flip (a `Some(0)` fall-
+    /// through breaks on the loop's first iteration and re-emits the whole
+    /// text; an empty pattern compiles to a regex whose every match is
+    /// zero-width and is skipped) — the ONE thing that survives to the caller
+    /// is the compile ERROR. So the discriminating input is a *bad* pattern
+    /// with `max == Some(0)`: exactly the `max` side of the disjunction true.
+    #[test]
+    fn replace_n_zero_short_circuits_before_the_pattern_is_even_compiled() {
+        let bad = Query {
+            pattern: "(unclosed".into(),
+            regex: true,
+            ..Default::default()
+        };
+        // Precondition: this pattern really is uncompilable, so the test is
+        // asserting a short-circuit rather than a pattern that merely works.
+        assert!(
+            replace_n("(unclosed group", &bad, "x", Some(1)).is_err(),
+            "precondition: the pattern must fail to compile when it IS compiled"
+        );
+        assert_eq!(
+            replace_n("(unclosed group", &bad, "x", Some(0)).unwrap(),
+            "(unclosed group",
+            "`Some(0)` means do nothing — it must return the text unchanged \
+             without ever compiling the pattern"
+        );
+    }
+
+    /// The pattern side of that same disjunction: an empty pattern is a no-op
+    /// for every cap, including the caps that do NOT satisfy the `Some(0)` arm.
+    #[test]
+    fn replace_n_empty_pattern_is_a_noop_at_every_cap() {
+        for max in [None, Some(1), Some(99)] {
+            assert_eq!(
+                replace_n("alpha alpha", &q(""), "beta", max).unwrap(),
+                "alpha alpha",
+                "an empty query replaces nothing at max={max:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn replace_n_cap_above_match_count_replaces_everything() {
+        assert_eq!(replace_n("a a a", &q("a"), "b", Some(99)).unwrap(), "b b b");
+    }
+
+    #[test]
+    fn replace_n_one_skips_zero_width_before_counting() {
+        // `a*` matches empty at offset 0 of "ba"; the empty hit must not consume
+        // the single-replacement budget — the real "a" run must still be hit.
+        let out = replace_n("ba", &rq("a*"), "X", Some(1)).unwrap();
+        assert_eq!(out, "bX");
+    }
+
+    #[test]
+    fn replace_n_first_match_under_regex_expands_captures() {
+        let query = Query {
+            pattern: r"(\w+)@(\w+)".into(),
+            regex: true,
+            ..Default::default()
+        };
+        let out = replace_n("a@b c@d", &query, "$2.$1", Some(1)).unwrap();
+        assert_eq!(out, "b.a c@d");
+    }
+
+    #[test]
+    fn literal_query_does_not_expand_dollar_refs() {
+        // A LITERAL search must splice the replacement verbatim: `$1` is two
+        // characters, not an expansion of a non-existent capture group. Before
+        // the `q.regex` gate this silently produced "X" (the group-1 expansion
+        // of nothing) and ate the user's text.
+        let out = replace_all("a", &q("a"), "$1").unwrap();
+        assert_eq!(out, "$1", "a literal replacement must not expand `$1`");
+        let out2 = replace_all("cost", &q("cost"), "$5.00").unwrap();
+        assert_eq!(out2, "$5.00", "a literal `$5.00` must survive intact");
+    }
+
+    #[test]
+    fn regex_query_still_expands_dollar_refs() {
+        // The gate must not disable capture expansion for real regex queries.
+        let query = Query {
+            pattern: r"(\w+)@(\w+)".into(),
+            regex: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            replace_all("a@b", &query, "$2.$1").unwrap(),
+            "b.a",
+            "regex mode must still expand capture refs"
+        );
     }
 
     #[test]

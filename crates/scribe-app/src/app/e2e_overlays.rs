@@ -59,6 +59,35 @@ const MOD: &str = if cfg!(target_os = "macos") {
     "Ctrl"
 };
 
+/// The combo `New file` is rebound to for the test below.
+///
+/// It must not be ANY other action's default, or the cheatsheet renders the
+/// chord twice and `query_by_label` — which panics on more than one match —
+/// fails for a reason that has nothing to do with what is under test. That is
+/// not hypothetical: this test used to rebind onto `mod+e`, and the moment
+/// `toggle_md_preview` moved there (off the swallowed `mod+shift+v`) the row
+/// became ambiguous. `rebind_target_is_no_other_actions_default` below is the
+/// guard that makes the collision fail as itself instead of as a mystery.
+const REBIND_TO: &str = "mod+shift+e";
+
+/// The precondition [`REBIND_TO`] carries, asserted rather than assumed.
+#[test]
+fn rebind_target_is_no_other_actions_default() {
+    let kb = scribe_core::config::Keybindings::default();
+    let clashes: Vec<&str> = kb
+        .entries()
+        .iter()
+        .filter(|(action, combo)| *action != "new_file" && *combo == REBIND_TO)
+        .map(|(action, _)| *action)
+        .collect();
+    assert!(
+        clashes.is_empty(),
+        "the cheatsheet rebind fixture uses {REBIND_TO:?}, which is now also the \
+         default for {clashes:?} — the cheatsheet would render that chord twice \
+         and the label query would be ambiguous. Move the fixture to a free combo."
+    );
+}
+
 /// The F1 cheatsheet shows the chord the user ACTUALLY has.
 ///
 /// The table hard-coded "Ctrl+N". That was accurate only while chords were
@@ -67,11 +96,13 @@ const MOD: &str = if cfg!(target_os = "macos") {
 /// ever goes back to `entry.chord`.
 #[test]
 fn cheatsheet_renders_the_rebound_chord_not_the_default() {
-    let mut h = harness(cheatsheet_app(|c| c.keybindings.new_file = "mod+e".into()));
+    let mut h = harness(cheatsheet_app(|c| {
+        c.keybindings.new_file = REBIND_TO.into()
+    }));
     h.run();
     assert!(
-        h.query_by_label(&format!("{MOD}+E")).is_some(),
-        "the cheatsheet must show the rebound {MOD}+E for New file"
+        h.query_by_label(&format!("{MOD}+Shift+E")).is_some(),
+        "the cheatsheet must show the rebound {MOD}+Shift+E for New file"
     );
     assert!(
         h.query_by_label(&format!("{MOD}+N")).is_none(),

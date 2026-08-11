@@ -326,9 +326,42 @@ jobs:
     # `windows_module_is_cfg_gated_so_the_mutation_exclusion_stays_honest` fails
     # if that premise ever stops holding, so the exclusion cannot silently rot
     # into a real blind spot.
+    #
+    # WALL-CLOCK — why this job is sharded and capped rather than left to run.
+    #
+    # It previously declared no `timeout-minutes:` at all, so it inherited
+    # GitHub's 360-minute ceiling. On a PR that changed enough lines to yield
+    # 1763 in-diff mutants it was CANCELLED at 6h00m17s — and a cancelled job
+    # reports neither pass nor fail, it simply vanishes from the checks list.
+    # That is the worst of the three outcomes: the gate looked absent rather
+    # than red, so nobody knew mutation had stopped covering the PR.
+    #
+    # Two changes make it fail LOUDLY instead. The matrix raises the ceiling
+    # (the `mutation-app` job below is the 12-shard precedent), and the explicit
+    # per-shard `timeout-minutes` is comfortably under GitHub's limit so a
+    # genuine overrun is reported as a failed step. The pre-flight cap then
+    # turns "too big to finish" into an actionable message BEFORE burning the
+    # budget, rather than a silent cancellation five hours later.
+    #
+    # The shard count is the throughput dial. It was raised 8 -> 24 -> 40
+    # because real PRs in this repo exceed the cap a smaller matrix could test —
+    # a capped-out PR is refused, i.e. NOT mutation tested, which is a coverage
+    # hole even though it is a loud one. The fix is more shards, never a bigger
+    # per-shard cap: see the derivation on the pre-flight step.
     name: mutation testing (in-diff)
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    timeout-minutes: 100
+    strategy:
+      fail-fast: false
+      matrix:
+        shard:
+          [
+            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11,
+            12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
+            24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35,
+            36, 37, 38, 39,
+          ]
     steps:
       - name: Harden the runner (egress audit)
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
@@ -350,19 +383,95 @@ jobs:
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: git diff "$BASE_SHA"...HEAD -- '*.rs' > pr.diff
+      - name: Refuse to start a run that cannot finish
+        # The loud half of the timeout fix. `--list` is seconds (it parses, it
+        # does not build), so this converts "this PR is too large to mutation
+        # test in the budget" from a 6-hour silent cancellation into an
+        # immediate, actionable failure that names the number and the options.
+        #
+        # The cap is derived, not guessed: ~60s per mutant observed, a 100
+        # minute per-shard timeout, and a ~40% margin for the build and for
+        # slower mutants => 80 per shard. Total = MAX_PER_SHARD * SHARDS.
+        #
+        # `MAX_PER_SHARD` is the WALL-CLOCK property and is deliberately
+        # untouched: it is what the 100-minute per-shard `timeout-minutes`
+        # above is derived from (80 x ~60s = ~80 min of mutants, leaving ~20
+        # min for checkout, toolchain install and build). Raising it would
+        # invalidate that timeout and re-introduce the silent cancellation this
+        # whole block exists to prevent.
+        #
+        # `SHARDS` is the THROUGHPUT property, and is the only half raised:
+        # 8 -> 24 -> 40 widens the total cap 640 -> 1920 -> 3200 while every
+        # shard still does at most 80 mutants, so the per-shard arithmetic — and
+        # therefore the 100-minute timeout — is unchanged. The matrix already
+        # exceeds the free concurrency ceiling, so some shards queue rather than
+        # start at once; that costs latency, not correctness, because each shard
+        # carries its own independent timeout.
+        #
+        # 24 -> 40 is the fix for a gate that could no longer COMPLETE. A PR
+        # yielding 1857 in-diff mutants (96.7% of the 1920 cap) passed the
+        # pre-flight and then put ~77 mutants on every shard — right at the 80
+        # ceiling — and 12 of the 24 shards were killed by the 100-minute
+        # `timeout-minutes` with cargo-mutants still running. Not collateral of
+        # the failures: `fail-fast: false` is set above. The same 1857 mutants
+        # over 40 shards is ~47 each, which fits the existing budget with room.
+        # This SCALES the gate; the mutant set, the per-shard cap and the
+        # timeout are all untouched, so total coverage is identical.
+        #
+        # Residual, deliberately NOT patched here: the 80/shard ceiling is what
+        # the timed-out run empirically overran, so a future PR at the new 3200
+        # cap would again land ~80 on a shard and hit the same wall. The honest
+        # per-shard number is nearer 50 than 80; lowering it belongs with a
+        # matching shard raise so total capacity does not regress.
+        env:
+          MAX_PER_SHARD: 80
+          SHARDS: 40
+        run: |
+          set -euo pipefail
+          n=$(cargo mutants --list --in-diff pr.diff \
+                --exclude '**/src/integration/windows.rs' \
+                --exclude '**/scribe-win32-chrome/src/imp.rs' | wc -l)
+          echo "in-diff mutants: $n (cap $((MAX_PER_SHARD * SHARDS)))"
+          echo "in-diff mutants: **$n**" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$n" -gt "$((MAX_PER_SHARD * SHARDS))" ]; then
+            echo "::error::This PR yields $n in-diff mutants, more than the" \
+                 "$((MAX_PER_SHARD * SHARDS)) this gate can test within its" \
+                 "wall-clock budget. It has NOT been mutation tested. Either" \
+                 "split the PR, or run it locally with" \
+                 "\`cargo mutants --in-diff pr.diff --test-tool nextest\` and" \
+                 "attach the survivor list. Do not ignore this: silently" \
+                 "skipping is the failure mode this check replaced."
+            exit 1
+          fi
       - name: Mutation test (only what this PR changed)
         # A surviving mutant here means a line this PR touched can be broken with
         # the suite still green. Fix the test, or document the mutant as
         # equivalent (see apply.rs for the precedent) — do not silence the job.
         #
-        # The one `--exclude` below is NOT a silencing: `integration/windows.rs`
-        # is `#[cfg(windows)]`, so it is not compiled on this ubuntu runner and
-        # 100% of its mutants are vacuous MISSES that no test could ever kill.
-        # Adding a file here to make a REAL survivor go away is silencing; see
-        # the job comment above, and the test that pins this one's premise.
+        # The two `--exclude`s below are NOT silencing. Each names a file that is
+        # reached ONLY through a `#[cfg(windows)]` declaration, so on this ubuntu
+        # runner none of its lines are compiled: mutating them changes nothing
+        # that builds, no test can fail, and 100% of their mutants are vacuous
+        # MISSES no test could ever kill. Adding a file here to make a REAL
+        # survivor go away is silencing; see the job comment above, and the test
+        # that pins each one's premise.
+        #
+        #  * `integration/windows.rs`        — pinned by
+        #    `windows_module_is_cfg_gated_so_the_mutation_exclusion_stays_honest`
+        #  * `scribe-win32-chrome/src/imp.rs` — pinned by
+        #    `the_windows_only_module_is_cfg_gated_so_the_mutation_exclusion_stays_honest`
+        #
+        # `imp.rs` was extracted out of `scribe-win32-chrome/src/lib.rs` for
+        # exactly this reason: the Win32 body lived inline as a `#[cfg(windows)]
+        # mod imp { … }` spanning ~1,100 lines, so it could not be excluded
+        # without also excluding the handful of `#[cfg(not(windows))]` stubs in
+        # the same file — which DO compile here and whose mutants ARE real. The
+        # split keeps every compiled line of `lib.rs` under mutation.
         run: >
           cargo mutants --in-diff pr.diff --test-tool nextest --timeout 300 --in-place
+          --shard ${{ matrix.shard }}/40
           --exclude '**/src/integration/windows.rs'
+          --exclude '**/scribe-win32-chrome/src/imp.rs'
 
   mutation:
     # Mutation testing (cargo-mutants) over scribe-core — too slow to gate every
@@ -497,6 +606,25 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    # RUSTUP_TOOLCHAIN is the ONLY thing that makes this job authoritative.
+    #
+    # Installing the MSRV toolchain and letting the action make it rustup's
+    # *default* is NOT enough: the repo-root rust-toolchain.toml (channel
+    # "1.95.0") is a DIRECTORY OVERRIDE, and rustup's precedence is
+    #   `cargo +toolchain` > RUSTUP_TOOLCHAIN > `rustup override` > rust-toolchain.toml > default
+    # so the default always loses to the file. Before this env existed, this job
+    # ran `cargo check` on 1.95.0, not 1.92.0 — rustup said so on every run
+    # ("note that the toolchain '1.95.0-…' is currently in use (overridden by
+    # '…/rust-toolchain.toml')"). Passing on 1.95 proves nothing about 1.92, so
+    # the gate could not fail and the declared floor was unverified.
+    #
+    # Chosen over per-command `cargo +1.92.0 …` because the env covers EVERY
+    # toolchain-proxy invocation in the job — including future steps, build
+    # scripts, and any tool that shells out to `cargo` without a `+` prefix.
+    # A `+`-prefix has to be remembered on each command; forgetting it once
+    # silently restores the vacuous gate this fixes.
+    env:
+      RUSTUP_TOOLCHAIN: "1.92.0"
     steps:
       - name: Harden the runner (egress audit)
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
@@ -508,14 +636,25 @@ jobs:
       - name: Install Rust (declared MSRV)
         uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1 action; MSRV toolchain
         with:
-          # Must equal Cargo.toml `rust-version`. Bump both together when a
-          # dependency raises the floor.
+          # Must equal Cargo.toml `rust-version` AND RUSTUP_TOOLCHAIN above.
+          # Bump all three together when a dependency raises the floor.
           toolchain: "1.92.0"
       - name: Linux GUI deps
         run: |
           sudo apt-get update
           sudo apt-get install -y libgtk-3-dev libxcb-render0-dev libxcb-shape0-dev \
             libxcb-xfixes0-dev libxkbcommon-dev libssl-dev
+      # Anti-vacuity assertion. If a future edit ever lets the directory
+      # override win again, this fails HERE with a clear message instead of the
+      # job quietly re-testing 1.95.0 and reporting green.
+      - name: Assert the MSRV toolchain is the one actually in use
+        run: |
+          set -euo pipefail
+          rustc --version
+          rustc --version | grep -qF 'rustc 1.92.0' || {
+            echo "::error::MSRV job is not running on 1.92.0 — a toolchain override won. See the RUSTUP_TOOLCHAIN comment on this job."
+            exit 1
+          }
       - name: cargo check on the declared MSRV
         run: cargo check --workspace --locked
 
@@ -608,3 +747,335 @@ jobs:
               raise SystemExit("::error::shipped binary is missing mitigations: " + "; ".join(missing))
           print("binary hardening OK:", "; ".join(required.values()))
           PY
+
+  msi-build:
+    # Compile the Windows installer source. Before this job NOTHING in the repo
+    # ever ran WiX: `crates/scribe-app/wix/main.wxs` had never been compiled by
+    # CI or locally (there is no WiX toolchain on the dev host, and the shipped
+    # Windows artifact is the F0RG3-W1R3 native CRT .exe built by release.yml,
+    # not this MSI). A 351-row HKCU registry table was added to it validated
+    # only for XML well-formedness -- so a schema-valid-but-WiX-invalid edit, a
+    # duplicate Component Id, a dangling ComponentRef, or an illegal registry
+    # Root value would all have shipped green.
+    #
+    # This job also makes the in-tree drift test
+    # (integration::packaging_consistency_tests::
+    #  wix_installer_registers_what_the_app_registers, which asserts main.wxs's
+    # table equals the app's `registry_entries`) verified end-to-end rather than
+    # assumed: that test parses the .wxs as TEXT. Here the same table is
+    # compiled into a real MSI and read back out of the built package, so "the
+    # source text matches" is upgraded to "the installer that would actually
+    # ship carries those rows".
+    name: Windows installer (.msi) compile
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    env:
+      # WiX 3.x is required (main.wxs uses the wix/2006/wi namespace, which WiX
+      # 4/5 do not accept). Pinned to a release asset + SHA-256 rather than
+      # relying on whatever the runner image happens to preinstall, so a runner
+      # image change cannot silently swap the compiler under the gate.
+      WIX_URL: "https://github.com/wixtoolset/wix3/releases/download/wix3141rtm/wix314-binaries.zip"
+      WIX_SHA256: "6ac824e1642d6f7277d0ed7ea09411a508f6116ba6fae0aa5f2c7daa2ff43d31"
+      # Non-vacuity floor for the compiled registry table. Mirrors the
+      # `rows.len() > 300` floor the Rust drift test uses, for the same reason:
+      # a silently-empty compile would make every other assertion here
+      # trivially true.
+      REGISTRY_ROW_FLOOR: "300"
+    steps:
+      - name: Harden the runner (egress audit)
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          # Pinned for reproducible CI; bump in lockstep with rust-toolchain.toml.
+          toolchain: "1.95.0"
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Build the release binary the installer packages
+        shell: bash
+        # main.wxs embeds $(var.CargoTargetBinDir)\scr1b3.exe, so the exe must
+        # exist before `light` can build the cab. Building it for real (rather
+        # than stubbing a placeholder file) keeps the compiled MSI the same
+        # artifact a release would produce.
+        run: cargo build --locked --release --package scribe-app
+      - name: Stage the license tree the installer packages
+        shell: bash
+        # main.wxs references `<ComponentGroupRef Id="LicenseComponents" />`, a
+        # group NOTHING in the repo authors by hand -- release.yml generates it
+        # with `heat` from this staged tree. Without this step (and the harvest
+        # below) `light` cannot resolve the reference and the job dies with
+        # LGHT0094, which is exactly how this job stood before: it ran candle and
+        # light but never the harvest, so it was deterministically red.
+        #
+        # Staged into its OWN directory rather than target/release/ so `heat` can
+        # harvest the license tree without also re-harvesting scr1b3.exe, which
+        # main.wxs already declares. Mirrors release.yml's msi job exactly, so CI
+        # compiles the same package shape a release publishes.
+        run: |
+          set -euo pipefail
+          sh packaging/collect-licenses.sh "${PWD}" licstage
+          n=$(find licstage/licenses/fonts -type f | wc -l)
+          echo "font license files staged: $n"
+          [ "$n" -gt 0 ] || { echo "::error::no font licenses staged"; exit 1; }
+      - name: Install WiX 3.14 (pinned + checksum-verified)
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -sSLf -o wix314-binaries.zip "$WIX_URL"
+          # Verify BEFORE extracting: an unverified archive is never unpacked.
+          echo "${WIX_SHA256}  wix314-binaries.zip" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/wix"
+          # Git-Bash on the Windows image does not reliably ship `unzip`, and
+          # 7z's presence is an image detail, so try each and fail loudly rather
+          # than let a missing extractor look like a missing WiX.
+          if command -v unzip >/dev/null 2>&1; then
+            unzip -q -o wix314-binaries.zip -d "$RUNNER_TEMP/wix"
+          elif command -v 7z >/dev/null 2>&1; then
+            7z x -y -o"$RUNNER_TEMP/wix" wix314-binaries.zip > /dev/null
+          else
+            echo "::error::no archive extractor available (tried unzip, 7z)"
+            exit 1
+          fi
+          # heat.exe is as load-bearing as candle/light here: main.wxs carries a
+          # `<ComponentGroupRef Id="LicenseComponents" />` that ONLY the harvest
+          # below defines, so a WiX archive without heat cannot link at all.
+          for t in candle.exe light.exe dark.exe heat.exe; do
+            [ -f "$RUNNER_TEMP/wix/$t" ] || { echo "::error::WiX archive did not contain $t"; exit 1; }
+          done
+          "$RUNNER_TEMP/wix/candle.exe" -? | head -2
+      - name: Compile the installer source (candle)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Read the version EXACTLY as release.yml's `windows-msi` job does.
+          # This job used `cargo pkgid --offline -p scribe-app`, which agrees
+          # today but is a DIFFERENT mechanism from the one that runs at tag
+          # time — and the whole value of this job is that CI green predicts
+          # release green. Two mechanisms means CI cannot fail for a reason the
+          # tag-time job can (a workspace-inheritance change, a pkgid output
+          # format change, an offline-registry state difference), which is
+          # precisely the gap a mirrored gate must not have. Both jobs check out
+          # at the repo ROOT, so the path is the same in both. The workspace root
+          # carries the real number; scribe-app inherits it via
+          # `version.workspace = true`. Pinned by
+          # `both_msi_jobs_resolve_the_version_the_same_way`.
+          VER="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+          # WiX requires x.x.x.x with each field <= 65534, so a non-numeric or
+          # empty version must stop here rather than reach candle as garbage.
+          echo "$VER" | grep -qE '^[0-9]+(\.[0-9]+){1,3}$' \
+            || { echo "::error::could not resolve a numeric scribe-app version (got '$VER')"; exit 1; }
+          echo "installer version = $VER"
+          # Windows-style dir for the $(var.CargoTargetBinDir)\scr1b3.exe join.
+          BIN_DIR="$(pwd -W)/target/release"
+          LIC_DIR="$(pwd -W)/licstage"
+          [ -f "target/release/scr1b3.exe" ] || { echo "::error::target/release/scr1b3.exe missing"; exit 1; }
+          # Harvest the staged license tree into a WiX fragment -- this is what
+          # DEFINES the `LicenseComponents` group main.wxs references. Generated,
+          # not hand-authored: a hand-written list of 22 font directories rots the
+          # moment a font is added or dropped, and the whole point of the
+          # collector is that the set is dynamic. The XSL adds the RemoveFolder
+          # rows heat never emits -- without them `light` fails with one
+          # LGHT0204/ICE64 per harvested directory, because SCR1B3 installs into
+          # the user profile. Authoring the rows keeps ICE64 ENFORCED instead of
+          # suppressed -- the same trade main.wxs already documents for
+          # APPLICATIONFOLDER / ProgramsFolder.
+          "$RUNNER_TEMP/wix/heat.exe" dir "$LIC_DIR" -nologo \
+            -cg LicenseComponents -dr APPLICATIONFOLDER \
+            -ag -srd -sfrag -var var.LicenseStageDir \
+            -t crates/scribe-app/wix/license-harvest.xsl \
+            -out licenses.wxs
+          # Non-vacuity: a harvest that produced nothing would compile and link
+          # perfectly and ship an MSI with no license texts at all -- the exact
+          # silent under-delivery this step exists to prevent.
+          harvested=$(grep -c '<File ' licenses.wxs || true)
+          echo "harvested license files: $harvested"
+          [ "$harvested" -ge 25 ] || { echo "::error::heat harvested only $harvested license file(s); expected >= 25 (22 fonts + top-level docs)"; exit 1; }
+          "$RUNNER_TEMP/wix/candle.exe" -nologo -arch x64 \
+            -dVersion="$VER" -dCargoTargetBinDir="$BIN_DIR" -dLicenseStageDir="$LIC_DIR" \
+            -out main.wixobj crates/scribe-app/wix/main.wxs
+          [ -s main.wixobj ] || { echo "::error::candle reported success but produced no .wixobj"; exit 1; }
+          "$RUNNER_TEMP/wix/candle.exe" -nologo -arch x64 \
+            -dLicenseStageDir="$LIC_DIR" \
+            -out licenses.wixobj licenses.wxs
+          [ -s licenses.wixobj ] || { echo "::error::candle produced no .wixobj for the license fragment"; exit 1; }
+      - name: Link the installer (light, with ICE validation)
+        shell: bash
+        # ICE validation stays ON. Exactly two ICEs are suppressed, and only
+        # these two -- each is a known false positive for a per-user
+        # (InstallScope="perUser") MSI, which is what this installer is by
+        # design (no admin / no UAC, so the in-app updater can swap the binary
+        # in place; see the header comment in main.wxs):
+        #   ICE38 -- "component installs to user profile, KeyPath must be an
+        #            HKCU registry value, not a file". Written for per-machine
+        #            packages so they can track per-user install state; a
+        #            strictly perUser package has no other-user scenario. The
+        #            file KeyPath is also what lets MSI detect and self-heal a
+        #            deleted scr1b3.exe, which an HKCU KeyPath would not.
+        #            Verified load-bearing: dropping this alone still fails 204.
+        #   ICE91 -- per-user directory "doesn't vary based on ALLUSERS", which
+        #            is the explicit intent of a perUser install. Note this one
+        #            is LGHT1076, a WARNING -- light exits 0 without the flag.
+        #            Kept so intent is documented and so it stays correct if
+        #            -wx is ever added, NOT because the build needs it.
+        # ICE64 was suppressed here and is no longer: main.wxs now carries the
+        # RemoveFolder rows, so the ICE links clean and is ENFORCED again. That
+        # was done to strengthen the gate, not to fix a leak -- a real per-user
+        # install/uninstall cycle showed Windows Installer already sweeps the
+        # empty directories it created, with or without those rows.
+        # Every other ICE -- including the ones that catch duplicate keys, bad
+        # foreign keys, malformed tables and invalid sequencing -- still fails
+        # the build. Do NOT widen this list to make an edit pass: an ICE outside
+        # these three is a real defect in the .wxs.
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/wix/light.exe" -nologo \
+            -ext WixUIExtension -ext WixUtilExtension \
+            -sice:ICE38 -sice:ICE91 \
+            -out scr1b3-installer.msi main.wixobj licenses.wixobj
+          [ -f scr1b3-installer.msi ] || { echo "::error::light reported success but produced no .msi"; exit 1; }
+          # light writes the .msi BEFORE ICE validation runs, so "the file
+          # exists" is not by itself proof the link succeeded -- `set -e` on
+          # light's exit status is what enforces that. This size floor is the
+          # separate check that the package is not a degenerate stub.
+          sz=$(wc -c < scr1b3-installer.msi)
+          echo "MSI size = $sz bytes"
+          [ "$sz" -gt 100000 ] || { echo "::error::MSI is implausibly small ($sz bytes)"; exit 1; }
+      - name: Assert the compiled MSI carries the registry table the app expects
+        shell: bash
+        # Reads the table back out of the BUILT package (via WiX's own
+        # decompiler) instead of trusting the source text. This is what turns
+        # the Rust drift test's premise from assumed into verified: that test
+        # proves main.wxs's text matches `registry_entries`; this proves the
+        # package that would ship actually contains that same set of rows.
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/wix/dark.exe" -nologo scr1b3-installer.msi -out decompiled.wxs
+          [ -s decompiled.wxs ] || { echo "::error::dark produced no output"; exit 1; }
+          built=$(grep -c '<RegistryValue' decompiled.wxs || true)
+          src=$(grep -c '<RegistryValue' crates/scribe-app/wix/main.wxs || true)
+          echo "RegistryValue rows: source=$src compiled=$built"
+          if [ "$built" -lt "$REGISTRY_ROW_FLOOR" ]; then
+            echo "::error::the compiled MSI carries only $built RegistryValue rows (floor $REGISTRY_ROW_FLOOR) -- the registry table did not make it into the package."
+            exit 1
+          fi
+          if [ "$built" -ne "$src" ]; then
+            echo "::error::registry rows differ between source ($src) and compiled MSI ($built) -- rows were dropped or merged during the build."
+            exit 1
+          fi
+          # License delivery, asserted against the BUILT package rather than the
+          # staging directory -- the same assertion release.yml makes, kept here
+          # so a license regression is caught on the PR that causes it instead of
+          # at tag time. A staged tree only proves the collector ran; the File
+          # table is what proves the texts actually SHIP.
+          licfiles=$(grep -cE '<File [^>]*Name="(OFL|LICENSE|UFL)[^"]*"' decompiled.wxs || true)
+          echo "license files in the compiled MSI: $licfiles"
+          [ "$licfiles" -ge 22 ] || { echo "::error::the compiled MSI carries only $licfiles font license file(s) (expected >= 22) -- OFL-1.1 s2 requires the text to accompany every copy."; exit 1; }
+          for doc in LICENSE-MIT THIRD-PARTY-LICENSES.md; do
+            grep -q "Name=\"$doc\"" decompiled.wxs || { echo "::error::the compiled MSI does not carry $doc"; exit 1; }
+          done
+      - name: Upload the compiled MSI
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: scr1b3-msi-ci
+          path: scr1b3-installer.msi
+          if-no-files-found: error
+
+  gate:
+    # THE aggregating check. Every blocking job above is a `needs:` of this one,
+    # so a single required-status-check entry ("CI gate") covers the whole set
+    # -- and a job can no longer be authoritative while being unable to block a
+    # merge. `msrv` is the case in point: it was recently made authoritative
+    # (job-level RUSTUP_TOOLCHAIN, so it really tests the declared floor instead
+    # of silently re-testing 1.95.0 under the rust-toolchain.toml directory
+    # override) while being a `needs:` of NOTHING, which left the repaired gate
+    # still unable to fail a merge.
+    #
+    # `if: always()` is required: without it, a failed or skipped dependency
+    # would SKIP this job, and GitHub treats a skipped required check as
+    # satisfied -- the exact "skipped equals success" footgun this job closes.
+    name: CI gate
+    needs:
+      - test
+      - deny
+      - content-safety
+      - forge-wire-manifest
+      - bench-smoke
+      - gpu-ignored
+      - fuzz-build
+      - miri
+      - mutation-in-diff
+      - unused-deps
+      - msrv
+      - supply-chain-audit
+      - binary-hardening
+      - msi-build
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Verify every required job succeeded
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          R_TEST: ${{ needs.test.result }}
+          R_DENY: ${{ needs.deny.result }}
+          R_CONTENT_SAFETY: ${{ needs.content-safety.result }}
+          R_FORGE_WIRE_MANIFEST: ${{ needs.forge-wire-manifest.result }}
+          R_BENCH_SMOKE: ${{ needs.bench-smoke.result }}
+          R_GPU_IGNORED: ${{ needs.gpu-ignored.result }}
+          R_FUZZ_BUILD: ${{ needs.fuzz-build.result }}
+          R_MIRI: ${{ needs.miri.result }}
+          R_MUTATION_IN_DIFF: ${{ needs.mutation-in-diff.result }}
+          R_UNUSED_DEPS: ${{ needs.unused-deps.result }}
+          R_MSRV: ${{ needs.msrv.result }}
+          R_SUPPLY_CHAIN_AUDIT: ${{ needs.supply-chain-audit.result }}
+          R_BINARY_HARDENING: ${{ needs.binary-hardening.result }}
+          R_MSI_BUILD: ${{ needs.msi-build.result }}
+        run: |
+          set -uo pipefail
+          failed=0
+          # $1 = job name, $2 = result, $3 = "skippable" when the job is
+          # deliberately gated off for this trigger.
+          check() {
+            printf '%-24s %s\n' "$1" "$2"
+            if [ "$2" = "success" ]; then return; fi
+            if [ "${3:-}" = "skippable" ] && [ "$2" = "skipped" ]; then
+              echo "                         (skipped by design for event '${EVENT}')"
+              return
+            fi
+            echo "::error::required job '$1' did not succeed (result: $2)"
+            failed=1
+          }
+          check test                 "$R_TEST"
+          check deny                 "$R_DENY"
+          check content-safety       "$R_CONTENT_SAFETY"
+          check forge-wire-manifest  "$R_FORGE_WIRE_MANIFEST"
+          check bench-smoke          "$R_BENCH_SMOKE"
+          check gpu-ignored          "$R_GPU_IGNORED"
+          check fuzz-build           "$R_FUZZ_BUILD"
+          check miri                 "$R_MIRI"
+          check unused-deps          "$R_UNUSED_DEPS"
+          check msrv                 "$R_MSRV"
+          check supply-chain-audit   "$R_SUPPLY_CHAIN_AUDIT"
+          check binary-hardening     "$R_BINARY_HARDENING"
+          check msi-build            "$R_MSI_BUILD"
+          # mutation-in-diff is `if: github.event_name == 'pull_request'`, so it
+          # is legitimately skipped on push and schedule runs. On a pull_request
+          # -- the case a merge gate actually guards -- it must succeed like
+          # everything else.
+          if [ "$EVENT" = "pull_request" ]; then
+            check mutation-in-diff "$R_MUTATION_IN_DIFF"
+          else
+            check mutation-in-diff "$R_MUTATION_IN_DIFF" skippable
+          fi
+          if [ "$failed" -ne 0 ]; then
+            echo "::error::CI gate failed -- one or more required jobs did not succeed."
+            exit 1
+          fi
+          echo "CI gate passed: all required jobs succeeded."

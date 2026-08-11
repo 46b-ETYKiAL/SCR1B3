@@ -52,9 +52,65 @@ pub(crate) const KEYBOARD_SHORTCUTS: &[ShortcutEntry] = &[
         bindings: &[action::SAVE],
     },
     ShortcutEntry {
+        chord: "Ctrl+Shift+S",
+        action: "Save active buffer under a new name",
+        bindings: &[action::SAVE_AS],
+    },
+    ShortcutEntry {
         chord: "Ctrl+W",
         action: "Close active tab",
         bindings: &[action::CLOSE_TAB],
+    },
+    // One row PER tab number, deliberately. Folding all nine into a single row
+    // would render as `display_for`'s " / "-joined list — "Ctrl+1 / Ctrl+2 / …
+    // / Ctrl+9" — which is 60+ monospace chars in a two-column grid whose other
+    // column is the description, so it would widen the whole modal. Nine short
+    // rows cost vertical space in an already-scrolling list; one long row costs
+    // every other row's layout.
+    ShortcutEntry {
+        chord: "Ctrl+1",
+        action: "Go to tab 1 (out of range: no-op, never a clamp)",
+        bindings: &[action::GOTO_TAB_1],
+    },
+    ShortcutEntry {
+        chord: "Ctrl+2",
+        action: "Go to tab 2",
+        bindings: &[action::GOTO_TAB_2],
+    },
+    ShortcutEntry {
+        chord: "Ctrl+3",
+        action: "Go to tab 3",
+        bindings: &[action::GOTO_TAB_3],
+    },
+    ShortcutEntry {
+        chord: "Ctrl+4",
+        action: "Go to tab 4",
+        bindings: &[action::GOTO_TAB_4],
+    },
+    ShortcutEntry {
+        chord: "Ctrl+5",
+        action: "Go to tab 5",
+        bindings: &[action::GOTO_TAB_5],
+    },
+    ShortcutEntry {
+        chord: "Ctrl+6",
+        action: "Go to tab 6",
+        bindings: &[action::GOTO_TAB_6],
+    },
+    ShortcutEntry {
+        chord: "Ctrl+7",
+        action: "Go to tab 7",
+        bindings: &[action::GOTO_TAB_7],
+    },
+    ShortcutEntry {
+        chord: "Ctrl+8",
+        action: "Go to tab 8",
+        bindings: &[action::GOTO_TAB_8],
+    },
+    ShortcutEntry {
+        chord: "Ctrl+9",
+        action: "Go to tab 9",
+        bindings: &[action::GOTO_TAB_9],
     },
     ShortcutEntry {
         chord: "Ctrl+Tab",
@@ -177,7 +233,10 @@ pub(crate) const KEYBOARD_SHORTCUTS: &[ShortcutEntry] = &[
         bindings: &[action::TOGGLE_MINIMAP],
     },
     ShortcutEntry {
-        chord: "Ctrl+Shift+V",
+        // NOT Ctrl+Shift+V: the windowing layer eats every command+V press as
+        // Paste (Shift is not excluded from its test), so that chord could never
+        // reach the editor. See `keymap::swallowed_by`.
+        chord: "Ctrl+E",
         action: "Toggle the markdown live-preview panel",
         bindings: &[action::TOGGLE_MD_PREVIEW],
     },
@@ -334,6 +393,7 @@ pub(crate) enum BuiltinCommand {
     ToggleZen,
     ToggleMarkdownPreview,
     ToggleDiffView,
+    ToggleNotesPane,
     ToggleSpellcheck,
     ToggleWordWrap,
     ToggleLineNumbers,
@@ -385,6 +445,13 @@ pub(crate) enum BuiltinCommand {
     NewChecklistNote,
     NewMeetingNote,
     NewDailyNote,
+    // ---- Note-capture actions ----
+    /// Save the clipboard image into the vault's attachments folder and insert
+    /// a markdown link to it at the caret.
+    PasteImageAttachment,
+    /// Rename the active note, retargeting every inbound `[[wiki-link]]` in the
+    /// vault so no backlink is silently broken.
+    RenameNote,
 }
 
 /// A clipboard / history action the palette requests; drained in `frame_tick`
@@ -561,6 +628,12 @@ pub(crate) const BUILTIN_COMMANDS: &[BuiltinEntry] = &[
         bindings: &[],
     },
     BuiltinEntry {
+        label: "Paste image as attachment",
+        shortcut: "",
+        action: BuiltinCommand::PasteImageAttachment,
+        bindings: &[],
+    },
+    BuiltinEntry {
         label: "Previous tab",
         shortcut: "",
         action: BuiltinCommand::CycleTabPrev,
@@ -570,6 +643,12 @@ pub(crate) const BUILTIN_COMMANDS: &[BuiltinEntry] = &[
         label: "Redo",
         shortcut: "Ctrl+Shift+Z",
         action: BuiltinCommand::Redo,
+        bindings: &[],
+    },
+    BuiltinEntry {
+        label: "Rename note (updates links)…",
+        shortcut: "",
+        action: BuiltinCommand::RenameNote,
         bindings: &[],
     },
     BuiltinEntry {
@@ -688,9 +767,16 @@ pub(crate) const BUILTIN_COMMANDS: &[BuiltinEntry] = &[
     },
     BuiltinEntry {
         label: "Toggle markdown preview",
-        shortcut: "Ctrl+Shift+V",
+        // See the cheatsheet row above: Ctrl+Shift+V is swallowed as Paste.
+        shortcut: "Ctrl+E",
         action: BuiltinCommand::ToggleMarkdownPreview,
         bindings: &[action::TOGGLE_MD_PREVIEW],
+    },
+    BuiltinEntry {
+        label: "Toggle notes pane",
+        shortcut: "",
+        action: BuiltinCommand::ToggleNotesPane,
+        bindings: &[],
     },
     BuiltinEntry {
         label: "Toggle minimap",
@@ -1129,6 +1215,29 @@ mod tests {
         }
     }
 
+    /// The note-capture commands are palette-only (no default chord), so the
+    /// registry IS their entire discovery surface. A command implemented but
+    /// never listed is unreachable for every user who does not read the source.
+    #[test]
+    fn note_capture_commands_are_discoverable_in_the_palette() {
+        for (action, needle) in [
+            (BuiltinCommand::PasteImageAttachment, "image"),
+            (BuiltinCommand::RenameNote, "Rename"),
+            (BuiltinCommand::NewDailyNote, "daily"),
+        ] {
+            let entry = BUILTIN_COMMANDS
+                .iter()
+                .find(|e| e.action == action)
+                .unwrap_or_else(|| panic!("{action:?} has no palette row"));
+            assert!(
+                entry.label.to_lowercase().contains(&needle.to_lowercase()),
+                "{action:?} is listed as {:?}, which does not say {needle:?} — \
+                 the fuzzy filter is how users find it",
+                entry.label
+            );
+        }
+    }
+
     #[test]
     fn builtin_commands_have_nonempty_labels() {
         for entry in BUILTIN_COMMANDS {
@@ -1164,6 +1273,52 @@ mod tests {
                  the F1 modal claims to show every shortcut",
             );
         }
+    }
+
+    /// The static chord text of a REBINDABLE row must be the chord that action is
+    /// actually bound to by default.
+    ///
+    /// The two are separate strings by design — the fallback is what renders
+    /// before the live keymap is consulted — and nothing tied them together, so
+    /// they could drift apart silently. They did: when `toggle_md_preview` moved
+    /// off the swallowed `mod+shift+v`, these rows still read "Ctrl+Shift+V" and
+    /// the F1 modal (and the palette) would have kept teaching a chord that had
+    /// been deliberately abandoned for being unreachable.
+    ///
+    /// Hard-wired rows (`bindings: &[]`) are exempt: their chord belongs to
+    /// egui or the editor widget, not to the `[keybindings]` schema.
+    #[test]
+    fn a_rebindable_rows_fallback_chord_is_its_real_default_chord() {
+        use crate::app::keymap::Keymap;
+        use scribe_core::config::Keybindings;
+
+        let km = Keymap::resolve(&Keybindings::default());
+        let mut checked = 0usize;
+        let mut check = |what: &str, label: &str, text: &str, bindings: &[&str]| {
+            if bindings.is_empty() {
+                return;
+            }
+            let live = km
+                .display_for(bindings)
+                .expect("a non-empty binding list always renders");
+            assert_eq!(
+                crate::app::keymap::platform_chord_text(text),
+                live,
+                "{what} row '{label}' advertises {text:?} but '{}' is bound to {live:?}",
+                bindings.join(" / ")
+            );
+            checked += 1;
+        };
+        for e in KEYBOARD_SHORTCUTS {
+            check("cheatsheet", e.action, e.chord, e.bindings);
+        }
+        for e in BUILTIN_COMMANDS {
+            check("palette", e.label, e.shortcut, e.bindings);
+        }
+        assert!(
+            checked > 0,
+            "no rebindable row was compared — the test would be vacuous"
+        );
     }
 
     /// Every `bindings` entry must name a real action.

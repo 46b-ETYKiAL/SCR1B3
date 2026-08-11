@@ -1,8 +1,354 @@
 //! Custom-titlebar chrome: caption buttons + frameless-window
 //! resize handling. Free functions extracted from the `app`
 //! module root; `use super::*` pulls in egui + app-local types.
+//!
+//! ## Win32 chrome wiring (the `scribe-win32-chrome` call sites)
+//!
+//! `scribe-win32-chrome` implements `WM_NCHITTEST`, the Snap-Layouts
+//! `HTMAXBUTTON` reply, and the native system menu — but every one of those is
+//! inert until the app *publishes* the maximize-button rect and *reads back* the
+//! OS-side hover. Those call sites live here, in the one module that owns the
+//! caption row:
+//!
+//! * [`caption_btn`] publishes the Maximize/Restore button's rect (converted
+//!   from egui logical points to physical CLIENT pixels) every frame it lays the
+//!   button out, and ORs `maximize_button_hovered()` into the button's hover
+//!   visual. The second half is not cosmetic: once `WM_NCHITTEST` answers
+//!   `HTMAXBUTTON` for that rect, Windows routes `WM_NCMOUSEMOVE` there instead
+//!   of client-area events, so egui's own `Response::hovered()` is permanently
+//!   `false` over the button and it would otherwise look dead.
+//! * [`MaximizeRectRetractor`] — an egui plugin registered once per `Context` —
+//!   retracts the rect at the end of any pass in which the titlebar did *not*
+//!   lay the button out (fullscreen, `frameless` off, zen). Without it a stale
+//!   rect would keep claiming `HTMAXBUTTON` over a region with no button, which
+//!   would swallow egui pointer events there.
+//! * [`caption_btn`] also pops the native system menu on a secondary click in
+//!   the titlebar band. With the titlebar answering `HTCLIENT`, Windows never
+//!   sees a non-client right-click, so it never pops the menu on its own.
+//!
+//! The three "policy" knobs (`set_hit_test_mode`, `set_snap_support_enabled`,
+//! `set_backdrop`) are applied once from [`apply_chrome_policy`]; see that
+//! function for why each value is what it is.
 #![allow(clippy::wildcard_imports)]
 use super::*;
+
+// ───────────────────── per-`Context` titlebar chrome state ─────────────────────
+//
+// The titlebar band, the caption-button union and the two pass latches below
+// are all answers to per-CONTEXT questions ("did THIS context's titlebar
+// publish on THIS pass?"), so they live in `egui::Context::data` — the
+// per-context store egui already provides, and the same one the rope editor
+// uses for its action requests.
+//
+// They were process-globals (a `static Mutex` pair + a `static AtomicU64`
+// pair). A test binary is ONE process but MANY egui `Context`s: `chrome_tests`,
+// `e2e.rs` and `e2e_overlays.rs` each build their own harness, on their own
+// thread, each with its own independent `cumulative_pass_nr`. Sharing one latch
+// across them corrupted the retraction decision three different ways, all
+// reproducible at `--test-threads=32`:
+//
+//   * a sibling storing ITS pass number between this context's publish and this
+//     context's end-of-pass made `classify_end_pass` say `RetractNow`, so the
+//     retractor retracted a rect that WAS on screen;
+//   * a sibling whose pass number happened to EQUAL ours read as
+//     `PublishedThisPass`, so a retraction that was due never happened;
+//   * a sibling that had just retracted (`u64::MAX`) read as `AlreadyLatched`,
+//     same outcome.
+//
+// A file-scoped lock cannot fix that — the siblings are in other files and
+// legitimately render titlebars. Scoping the state to the context that owns it
+// removes the interference entirely. Production drives exactly one `Context`,
+// so its behaviour is unchanged.
+
+/// Namespaced `Id` for one piece of per-context chrome state.
+fn chrome_state_id(key: &'static str) -> egui::Id {
+    egui::Id::new(("scr1b3::chrome", key))
+}
+
+/// `cumulative_pass_nr` of the pass in which THIS context's maximize button
+/// last published its rect. `u64::MAX` = never / retracted. Read by
+/// [`MaximizeRectRetractor`] to decide whether the titlebar rendered this pass.
+fn last_max_rect_pass(ctx: &egui::Context) -> u64 {
+    ctx.data(|d| d.get_temp::<u64>(chrome_state_id("last_max_rect_pass")))
+        .unwrap_or(u64::MAX)
+}
+
+fn set_last_max_rect_pass(ctx: &egui::Context, pass: u64) {
+    ctx.data_mut(|d| d.insert_temp(chrome_state_id("last_max_rect_pass"), pass));
+}
+
+/// Set the band-pass latch and return the PREVIOUS value — the per-context
+/// equivalent of the `AtomicU64::swap` this replaced, so the "first caption
+/// button of this pass wins" test stays a single read-modify-write.
+///
+/// `cumulative_pass_nr` of the pass whose titlebar band + caption-button union
+/// are currently recorded. Distinct from [`last_max_rect_pass`] because the
+/// maximize button is not the first button drawn.
+fn swap_last_band_pass(ctx: &egui::Context, pass: u64) -> u64 {
+    ctx.data_mut(|d| {
+        let id = chrome_state_id("last_band_pass");
+        let prev = d.get_temp::<u64>(id).unwrap_or(u64::MAX);
+        d.insert_temp(id, pass);
+        prev
+    })
+}
+
+/// The pointer-position band the titlebar occupied on the most recent frame, in
+/// egui logical points. Recorded by [`caption_btn`] so the titlebar right-click
+/// -> system-menu check can exclude clicks that landed on a caption button
+/// (right-clicking a caption button pops nothing on a native window either).
+fn titlebar_band(ctx: &egui::Context) -> Option<egui::Rect> {
+    ctx.data(|d| d.get_temp::<Option<egui::Rect>>(chrome_state_id("titlebar_band")))
+        .flatten()
+}
+
+fn set_titlebar_band(ctx: &egui::Context, band: Option<egui::Rect>) {
+    ctx.data_mut(|d| d.insert_temp(chrome_state_id("titlebar_band"), band));
+}
+
+/// Union of the caption buttons laid out inside [`titlebar_band`] this pass.
+fn caption_btn_union(ctx: &egui::Context) -> Option<egui::Rect> {
+    ctx.data(|d| d.get_temp::<Option<egui::Rect>>(chrome_state_id("caption_btn_union")))
+        .flatten()
+}
+
+fn set_caption_btn_union(ctx: &egui::Context, union: Option<egui::Rect>) {
+    ctx.data_mut(|d| d.insert_temp(chrome_state_id("caption_btn_union"), union));
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook: the physical-pixel rect the LAST [`publish_maximize_rect`]
+    /// call handed to `scribe_win32_chrome::set_maximize_button_rect`. Recorded
+    /// inside that single publish helper (never at the call site) so a test can
+    /// assert the app's real titlebar render path drives the win32 layer — a
+    /// test that called the win32 helper itself would pass forever even with the
+    /// wire cut. `None` = never published this thread; an EMPTY rect = retracted.
+    pub(crate) static TEST_PUBLISHED_MAX_RECT:
+        std::cell::Cell<Option<scribe_win32_chrome::RectPx>> = const { std::cell::Cell::new(None) };
+    /// Test hook: when `true`, [`tab_glyph_button`] forces its `hovered` branch so
+    /// a deterministic offscreen visual-QA render can capture the HOVER state (the
+    /// veil fill + hot glyph colour) without a live pointer, exactly like
+    /// `TEST_FORCE_SIDE_TAB_DRAG` forces the drop indicator. Never set outside a
+    /// test — the real hover path is `Response::hovered()` / `rect_contains_pointer`.
+    pub(super) static TEST_FORCE_GLYPH_HOVER:
+        std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Test hook: the policy triple the LAST [`apply_chrome_policy`] call handed
+    /// to `scribe-win32-chrome`. Recorded inside that single helper (never at the
+    /// call site) for the same reason as [`TEST_PUBLISHED_MAX_RECT`] — so a test
+    /// asserts the app's real titlebar render path applies the policy, and would
+    /// fail if that wire were cut.
+    ///
+    /// It records the VALUES, not a call count: each of the three is a deliberate
+    /// choice documented on `apply_chrome_policy`, and the crate exposes no
+    /// reader for them (the setters are `#[cfg(windows)]` no-ops elsewhere), so
+    /// there is no other way to assert what was applied.
+    pub(crate) static TEST_APPLIED_CHROME_POLICY: std::cell::Cell<
+        Option<(
+            scribe_win32_chrome::HitTestMode,
+            bool,
+            scribe_win32_chrome::Backdrop,
+        )>,
+    > = const { std::cell::Cell::new(None) };
+}
+
+/// Hand the maximize/restore button's rect to `scribe-win32-chrome` so
+/// `WM_NCHITTEST` can answer `HTMAXBUTTON` over it (the ONLY trigger for the
+/// Windows 11 Snap Layouts flyout).
+///
+/// `rect` is in egui logical points; the crate wants **physical** pixels in
+/// CLIENT coordinates. egui's screen space for the main viewport already has its
+/// origin at the client top-left, so the only conversion needed is the DPI
+/// scale — `logical_rect_to_physical` does it with rounding (not truncation) so
+/// a 1.25/1.5 scale lands on the pixel the renderer actually painted.
+fn publish_maximize_rect(rect: egui::Rect, pixels_per_point: f32) {
+    let px = scribe_win32_chrome::hit_test::logical_rect_to_physical(
+        rect.left(),
+        rect.top(),
+        rect.right(),
+        rect.bottom(),
+        pixels_per_point,
+    );
+    scribe_win32_chrome::set_maximize_button_rect(px.left, px.top, px.right, px.bottom);
+    #[cfg(test)]
+    TEST_PUBLISHED_MAX_RECT.with(|c| c.set(Some(px)));
+}
+
+/// Retract the published rect. See [`publish_maximize_rect`].
+fn retract_maximize_rect() {
+    scribe_win32_chrome::clear_maximize_button_rect();
+    #[cfg(test)]
+    TEST_PUBLISHED_MAX_RECT.with(|c| c.set(Some(scribe_win32_chrome::RectPx::new(0, 0, 0, 0))));
+}
+
+/// Apply the one-shot `scribe-win32-chrome` policy knobs. Called (idempotently)
+/// from [`caption_btn`]; each value is deliberate:
+///
+/// * **`HitTestMode::MaximizeButtonOnly`** — SCR1B3 owns titlebar drag
+///   (`ViewportCommand::StartDrag`) and the 8/12px edge-resize bands
+///   ([`resize_dir_at`] / [`handle_frameless_resize`]) in egui space. Letting
+///   Win32 *also* answer "is this a resize edge?" is a real bug source (the OS
+///   modal resize loop swallows the button-up egui's state machine waits for),
+///   so this crate claims ONLY the maximize-button rect. `FullNonClient` would
+///   require disabling `handle_frameless_resize`, which is not wanted.
+/// * **`set_snap_support_enabled(true)`** — retains
+///   `WS_SYSMENU|WS_MINIMIZEBOX|WS_MAXIMIZEBOX`, which Aero Snap, `Win`+arrow,
+///   Snap Assist and the Snap Layouts flyout all gate on. This is already the
+///   crate default; it is set explicitly so the intent is stated at the call
+///   site and the escape hatch is one edit away. Flip to `false` if retaining
+///   those bits re-admits the DWM-drawn doubled caption buttons on a
+///   transparent window (see the crate docs — that outcome needs a real window
+///   on real Win11 and has not been observed either way here).
+/// * **`Backdrop::None`** — SCR1B3 has **no** backdrop config key, and
+///   `WindowConfig::effective_translucent`'s own docs record that applying a DWM
+///   material (Mica/Acrylic/Tabbed) is what previously re-added the native
+///   caption buttons over the custom titlebar. Mapping the legacy
+///   `WindowMode::Mica` value onto `Backdrop::Mica` would therefore reintroduce
+///   a known, already-fixed bug, so the shipped default is asserted explicitly
+///   rather than derived.
+fn apply_chrome_policy() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+
+    let mode = scribe_win32_chrome::HitTestMode::MaximizeButtonOnly;
+    let snap = true;
+    let backdrop = scribe_win32_chrome::Backdrop::None;
+
+    // Record the policy on EVERY pass, OUTSIDE the `Once`.
+    //
+    // `ONCE` is a process-global, and a test binary is one process: whichever
+    // test happened to reach this first consumed it, and every later test read
+    // `None` — so this assertion passed or failed purely on test ORDER, which is
+    // exactly how it was committed red. The thread-local is per-test, so
+    // recording outside the `Once` makes each test observe its own pass.
+    //
+    // The real Win32 calls stay inside the `Once` — they are the part that must
+    // happen once. What the test asserts is that the titlebar path computes and
+    // would apply these three values, which this records faithfully.
+    #[cfg(test)]
+    TEST_APPLIED_CHROME_POLICY.with(|c| c.set(Some((mode, snap, backdrop))));
+
+    ONCE.call_once(|| {
+        scribe_win32_chrome::set_hit_test_mode(mode);
+        scribe_win32_chrome::set_snap_support_enabled(snap);
+        scribe_win32_chrome::set_backdrop(backdrop);
+    });
+}
+
+/// Retracts the published maximize-button rect on any pass where the titlebar
+/// did not lay the maximize button out.
+///
+/// Registered once per [`egui::Context`] (`Context::add_plugin` dedupes by type
+/// and ignores repeat registrations), so it runs at the end of EVERY pass —
+/// including the passes where the titlebar is gone entirely and therefore no
+/// `chrome.rs` code would otherwise run. That is exactly the case the retraction
+/// exists for: fullscreen, zen, and `appearance.frameless == false`.
+#[derive(Default)]
+pub(super) struct MaximizeRectRetractor;
+
+/// What an end-of-pass should do, given the latch state and the current pass.
+///
+/// Extracted as a PURE decision so the latching property can be pinned over
+/// `(last_pass, pass)` — where it is total and deterministic — in all three
+/// cases, rather than only the one an idling harness could observe.
+///
+/// Both inputs must come from the SAME [`egui::Context`]: `pass` is that
+/// context's `cumulative_pass_nr` and `last_pass` is [`last_max_rect_pass`] for
+/// that same context. While the latch was a process-global the two could come
+/// from different contexts, and every mismatched pairing here decodes to a wrong
+/// answer — see the module-level note on the per-context state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum EndPassAction {
+    /// The titlebar published this very pass — the button is on screen.
+    PublishedThisPass,
+    /// First pass without a publish: retract now, then latch.
+    RetractNow,
+    /// Already retracted; an idle pass must NOT re-store the empty rect.
+    AlreadyLatched,
+}
+
+/// The pure end-of-pass decision. See [`EndPassAction`].
+pub(super) const fn classify_end_pass(last_pass: u64, pass: u64) -> EndPassAction {
+    if last_pass == pass {
+        EndPassAction::PublishedThisPass
+    } else if last_pass == u64::MAX {
+        EndPassAction::AlreadyLatched
+    } else {
+        EndPassAction::RetractNow
+    }
+}
+
+impl egui::Plugin for MaximizeRectRetractor {
+    fn debug_name(&self) -> &'static str {
+        "scr1b3::MaximizeRectRetractor"
+    }
+
+    fn on_end_pass(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        let pass = ctx.cumulative_pass_nr();
+        // One load, one decision, one transition — so the branch the tests pin is
+        // the branch production takes. Both the latch and the pass number now
+        // come from the SAME context, so no other context can answer for it.
+        match classify_end_pass(last_max_rect_pass(&ctx), pass) {
+            EndPassAction::PublishedThisPass | EndPassAction::AlreadyLatched => {}
+            EndPassAction::RetractNow => {
+                set_last_max_rect_pass(&ctx, u64::MAX);
+                retract_maximize_rect();
+                set_titlebar_band(&ctx, None);
+                set_caption_btn_union(&ctx, None);
+            }
+        }
+    }
+}
+
+/// Where — in SCREEN-space physical pixels — the native window system menu
+/// should pop for a titlebar secondary-click at `pos`, or `None` when that click
+/// must be ignored.
+///
+/// With `HitTestMode::MaximizeButtonOnly` the titlebar answers `HTCLIENT`, so
+/// Windows never sees a non-client right-click and never pops the menu itself —
+/// the app must do it, at the right place. This is the whole decision:
+///
+/// * a click OUTSIDE the recorded titlebar band is not a titlebar right-click;
+/// * a click ON a caption button pops nothing on a native window either, so the
+///   caption-button union is excluded from the band;
+/// * `inner_rect` (the viewport's top-left in logical screen points) plus the
+///   client-space pointer position, scaled by `pixels_per_point`, is the screen
+///   point Win32 wants.
+///
+/// Pure, and separate from the `Context` plumbing in [`caption_btn`], because a
+/// wrong answer here pops the menu in the wrong place (or over a button that
+/// should have swallowed the click) — a defect with no other witness than a live
+/// Windows desktop.
+pub(super) fn system_menu_point(
+    pos: egui::Pos2,
+    band: egui::Rect,
+    caption_union: Option<egui::Rect>,
+    inner_rect: egui::Rect,
+    pixels_per_point: f32,
+) -> Option<(i32, i32)> {
+    if !band.contains(pos) {
+        return None;
+    }
+    // A right-click ON a caption button pops nothing on a native window either.
+    if caption_union.is_some_and(|r| r.contains(pos)) {
+        return None;
+    }
+    let screen = (inner_rect.min.to_vec2() + pos.to_vec2()) * pixels_per_point;
+    Some((screen.x.round() as i32, screen.y.round() as i32))
+}
+
+/// Whether a glyph control (a tab's pin / close ✕) paints its hover feedback.
+///
+/// Sensed hover OR a raw pointer-in-rect test. The raw test is not redundant: it
+/// is what keeps the veil lit while an ADJACENT widget (the tab chip, mid-drag)
+/// holds the pointer grab, in which case this control's own
+/// `Response::hovered()` is false and the control would read dead under the
+/// cursor. Extracted so that "either signal lights it" is a tested rule rather
+/// than an inline operator whose only witness is a painted pixel.
+pub(super) fn glyph_is_hovered(sensed: bool, pointer_in_rect: bool) -> bool {
+    sensed || pointer_in_rect
+}
 
 pub(super) fn caption_btn(
     ui: &mut egui::Ui,
@@ -16,12 +362,76 @@ pub(super) fn caption_btn(
     // buttons when the user picks a large toolbar button size (the default 28px
     // is preserved — see the call site's `.max(28.0)`).
     let size = egui::vec2(46.0, height);
+    // Record the titlebar band BEFORE the button consumes its slice, so the
+    // right-click -> system-menu check sees the whole caption row (not just the
+    // shrinking remainder). The first caption button of the frame wins; the
+    // later ones only extend the caption-button union.
+    let ctx = ui.ctx().clone();
+    let pass = ctx.cumulative_pass_nr();
+    {
+        // First caption button OF THIS PASS starts a fresh band + union; the
+        // later ones only extend the union. Tracked on its own counter — the
+        // maximize button is the SECOND button drawn, so keying this off
+        // `last_max_rect_pass` would reset the union after Close was recorded.
+        if swap_last_band_pass(&ctx, pass) != pass {
+            set_titlebar_band(&ctx, Some(ui.max_rect()));
+            set_caption_btn_union(&ctx, None);
+        }
+    }
     let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+    set_caption_btn_union(
+        &ctx,
+        Some(caption_btn_union(&ctx).map_or(rect, |u| u.union(rect))),
+    );
+    // ---- win32 chrome wiring (see the module docs) ----
+    // The maximize/restore button is the one region `WM_NCHITTEST` claims. Publish
+    // its rect every frame it is laid out so the Snap Layouts flyout can trigger,
+    // and register the retractor that clears it when the titlebar goes away.
+    let is_max_button = matches!(icon, CaptionIcon::Maximize | CaptionIcon::Restore);
+    if is_max_button {
+        apply_chrome_policy();
+        ctx.add_plugin(MaximizeRectRetractor);
+        publish_maximize_rect(rect, ctx.pixels_per_point());
+        set_last_max_rect_pass(&ctx, pass);
+        // Exactly ONE caption button runs this per frame — `show_system_menu`
+        // spins a MODAL `TrackPopupMenu` loop, so running it once per button
+        // would pop the menu four times over.
+        //
+        // The `Context` plumbing lives here (rather than in a helper of its own)
+        // so the only thing between the raw input and the OS call is the tested
+        // pure decision in `system_menu_point`. Never steal a right-click egui is
+        // already using for its own popup (the tab / editor context menus), and
+        // skip entirely when the backend reports no `inner_rect` rather than pop
+        // the menu in the wrong place.
+        let band = titlebar_band(&ctx);
+        let popup_open = ctx.memory(|m| m.any_popup_open());
+        let click_pos = ctx.input(|i| {
+            i.pointer
+                .button_clicked(egui::PointerButton::Secondary)
+                .then(|| i.pointer.interact_pos())
+                .flatten()
+        });
+        let inner_rect = ctx.input(|i| i.viewport().inner_rect);
+        if let (false, Some(band), Some(pos), Some(inner)) =
+            (popup_open, band, click_pos, inner_rect)
+        {
+            let union = caption_btn_union(&ctx);
+            if let Some((x, y)) = system_menu_point(pos, band, union, inner, ctx.pixels_per_point())
+            {
+                scribe_win32_chrome::show_system_menu(x, y);
+            }
+        }
+    }
+    // Once Windows answers `HTMAXBUTTON` for that rect it delivers WM_NCMOUSEMOVE
+    // there instead of client-area events, so egui's own `hovered()` is stuck
+    // false over the button. OR in the OS-side hover or the button paints dead.
+    let hovered =
+        resp.hovered() || (is_max_button && scribe_win32_chrome::maximize_button_hovered());
     let painter = ui.painter();
-    if resp.hovered() {
+    if hovered {
         painter.rect_filled(rect, 2.0, hover_fill);
     }
-    let col = if resp.hovered() { Color32::WHITE } else { base };
+    let col = if hovered { Color32::WHITE } else { base };
     let c = rect.center();
     let s = 4.5_f32;
     let stroke = egui::Stroke::new(1.4, col);
@@ -102,6 +512,65 @@ pub(super) fn caption_btn(
         CaptionIcon::Settings => "Open settings",
     };
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, name));
+    resp
+}
+
+/// Minimum hit-target edge (logical px) for a small in-strip glyph control — a
+/// tab's pin toggle or close ✕. WCAG 2.5.8 target-size floor (24×24) + Fitts'
+/// law: the glyph itself stays small, but the interactive BOX is allocated at
+/// this size so the control is easy to hit and reads as a real button.
+pub(super) const GLYPH_CONTROL_HIT: f32 = 24.0;
+
+/// Paint a flat, frameless glyph control (a tab's pin / close ✕) whose hover
+/// feedback is pre-resolved, and return its click [`egui::Response`].
+///
+/// `egui::Button::new(glyph).frame(false)` paints NO fill or stroke in ANY state
+/// (egui 0.34 `button.rs`) and bakes its glyph colour at construction, so a plain
+/// flow button can never light up on hover — which is exactly why a tab's pin/×
+/// read as dead controls before this. This helper instead:
+///
+/// 1. allocates a fixed [`GLYPH_CONTROL_HIT`]-square interactive rect. Using
+///    `allocate_exact_size` keeps it layout-agnostic — the cursor advances
+///    correctly whether the caller is in a horizontal row (`draw_tab_strip`) or a
+///    vertical column (`draw_rotated_side_tabs`), so ONE helper serves every tab
+///    orientation;
+/// 2. resolves `hovered` from the SENSED response OR a pointer-in-rect test (so
+///    the veil still shows while an adjacent widget holds the drag) BEFORE any
+///    paint — the pre-check a `Button` cannot do;
+/// 3. picks the glyph colour (`rest` → `hot`) and paints the veil `hover_fill`
+///    only while hovered.
+///
+/// The accessible name is set to `glyph` so an AccessKit `get_by_label(glyph)`
+/// query still reaches the control — the tab/caption e2e tests rely on the pin/×
+/// being reachable by their phosphor glyph.
+pub(super) fn tab_glyph_button(
+    ui: &mut egui::Ui,
+    glyph: &'static str,
+    rest: Color32,
+    hot: Color32,
+    hover_fill: Color32,
+) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(
+        egui::vec2(GLYPH_CONTROL_HIT, GLYPH_CONTROL_HIT),
+        egui::Sense::click(),
+    );
+    #[allow(unused_mut)]
+    let mut hovered = glyph_is_hovered(resp.hovered(), ui.rect_contains_pointer(rect));
+    // Test-only: force the hover branch so an offscreen render can capture the
+    // HOVER frame deterministically (no live pointer). Never set in production.
+    #[cfg(test)]
+    if TEST_FORCE_GLYPH_HOVER.with(std::cell::Cell::get) {
+        hovered = true;
+    }
+    // Resolve the font before borrowing the painter (both borrow `ui`).
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let painter = ui.painter();
+    if hovered {
+        painter.rect_filled(rect, 3.0, hover_fill);
+    }
+    let col = if hovered { hot } else { rest };
+    painter.text(rect.center(), egui::Align2::CENTER_CENTER, glyph, font, col);
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, glyph));
     resp
 }
 
@@ -207,5 +676,63 @@ pub(super) fn handle_frameless_resize(ctx: &egui::Context) {
     // so proactively clear any phantom drag the OS resize loop may have orphaned.
     if !ctx.input(|i| i.pointer.any_down()) {
         ctx.stop_dragging();
+    }
+}
+
+#[cfg(test)]
+mod chrome_state_tests {
+    use super::{
+        caption_btn_union, set_caption_btn_union, set_titlebar_band, swap_last_band_pass,
+        titlebar_band,
+    };
+
+    /// The three pieces of per-context chrome state are a latch and two rect
+    /// slots, and every one of them is only ever read back through its own
+    /// getter — so a getter that always returned the "unset" answer, or a setter
+    /// that dropped its argument, would be invisible to every other test in the
+    /// tree. Assert the two things that distinguish a live slot from a stub: the
+    /// UNSET reading is the documented sentinel, and a stored value comes back
+    /// unchanged.
+    #[test]
+    fn per_context_chrome_state_starts_unset_and_round_trips() {
+        let ctx = egui::Context::default();
+
+        // `u64::MAX` is the "never published / retracted" sentinel, and the swap
+        // must return the PREVIOUS value — not the one just written, and not 0.
+        assert_eq!(
+            swap_last_band_pass(&ctx, 7),
+            u64::MAX,
+            "a fresh context must report the never-published sentinel"
+        );
+        assert_eq!(
+            swap_last_band_pass(&ctx, 9),
+            7,
+            "swap must return the previous pass, which is what makes \
+             first-caption-button-of-this-pass-wins a single read-modify-write"
+        );
+
+        assert_eq!(
+            titlebar_band(&ctx),
+            None,
+            "unset titlebar band reads as None"
+        );
+        let band = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 32.0));
+        set_titlebar_band(&ctx, Some(band));
+        assert_eq!(
+            titlebar_band(&ctx),
+            Some(band),
+            "a stored band must read back"
+        );
+        set_titlebar_band(&ctx, None);
+        assert_eq!(titlebar_band(&ctx), None, "retraction must clear the slot");
+
+        assert_eq!(caption_btn_union(&ctx), None, "unset union reads as None");
+        let union = egui::Rect::from_min_size(egui::pos2(700.0, 0.0), egui::vec2(100.0, 32.0));
+        set_caption_btn_union(&ctx, Some(union));
+        assert_eq!(
+            caption_btn_union(&ctx),
+            Some(union),
+            "a stored caption-button union must read back"
+        );
     }
 }
