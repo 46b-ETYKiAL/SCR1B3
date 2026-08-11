@@ -543,6 +543,26 @@ exclude_re = [
   'rope_editor/mod\.rs:\d+:23: replace \+ with \* in line_span',
   'rope_editor/mod\.rs:\d+:27: replace < with <= in line_span',
 
+  # integration/macos.rs `bundle_info_plist` + `register`: the two items carrying
+  # `#[cfg(target_os = "macos")]`. Not compiled on the ubuntu mutation runner, so
+  # 100% of their mutants are vacuous MISSES no test could ever kill — the same
+  # condition ci.yml already excludes `integration/windows.rs` and
+  # `scribe-win32-chrome/src/imp.rs` for.
+  #
+  # This is a per-ITEM pardon, NOT the whole file, and the distinction is
+  # load-bearing: `mod macos` is `#[cfg(any(test, target_os = "macos"))]`, so the
+  # module DOES compile everywhere under test and its pure half is real signal.
+  # Of the 11 mutants in the file, 7 (`summarize_bundle` x5, `declares_uti` x2)
+  # are compiled and killed by the tests below; only these 4 are vacuous. A
+  # file-glob exclusion would silently drop those 7 — the "green that isn't
+  # green" this config's header warns about.
+  #
+  # Premise pinned by `the_mac_only_items_stay_cfg_gated_so_the_mutation_pardon_
+  # stays_honest`: if either item loses its gate the test fails and these entries
+  # must be dropped, rather than quietly covering compiled code.
+  'macos\.rs.*bundle_info_plist',
+  'macos\.rs.*replace register -> RegisterReport',
+
   # --- The ONLY three literal-line anchors that survive, and why -------------
   # Each pardons a mutant whose NAME is byte-identical to a NEIGHBOUR in the
   # same function at the SAME column — so neither the description nor the column

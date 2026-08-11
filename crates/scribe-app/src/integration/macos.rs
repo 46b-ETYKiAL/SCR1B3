@@ -389,4 +389,38 @@ mod tests {
             two.message
         );
     }
+
+    /// The mutation pardon for this file's two mac-only items rests entirely on
+    /// them NOT compiling on the ubuntu mutation runner. This module itself
+    /// compiles everywhere under `test` (its pure `summarize_bundle` half is
+    /// where the fake-success regression lives), so the gate is per-ITEM, and
+    /// only the per-item gate makes those mutants vacuous.
+    ///
+    /// If either item ever loses its gate it compiles on the runner, its
+    /// mutants become real signal, and the pardon would start hiding a genuine
+    /// gap. Fail here so that cannot happen quietly — the same premise check
+    /// `windows_module_is_cfg_gated_so_the_mutation_exclusion_stays_honest`
+    /// carries for `integration/windows.rs`.
+    #[test]
+    fn the_mac_only_items_stay_cfg_gated_so_the_mutation_pardon_stays_honest() {
+        let src = include_str!("macos.rs");
+        // ASSEMBLED, never written as a literal. This test reads its OWN file,
+        // so a literal needle would sit in the source and `contains` would
+        // match the needle itself — passing no matter what the real
+        // declarations said.
+        let gate = ["#[cfg(target_os = ", "\"macos\"", ")]"].concat();
+        for item in ["fn bundle_info_plist(", "pub fn register("] {
+            let needle = format!("{gate}\n{item}");
+            assert_eq!(
+                src.matches(needle.as_str()).count(),
+                1,
+                "`{item}` is no longer directly {gate}-gated (or this test now \
+                 self-matches). If it compiles off macOS its mutants are real \
+                 signal: DROP the matching `macos\\.rs` entries from \
+                 `exclude_re` in .cargo/mutants.toml and delete this test, \
+                 rather than leaving a pardon that silently covers a file it \
+                 claims to have proven vacuous."
+            );
+        }
+    }
 }
