@@ -177,6 +177,28 @@ fn render_script(src: &[char], i: &mut usize, out: &mut String, depth: u8, sup: 
 /// argument rules (`\frac12` is `\frac{1}{2}`). Always advances `*i` when a
 /// character is available, so callers cannot loop forever.
 fn read_group(src: &[char], i: &mut usize) -> Vec<char> {
+    let entry = *i;
+    let group = read_group_inner(src, i);
+    // ENFORCE the "always advances" contract above rather than trusting it.
+    //
+    // Every caller is a `while *i < src.len()` loop whose ONLY progress is this
+    // cursor, so a `read_group` that stands still or rewinds does not render the
+    // wrong thing — it hangs the preview on a malformed fragment. That is a
+    // fault no assertion can observe, only a timeout, which is exactly how it
+    // shows up in a mutation run: perturbing an advance inside the body scored
+    // TIMEOUT instead of a kill, and a timeout fails the gate while teaching
+    // nothing. With this clamp the same perturbation produces a WRONG PARSE,
+    // which `read_group_advances_past_every_first_character` asserts.
+    //
+    // It is also a real robustness property in its own right: a user's `$…$`
+    // fragment must never be able to wedge the markdown preview.
+    if entry < src.len() && *i <= entry {
+        *i = entry + 1;
+    }
+    group
+}
+
+fn read_group_inner(src: &[char], i: &mut usize) -> Vec<char> {
     // Counted, not stepped. The obvious `while …is_whitespace() { *i += 1 }` is
     // a manual index loop whose increment is the loop's ONLY progress, so
     // perturbing that increment hangs rather than returning a wrong answer —
@@ -219,9 +241,17 @@ fn read_group(src: &[char], i: &mut usize) -> Vec<char> {
             let start = *i;
             *i += 1;
             if src.get(*i).is_some_and(|c| c.is_ascii_alphabetic()) {
-                while src.get(*i).is_some_and(|c| c.is_ascii_alphabetic()) {
-                    *i += 1;
-                }
+                // Counted, not stepped — the same reason as the whitespace skip
+                // at the top of this function. As a `while` loop the `*i += 1`
+                // was the loop's only progress, so perturbing it spun forever
+                // instead of returning a wrong name; counted, a perturbed
+                // advance mis-parses and can be asserted.
+                *i += src
+                    .get(*i..)
+                    .unwrap_or(&[])
+                    .iter()
+                    .take_while(|c| c.is_ascii_alphabetic())
+                    .count();
             } else if *i < src.len() {
                 *i += 1;
             }
@@ -1010,5 +1040,75 @@ mod tests {
         // consumption wrong and both arguments fall through to the outer walk,
         // which drops the fraction separator entirely.
         assert_eq!(math_to_unicode(r"\frac\alpha\beta"), "α/β");
+    }
+
+    /// `\quad` and `\qquad` are the two spacing commands the renderer knows,
+    /// and they differ only in WIDTH.
+    ///
+    /// Deleting the `"qquad"` arm drops it through to the unknown-command path,
+    /// which keeps the TeX verbatim — so a double-width space silently renders
+    /// as the literal text `\qquad`. The `\quad` half is asserted alongside it
+    /// so the test cannot pass by treating every spacing command the same.
+    /// Kills math.rs:134:9.
+    #[test]
+    fn the_two_spacing_commands_render_as_one_and_two_spaces() {
+        // `math_to_unicode` trims, so the spacing is asserted with content on
+        // both sides of it.
+        assert_eq!(
+            math_to_unicode(r"a\quad b"),
+            "a  b",
+            "one quad is one space"
+        );
+        assert_eq!(
+            math_to_unicode(r"a\qquad b"),
+            "a   b",
+            "qquad is DOUBLE width, and must not fall through to the verbatim              unknown-command path"
+        );
+        assert!(
+            !math_to_unicode(r"a\qquad b").contains("qquad"),
+            "the command name must never reach the rendered output"
+        );
+    }
+
+    /// `read_group` must consume at least one character whenever one is
+    /// available — its documented contract, and the thing every caller's
+    /// `while *i < src.len()` loop depends on for progress.
+    ///
+    /// Asserted over EVERY first-character shape the function branches on, at
+    /// the end of input as well as mid-fragment, because a cursor that stands
+    /// still or rewinds does not mis-render: it hangs the preview, which is a
+    /// fault only a timeout can observe. The `entry`-clamp in `read_group` is
+    /// what converts such a perturbation into a wrong parse this can catch.
+    #[test]
+    fn read_group_advances_past_every_first_character() {
+        for frag in [
+            "{ab}", "{", "}", r"\alpha", r"\{", r"\\", "a", " ", "  x", "",
+        ] {
+            let src: Vec<char> = frag.chars().collect();
+            let mut i = 0usize;
+            let _ = read_group(&src, &mut i);
+            if src.is_empty() {
+                assert_eq!(i, 0, "an empty fragment has nothing to consume");
+            } else {
+                assert!(
+                    i > 0,
+                    "read_group({frag:?}) left the cursor at {i} — a caller's                      loop would never terminate"
+                );
+                assert!(
+                    i <= src.len(),
+                    "read_group({frag:?}) ran the cursor to {i}, past the end                      ({} chars)",
+                    src.len()
+                );
+            }
+        }
+
+        // A `\command` argument that runs out of input is the end-of-input edge
+        // the `*i < src.len()` bound guards: widened to `<=` the cursor steps
+        // past the end and the slice that follows panics.
+        assert_eq!(math_to_unicode(r"\sqrt\"), "√\\");
+        // And the escaped-backslash form, where the second character IS present
+        // and must be consumed as the command's single-character name — the
+        // `*i += 1` that `<=` would skip and a rewind would undo.
+        assert_eq!(math_to_unicode(r"\sqrt\\x"), "√ x");
     }
 }
