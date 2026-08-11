@@ -41,9 +41,11 @@ NAME, a home path, or an internal token is not attribution, it is the same
 leak the content-safety audit exists to catch, wearing a different field.
 `git` fills `user.name` from the OS account by default, so this is the
 accidental case, not the adversarial one - and by volume it is the LARGER
-exposure here: on this repository 549 commits carry the account name in a name
-field against 30 carrying a personal mailbox in an address field, and the
-address rules cannot see any of the 549. The name is therefore passed through
+exposure here: measured over all 993 commits, 549 carry the account name in a
+name field against 31 carrying a personal mailbox in an address field (two
+distinct mailboxes), and the address rules cannot see any of the 549. The
+seventeen-to-one ratio is the whole argument for reading the name fields at
+all. The name is therefore passed through
 the content-safety audit's scanner: whatever that scanner already refuses is
 refused here too, and every other name is accepted untouched.
 """

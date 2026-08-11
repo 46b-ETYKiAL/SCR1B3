@@ -78,8 +78,8 @@ MUST_ACCEPT: list[tuple[str, str]] = [
 # from fragments for the same reason as the mailboxes above.
 MUST_REJECT_NAME: list[tuple[str, str]] = [
     # The default `user.name` git derives from the workstation account. This is
-    # the accidental case and by far the most common: 549 commits already on
-    # this repository carry it, against 30 carrying a personal mailbox.
+    # the accidental case and by far the most common: of this repository's 993
+    # commits, 549 carry it, against 31 carrying a personal mailbox.
     ("workstation account name", "." + "46b" + "_"),
     ("account name inside a longer name", "build-agent (" + "." + "46b" + "_" + ")"),
     # A name field is free text, so a path or a mailbox can land in it.
