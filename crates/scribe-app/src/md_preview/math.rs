@@ -51,24 +51,34 @@ fn render(src: &[char], depth: u8) -> String {
     }
     let mut out = String::new();
     let mut i = 0usize;
-    while i < src.len() {
-        match src[i] {
-            '\\' => {
-                i += 1;
-                render_command(src, &mut i, &mut out, depth);
-            }
-            '^' | '_' => {
-                let sup = src[i] == '^';
-                i += 1;
-                render_script(src, &mut i, &mut out, depth, sup);
-            }
+    while let Some(&c) = src.get(i) {
+        // The dispatch character is consumed HERE — once, unconditionally,
+        // before any arm runs — instead of by a separate `i += 1` in each arm.
+        // Two reasons, both about this loop being unable to stall:
+        //
+        //   * No arm can be the loop's ONLY source of progress any more. A
+        //     malformed `$…$` fragment must never be able to wedge the markdown
+        //     preview, and that is now a property of the loop itself rather
+        //     than of all four arms independently remembering to advance.
+        //   * `saturating_add`, not `+= 1`. An index step written as an
+        //     assign-op is exactly the shape a mutation run perturbs into
+        //     `-=`/`*=`, and a cursor that rewinds or stands still here does
+        //     not render the wrong thing — it hangs. That is a fault no
+        //     assertion can observe, only a timeout, and a timeout fails the
+        //     gate while teaching nothing. With no operator there is nothing to
+        //     perturb: the four `+=` mutants this loop used to carry (three of
+        //     them measured TIMEOUTs) are no longer generated at all. It is
+        //     also the honest semantics — this cursor only ever moves forward,
+        //     and saturating at `usize::MAX` beats wrapping to 0, which would
+        //     restart the whole walk.
+        i = i.saturating_add(1);
+        match c {
+            '\\' => render_command(src, &mut i, &mut out, depth),
+            '^' | '_' => render_script(src, &mut i, &mut out, depth, c == '^'),
             // Bare braces are TeX grouping, not content — drop them. An escaped
             // brace arrives as `\{` and is handled by `render_command`.
-            '{' | '}' => i += 1,
-            c => {
-                out.push(c);
-                i += 1;
-            }
+            '{' | '}' => {}
+            _ => out.push(c),
         }
     }
     out
@@ -98,9 +108,18 @@ fn render_command(src: &[char], i: &mut usize, out: &mut String, depth: u8) {
     }
 
     let start = *i;
-    while src.get(*i).is_some_and(|c| c.is_ascii_alphabetic()) {
-        *i += 1;
-    }
+    // Counted, not stepped — the same reason as the identical scan in
+    // `read_group_inner`. As a `while` loop the `*i += 1` was the loop's ONLY
+    // progress, so perturbing it spun forever instead of returning a wrong
+    // command name: a hang, which no assertion can catch and only a timeout
+    // reports. Counted, a perturbed advance mis-parses the name and terminates,
+    // which `greek_and_operator_commands_become_unicode` asserts.
+    *i += src
+        .get(*i..)
+        .unwrap_or(&[])
+        .iter()
+        .take_while(|c| c.is_ascii_alphabetic())
+        .count();
     let name: String = src[start..*i].iter().collect();
 
     match name.as_str() {
@@ -217,22 +236,30 @@ fn read_group_inner(src: &[char], i: &mut usize) -> Vec<char> {
             *i += 1;
             let start = *i;
             let mut nesting = 1usize;
-            while *i < src.len() {
-                match src[*i] {
+            // Consumed at the TOP of the loop, once, before the arms run — so
+            // no arm is this loop's only progress and a perturbed advance
+            // cannot stall it. Same reasoning as `render`'s loop head: a
+            // stalled cursor here does not mis-parse, it hangs the preview on a
+            // malformed fragment, and a hang is a fault only a timeout can
+            // observe. Previously the escaped-brace skip and the bottom-of-loop
+            // step were BOTH mutable into a net-zero advance.
+            while let Some(&c) = src.get(*i) {
+                let at = *i;
+                *i = i.saturating_add(1);
+                match c {
                     // Skip an escaped brace so it cannot unbalance the scan.
-                    '\\' => *i += 1,
+                    '\\' => *i = i.saturating_add(1),
                     '{' => nesting += 1,
                     '}' => {
                         nesting -= 1;
                         if nesting == 0 {
-                            let inner = src[start..*i].to_vec();
-                            *i += 1; // consume the closing brace
-                            return inner;
+                            // `at` is the closing brace, which the cursor has
+                            // already been advanced past.
+                            return src[start..at].to_vec();
                         }
                     }
                     _ => {}
                 }
-                *i += 1;
             }
             // Unbalanced `{` — take the rest of the fragment.
             src[start..].to_vec()
@@ -1110,5 +1137,39 @@ mod tests {
         // and must be consumed as the command's single-character name — the
         // `*i += 1` that `<=` would skip and a rewind would undo.
         assert_eq!(math_to_unicode(r"\sqrt\\x"), "√ x");
+    }
+
+    /// An escaped `\}` inside a braced group is CONTENT, not the group's
+    /// terminator.
+    ///
+    /// The brace scan carries an arm whose only job is to step over the
+    /// character after a `\` so it cannot unbalance the nesting count. Nothing
+    /// asserted it: every existing brace test either has no backslash inside
+    /// the group, or has one followed by an ordinary letter (`\frac{\frac…}`),
+    /// where skipping and not skipping land on the same parse. Deleting the arm
+    /// therefore changed no test — the mutant was MISSED, and the escape was
+    /// live but ungated.
+    ///
+    /// The discriminating shape is specifically an escaped CLOSE brace: without
+    /// the skip it terminates the group early, so the argument is truncated and
+    /// the remainder leaks out into the surrounding text.
+    #[test]
+    fn an_escaped_close_brace_inside_a_group_does_not_terminate_it() {
+        // The whole of `a\}b` is the radicand; the `\}` renders as a literal
+        // `}` via the escaped-literal path. Truncating at the escape would give
+        // `√(a\)b` instead — the `b` outside the radical and a stray backslash
+        // inside it.
+        assert_eq!(math_to_unicode(r"\sqrt{a\}b}"), "√(a}b)");
+        // Same escape as a whole numerator, which additionally proves the
+        // DENOMINATOR still lines up: an early terminator eats the `{` of `{b}`
+        // as the second argument and the fraction separator disappears.
+        assert_eq!(math_to_unicode(r"\frac{\}}{b}"), "}/b");
+        // The open-brace direction is deliberately asserted too. It is NOT
+        // discriminating on its own (an unskipped `\{` raises the nesting count
+        // and the group runs to the end of the fragment, which happens to
+        // re-render the same), so it is here to pin the behaviour rather than to
+        // carry the kill — and to keep a later reader from assuming the two
+        // directions are interchangeable.
+        assert_eq!(math_to_unicode(r"\sqrt{a\{b}"), "√(a{b)");
     }
 }
