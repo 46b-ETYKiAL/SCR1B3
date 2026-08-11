@@ -278,9 +278,15 @@ exclude_re = [
   #   appearance : render_sections 191 -> 177, appearance.rs 17 (15 moved + 2)
   #   fonts+editor: render_sections 177 ->  81, fonts.rs 40 + editor.rs 62
   #                 (98 moved + 4 whole-fn, 2 call-line `|=` stay gated)
+  #   motion+window+spellcheck: render_sections 81 -> 22, motion.rs 45 +
+  #                 window.rs 11 + spellcheck.rs 12 (62 moved + 6 whole-fn,
+  #                 3 call-line `|=` stay gated)
   'settings/appearance\.rs.*\brender\b',
   'settings/fonts\.rs.*\brender\b',
   'settings/editor\.rs.*\brender\b',
+  'settings/motion\.rs.*\brender\b',
+  'settings/window\.rs.*\brender\b',
+  'settings/spellcheck\.rs.*\brender\b',
   # app/chrome.rs frameless-window chrome painting
   '\bcaption_btn\b',
   '\bhandle_frameless_resize\b',
