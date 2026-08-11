@@ -8,20 +8,30 @@
 # telemetry. No data leaves your machine beyond the GitHub download itself.
 #
 # --- Why a signature and not just a checksum -------------------------------
-# A SHA-256 sidecar fetched from the SAME host as the artifact is a corruption
+# A SHA-256 digest fetched from the SAME host as the artifact is a corruption
 # check, not a security control: whoever can serve you a malicious tarball can
-# serve the matching `.sha256` alongside it. The authenticity control is the
+# serve the matching digest alongside it. The authenticity control is the
 # signature checked against PUBKEY below, which is embedded in this script and
 # therefore shares the trust root you accepted by choosing to run this script.
-# The checksum this script compares against is therefore taken from the SIGNED
-# aggregate `SHA256SUMS` manifest (verified against PUBKEY before it is read),
-# not from an unsigned per-artifact `.sha256` sidecar.
 #
-# This script FAILS CLOSED. Previously the checksum was entirely optional --
-# `curl ... || true` plus `if [ -f sum ] && command -v sha256sum` -- so a
-# missing sidecar or a machine without sha256sum installed silently skipped
-# verification and installed whatever had been downloaded. There is now no path
-# that installs an unverified binary, and deliberately no env var to skip it.
+# Releases DO publish a signature for their checksum files. The previous
+# version of this script simply never fetched or checked one: it read a digest
+# out of a `.sha256` sidecar and ignored the `.sha256.minisig` sitting next to
+# it, so the digest it compared against was unauthenticated in practice even
+# though an authenticated form was published. Worse, it requested
+# `scr1b3-<target>.sha256` while releases publish
+# `scr1b3-<target>.tar.gz.sha256`, so that fetch 404'd on every platform --
+# and being `|| true`-guarded, the 404 silently disabled the only check the
+# script had. The digest compared below is therefore taken from the aggregate
+# `SHA256SUMS` manifest, verified against PUBKEY BEFORE any digest is read
+# from it.
+#
+# This script FAILS CLOSED. Previously verification was entirely optional --
+# `curl ... || true` plus `if [ -f sum ] && command -v sha256sum` -- so the
+# 404 above, or a machine without sha256sum (stock macOS ships `shasum`, not
+# `sha256sum`), silently skipped verification and installed whatever had been
+# downloaded. There is now no path that installs an unverified binary, and
+# deliberately no env var to skip it.
 set -eu
 
 # Canonical public release repository, confirmed via
@@ -102,18 +112,41 @@ verify_sig() {
   fi
 }
 
-# Release checksums now ship as ONE aggregate manifest (SHA256SUMS) plus its
-# detached signature, instead of a per-artifact `.sha256` + `.sha256.minisig`
-# pair for every asset. That is not just less release clutter: the previous
-# per-artifact `.sha256` was UNSIGNED, so the checksum check it fed was a
-# corruption check with no authenticity value whatsoever (see the header note).
-# SHA256SUMS is signed with the SAME key as the artifact, so the digest we
-# compare against is now an AUTHENTICATED value.
+# --- Which checksum source: the trade-off this script accepts ---------------
+# Three options were on the table; this script takes the second.
+#
+#   1. Verify the per-artifact `.sha256` + `.sha256.minisig` pair. This WOULD
+#      work against v0.4.62 and earlier, which publish that pair. Rejected:
+#      v0.4.63 stops publishing per-artifact sidecars in favour of the
+#      aggregate manifest, so this path would break at the very next release.
+#   2. REQUIRE the signed aggregate `SHA256SUMS`. CHOSEN. One signed manifest
+#      rather than two extra assets per artifact, and a single verification
+#      path -- so there is no second path to rot unnoticed.
+#   3. Accept either, whichever the release happens to publish. Rejected: the
+#      sidecar branch becomes dead code the moment v0.4.63 ships, and a
+#      verification path nothing exercises is a path that silently stops
+#      working. A fallback that only ever runs against old releases is exactly
+#      the shape of check that is discovered broken years later.
+#
+# THE COST, stated plainly: v0.4.62 and earlier publish NO SHA256SUMS, so this
+# script REFUSES to install them. That is deliberate, not an oversight.
+# Refusing to install is a correct outcome; installing something that cannot be
+# verified is not. The first release this script can install is v0.4.63 -- the
+# same floor `.github/workflows/release.yml` writes into the update manifest's
+# `minimum_version`.
 #
 # All three downloads are REQUIRED. A missing one aborts rather than skipping
-# the check that a missing sidecar would otherwise silently disable.
-curl -fsSL "${base}/SHA256SUMS" -o "${tmp}/SHA256SUMS" \
-  || die "no SHA256SUMS published in this release — refusing to install unverified"
+# the check that a missing file would otherwise silently disable.
+if ! curl -fsSL "${base}/SHA256SUMS" -o "${tmp}/SHA256SUMS"; then
+  echo "error: no SHA256SUMS published in this release — refusing to install unverified" >&2
+  echo "" >&2
+  echo "Releases before v0.4.63 do not publish the signed checksum manifest this" >&2
+  echo "installer requires. Install v0.4.63 or later once it is released, or" >&2
+  echo "download the archive and its .minisig from" >&2
+  echo "  https://github.com/${REPO}/releases" >&2
+  echo "and verify manually against public key ${PUBKEY_ID}." >&2
+  exit 1
+fi
 curl -fsSL "${base}/SHA256SUMS.minisig" -o "${tmp}/SHA256SUMS.minisig" \
   || die "no SHA256SUMS.minisig published — refusing to trust an unsigned checksum manifest"
 curl -fsSL "${base}/${asset}.minisig" -o "${tmp}/sig" \
@@ -158,8 +191,14 @@ echo "installed ${BIN} to ${dest}"
 if [ -d "${tmp}/licenses" ]; then
   licdir="${dest}/../share/scr1b3/licenses"
   if mkdir -p "$licdir" 2>/dev/null && cp -R "${tmp}/licenses/." "$licdir/" 2>/dev/null; then
-    [ -f "${tmp}/THIRD-PARTY-LICENSES.md" ] && \
-      cp "${tmp}/THIRD-PARTY-LICENSES.md" "$licdir/../" 2>/dev/null || true
+    # Spelled out rather than `... || true`: this is the only best-effort step
+    # in the script, and it runs AFTER every verification gate has passed. An
+    # `|| true` here would be indistinguishable, to a reader or to `grep`, from
+    # the `|| true` on a verification step that this rewrite exists to remove.
+    if [ -f "${tmp}/THIRD-PARTY-LICENSES.md" ]; then
+      cp "${tmp}/THIRD-PARTY-LICENSES.md" "$licdir/../" 2>/dev/null \
+        || echo "note: could not copy THIRD-PARTY-LICENSES.md to ${licdir}/.." >&2
+    fi
     echo "license texts installed to $licdir"
   fi
 fi
