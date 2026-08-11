@@ -31,6 +31,15 @@ ureq = { version = "3", features = ["json"] }    # pure-Rust (rustls) blocking H
 flate2 = "1"                                     # pure-Rust (miniz_oxide) gzip decode for the release .tar.gz
 tar = "0.4"                                       # tar archive extraction of the release binary
 
+[features]
+# Exposes the `#[doc(hidden)]` test seams (currently
+# `Document::read_only_large_for_test`) to DOWNSTREAM crates' test targets.
+# `cfg(test)` alone is per-crate, so without this feature `scribe-app` cannot
+# construct the read-only-large document its two read-only-browse editor arms
+# are selected by. Enabled only from `scribe-app`'s `[dev-dependencies]`, so a
+# release build of the app never carries it.
+test-hooks = []
+
 [dev-dependencies]
 tempfile = "3"
 # Capture `tracing` events in tests to assert the silent-failure log sites emit

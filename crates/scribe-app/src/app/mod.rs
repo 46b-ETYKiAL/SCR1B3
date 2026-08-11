@@ -2489,6 +2489,13 @@ mod grid_pane_tests;
 #[cfg(test)]
 mod grid_parity_tests;
 
+/// The seven-arm editor-surface capability matrix. Extends `grid_parity_tests`
+/// (one grid pane vs one single-pane arm) to every arm of the
+/// `grid_tree.is_some()` fork, and pins each known gap as an expected-absent
+/// cell that a graft of the missing call turns red.
+#[cfg(test)]
+mod surface_parity_tests;
+
 #[cfg(test)]
 mod filetree_tests;
 
