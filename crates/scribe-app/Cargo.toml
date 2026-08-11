@@ -67,6 +67,11 @@ raw-window-handle = "0.6"
 tray-icon = { version = "=0.24.2", default-features = false }
 
 [dev-dependencies]
+# Test seams only (`Document::read_only_large_for_test`). Cargo unifies this
+# with the normal `scribe-core.workspace = true` dependency for TEST targets;
+# dev-dependencies are not built for `cargo build --release`, so the shipped
+# binary never carries the seam.
+scribe-core = { workspace = true, features = ["test-hooks"] }
 tempfile = "3"
 # Glyph-coverage assertion for the bundled Noto Sans JP kanji subset. Same
 # font crate egui 0.34 (epaint/skrifa) rasterizes with, so the test verifies
