@@ -852,15 +852,15 @@ mod packaging_consistency_tests {
         // Deliberately spans both sides of the predicate, including the shapes
         // a naive "contains a hyphen" test gets wrong.
         for (ref_type, tag) in [
-            ("tag", "v0.4.63"),               // stable
-            ("tag", "v1.2.3"),                // stable
-            ("tag", "v0.4.63-rc.1"),          // prerelease
-            ("tag", "v0.5.0-hotfix"),         // well-formed SemVer prerelease
+            ("tag", "v0.4.63"),                // stable
+            ("tag", "v1.2.3"),                 // stable
+            ("tag", "v0.4.63-rc.1"),           // prerelease
+            ("tag", "v0.5.0-hotfix"),          // well-formed SemVer prerelease
             ("tag", "v1.2.3-alpha.2+build.5"), // prerelease w/ build metadata
-            ("tag", "v1.0-final"),            // NOT SemVer -> stable
-            ("tag", "v0.5-hotfix"),           // NOT SemVer -> stable
-            ("tag", "v2026-08-10"),           // date tag -> stable
-            ("branch", "master"),             // dispatch build
+            ("tag", "v1.0-final"),             // NOT SemVer -> stable
+            ("tag", "v0.5-hotfix"),            // NOT SemVer -> stable
+            ("tag", "v2026-08-10"),            // date tag -> stable
+            ("branch", "master"),              // dispatch build
         ] {
             let class = run_tag_class(ref_type, tag);
             let (code, log) = run_signing_guard(ref_type, tag);
@@ -874,7 +874,11 @@ mod packaging_consistency_tests {
                  because prerelease` and `published as latest because stable`, \
                  which is exactly the hole this pair of checks exists to close. \
                  Guard output:\n{log}",
-                if unsigned_forbidden { "FORBIDS" } else { "ALLOWS" }
+                if unsigned_forbidden {
+                    "FORBIDS"
+                } else {
+                    "ALLOWS"
+                }
             );
         }
     }
@@ -923,12 +927,10 @@ mod packaging_consistency_tests {
              inline lets the two drift apart, and the drift is the bug.\n{step}"
         );
 
-        let branch_start = step
-            .find("if [ \"$class\" = \"stable\" ]; then")
-            .expect(
-                "the publish step must branch on the release class; without a \
+        let branch_start = step.find("if [ \"$class\" = \"stable\" ]; then").expect(
+            "the publish step must branch on the release class; without a \
                  branch it marks every ref the same way, which is the defect",
-            );
+        );
         let branch = &step[branch_start..];
         let else_at = branch
             .find("\n          else")
