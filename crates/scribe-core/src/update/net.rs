@@ -1544,6 +1544,24 @@ mod tests {
         assert_eq!(fetch_optional_sha_sidecar("   ").unwrap(), None);
     }
 
+    #[test]
+    fn optional_sha_sidecar_is_fetched_and_returned_when_present() {
+        // The absent-url test above is, on its own, satisfied by a function
+        // that ALWAYS returns `Ok(None)` — so it pins the short-circuit and
+        // nothing else. This is the other half: a PRESENT url must actually be
+        // fetched and its body handed back, or the updater would silently lose
+        // the sidecar it cross-checks the manifest SHA against.
+        let body = b"2222bbbb  scr1b3-x86_64-unknown-linux-gnu.tar.gz".to_vec();
+        let server = one_shot("200 OK", &[], body.clone());
+        let url = format!("{}/scr1b3.tar.gz.sha256", server.url);
+        assert_eq!(
+            fetch_optional_sha_sidecar(&url).expect("a present sidecar must fetch"),
+            Some(String::from_utf8(body).expect("ascii body")),
+            "a non-empty url must be fetched, never short-circuited to None"
+        );
+        let _ = server.captured();
+    }
+
     // --- resolve_expected_sha (manifest authoritative, sidecar must agree) ---
 
     #[test]

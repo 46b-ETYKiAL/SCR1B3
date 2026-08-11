@@ -575,4 +575,30 @@ mod tests {
         let _ = drain(&root);
         assert!(!pending(&root));
     }
+
+    /// `lock_path` is the path `acquire` takes its exclusive share-mode handle
+    /// on, so it is what makes single-instance detection PER-ROOT. Nothing
+    /// asserted it: replaced by `Default::default()` it becomes the EMPTY
+    /// path, and every root would then contend on one nameless lock — two
+    /// different installs would see each other as "an instance already
+    /// running".
+    ///
+    /// Asserted as its two halves (the file name, and the parent it sits in)
+    /// rather than by restating `root.join(...)`, so the test pins the
+    /// contract instead of echoing the implementation.
+    #[test]
+    fn the_lock_file_is_named_inside_the_root_it_is_given() {
+        let root = Path::new("some").join("project").join("root");
+        let got = lock_path(&root);
+        assert_eq!(
+            got.file_name().and_then(std::ffi::OsStr::to_str),
+            Some("instance.lock"),
+            "the lock file name is persisted behaviour, not an implementation detail"
+        );
+        assert_eq!(
+            got.parent(),
+            Some(root.as_path()),
+            "the lock must sit INSIDE the root it was given, so detection is per-root"
+        );
+    }
 }
