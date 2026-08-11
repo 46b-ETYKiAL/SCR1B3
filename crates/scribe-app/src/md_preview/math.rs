@@ -177,9 +177,18 @@ fn render_script(src: &[char], i: &mut usize, out: &mut String, depth: u8, sup: 
 /// argument rules (`\frac12` is `\frac{1}{2}`). Always advances `*i` when a
 /// character is available, so callers cannot loop forever.
 fn read_group(src: &[char], i: &mut usize) -> Vec<char> {
-    while src.get(*i).is_some_and(|c| c.is_whitespace()) {
-        *i += 1;
-    }
+    // Counted, not stepped. The obvious `while …is_whitespace() { *i += 1 }` is
+    // a manual index loop whose increment is the loop's ONLY progress, so
+    // perturbing that increment hangs rather than returning a wrong answer —
+    // a fault no assertion can observe, only a timeout. Advancing by a computed
+    // count has identical semantics while making a wrong step produce a wrong
+    // parse, which `read_group_index_arithmetic_is_exact` catches.
+    *i += src
+        .get(*i..)
+        .unwrap_or(&[])
+        .iter()
+        .take_while(|c| c.is_whitespace())
+        .count();
     match src.get(*i) {
         None => Vec::new(),
         Some('{') => {
@@ -926,5 +935,80 @@ mod tests {
                 "symbol({input:?}) is not a known command and must return None"
             );
         }
+    }
+
+    /// The depth cap must be driven by EVERY recursing construct, not just
+    /// `\sqrt` (which the test above already pins). Each fragment below nests
+    /// one construct past `MAX_DEPTH`; if that construct stopped incrementing
+    /// `depth` the cap would never fire, the fragment would expand all the way
+    /// down, and no raw TeX would be left — which is what each assert looks for.
+    #[test]
+    fn every_recursing_construct_increments_the_depth_counter() {
+        let n = MAX_DEPTH as usize + 4;
+
+        // `\frac` numerator: \frac{\frac{…x…}{c}}{c}
+        let out = math_to_unicode(&format!("{}x{}", r"\frac{".repeat(n), "}{c}".repeat(n)));
+        assert!(
+            out.contains(r"\frac"),
+            "frac numerator must stop expanding at the cap: {out}"
+        );
+
+        // `\frac` denominator: \frac{c}{\frac{c}{…x…}}
+        let out = math_to_unicode(&format!("{}x{}", r"\frac{c}{".repeat(n), "}".repeat(n)));
+        assert!(
+            out.contains(r"\frac"),
+            "frac denominator must stop expanding at the cap: {out}"
+        );
+
+        // Font/roman wrapper: \mathrm{\mathrm{…\alpha…}}
+        let out = math_to_unicode(&format!(
+            "{}{}{}",
+            r"\mathrm{".repeat(n),
+            r"\alpha",
+            "}".repeat(n)
+        ));
+        assert!(
+            out.contains(r"\mathrm") && out.contains(r"\alpha"),
+            "wrapper must stop expanding at the cap: {out}"
+        );
+
+        // Script group: x^{x^{…\alpha…}}
+        let out = math_to_unicode(&format!(
+            "{}{}{}",
+            "x^{".repeat(n),
+            r"\alpha",
+            "}".repeat(n)
+        ));
+        assert!(
+            out.contains(r"\alpha"),
+            "script body must stop expanding at the cap: {out}"
+        );
+    }
+
+    /// `read_group` is hand-rolled index arithmetic, so every step it takes is
+    /// pinned here: the leading-whitespace skip, the escaped-brace skip that
+    /// stops `\}` closing the group early, and both `\command` argument forms
+    /// (an alphabetic name, and the single-punctuation-character form).
+    #[test]
+    fn read_group_index_arithmetic_is_exact() {
+        // TeX allows whitespace between a command and its argument.
+        assert_eq!(math_to_unicode(r"\frac {a}{b}"), "a/b");
+        assert_eq!(math_to_unicode("x^ 2"), "x²");
+
+        // `\}` inside a group must NOT terminate it — the brace is content.
+        assert_eq!(math_to_unicode(r"\mathrm{a\}b}"), "a}b");
+
+        // `\command` as a bare argument: an alphabetic name...
+        assert_eq!(math_to_unicode(r"\sqrt\alpha"), "√α");
+        // ...and the single-punctuation-character form.
+        assert_eq!(math_to_unicode(r"\sqrt\{"), "√{");
+
+        // A command argument must be CONSUMED, not merely re-rendered by the
+        // caller's loop. `\sqrt\alpha` cannot tell the difference — if the
+        // group comes back empty the outer walk re-expands `\alpha` and the
+        // output is identical either way. A two-argument command can: get the
+        // consumption wrong and both arguments fall through to the outer walk,
+        // which drops the fraction separator entirely.
+        assert_eq!(math_to_unicode(r"\frac\alpha\beta"), "α/β");
     }
 }
