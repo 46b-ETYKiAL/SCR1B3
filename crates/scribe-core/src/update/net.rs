@@ -56,6 +56,12 @@ const GITHUB_API_VERSION: &str = "2026-03-10";
 /// GitHub Releases API `Accept` header value.
 const GITHUB_ACCEPT: &str = "application/vnd.github+json";
 
+/// Origin of the GitHub REST API — the single outbound host the updater talks
+/// to. Named (and threaded through as a parameter) rather than inlined into the
+/// URL composer so the compose-then-fetch step is reachable from a test; see
+/// [`fetch_releases`].
+pub const GITHUB_API_BASE: &str = "https://api.github.com";
+
 /// Overall per-request network timeout. Bounds a slow or stalled connection (a
 /// hostile or just-bad network) so an update check / download can never hang the
 /// worker thread indefinitely.
@@ -261,8 +267,20 @@ pub fn ensure_upgrade(candidate: &str, running: &str) -> Result<(), String> {
 /// always the NAME — never relaxing the redirect ban, which is what stops an
 /// off-GitHub bounce from serving forged JSON.
 pub fn releases_api_url(owner: &str, repo: &str) -> String {
+    releases_api_url_at(GITHUB_API_BASE, owner, repo)
+}
+
+/// [`releases_api_url`] against an explicit API `base`.
+///
+/// The base is a PARAMETER rather than a literal baked into the `format!` for
+/// one reason: it is what lets [`fetch_releases`] — the compose-then-fetch step
+/// the updater actually calls — be driven against the loopback mock. With
+/// `api.github.com` hard-coded, that function could only be exercised by a real
+/// network request, so nothing tested it and its body could be replaced by an
+/// empty list with the suite still green.
+fn releases_api_url_at(base: &str, owner: &str, repo: &str) -> String {
     // per_page=100 returns every release in one page for a project this size.
-    format!("https://api.github.com/repos/{owner}/{repo}/releases?per_page=100")
+    format!("{base}/repos/{owner}/{repo}/releases?per_page=100")
 }
 
 /// Blocking GET of `/repos/{owner}/{repo}/releases` (the FULL list, one page).
@@ -270,8 +288,14 @@ pub fn releases_api_url(owner: &str, repo: &str) -> String {
 /// that hides a freshly-published release, and maps a 403/429 to an explicit
 /// rate-limit message (unauthenticated GitHub allows 60 req/hr/IP). Never
 /// panics.
-pub fn fetch_releases(owner: &str, repo: &str) -> Result<Vec<RawRelease>, String> {
-    fetch_releases_at(&releases_api_url(owner, repo))
+/// `base` is [`GITHUB_API_BASE`] in production and a loopback mock's origin in
+/// tests. It is a parameter, not a constant read inside, because otherwise this
+/// composition — "build THAT url, then fetch and parse it" — has no observable
+/// behaviour short of a real request to GitHub, and a body replaced with an
+/// empty list would leave `check_for_update` reporting "up to date" forever on
+/// every installed copy while the whole suite stayed green.
+pub fn fetch_releases(base: &str, owner: &str, repo: &str) -> Result<Vec<RawRelease>, String> {
+    fetch_releases_at(&releases_api_url_at(base, owner, repo))
 }
 
 /// The URL-targetable core of [`fetch_releases`]: issue the redirect-forbidden,
@@ -395,7 +419,7 @@ pub fn check_for_update(
     current: &semver::Version,
     target: &str,
 ) -> Result<UpdateOutcome, String> {
-    let releases = fetch_releases(owner, repo)?;
+    let releases = fetch_releases(GITHUB_API_BASE, owner, repo)?;
     // Discovery: which release (if any) is even newer than us?
     let Some((latest, raw)) = pick_highest_stable(&releases) else {
         // No parseable stable release at all — silent "up to date".
@@ -1907,13 +1931,43 @@ mod tests {
         handle: JoinHandle<Option<CapturedRequest>>,
     }
 
+    /// How long the mock waits for its one client. A real loopback connection
+    /// lands in microseconds, so this is a ~million-fold margin whose only job
+    /// is to make "the request was never issued" terminate.
+    const ACCEPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
     fn one_shot(status_line: &str, extra_headers: &[&str], body: Vec<u8>) -> OneShotServer {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
         let port = listener.local_addr().unwrap().port();
+        listener
+            .set_nonblocking(true)
+            .expect("a pollable listener so the accept below can be bounded");
         let status_line = status_line.to_string();
         let extra: Vec<String> = extra_headers.iter().map(|s| s.to_string()).collect();
         let handle = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().ok()?;
+            // BOUNDED accept. An unbounded one wedges the whole suite the moment
+            // the code under test stops issuing the request — which is exactly
+            // what a mutant that replaces a fetch with a canned value does, and
+            // it turned `fetch_releases_at -> Ok(vec![])` into a mutation-run
+            // TIMEOUT instead of a kill. With a deadline the thread ends, and
+            // `captured()` reports "server handled no request": a clean failure
+            // that says the request was never made.
+            let deadline = std::time::Instant::now() + ACCEPT_TIMEOUT;
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        if std::time::Instant::now() >= deadline {
+                            return None;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(_) => return None,
+                }
+            };
+            // The accepted stream inherits the listener's non-blocking mode on
+            // some platforms; the request read below is a blocking one.
+            stream.set_nonblocking(false).ok()?;
             let mut reader = BufReader::new(stream.try_clone().ok()?);
             let mut start_line = String::new();
             reader.read_line(&mut start_line).ok()?;
@@ -2049,6 +2103,50 @@ mod tests {
             Some(GITHUB_API_VERSION)
         );
         assert!(!req.start_line.contains("&t=") && !req.start_line.contains("?t="));
+    }
+
+    #[test]
+    fn fetch_releases_composes_the_api_url_then_returns_what_it_fetched() {
+        // `fetch_releases` is the composition the updater actually calls: build
+        // the releases URL for (owner, repo), fetch it, hand back the parsed
+        // list. Both halves were separately tested and the JOIN between them was
+        // not, so replacing the body with `Ok(vec![])` left every assertion
+        // green while `check_for_update` saw no releases, took the
+        // "no parseable stable release at all" branch, and reported UpToDate
+        // forever — every installed copy silently stops updating.
+        //
+        // It was untestable because the API origin was baked into the composer,
+        // so the only way to exercise it was a real request to api.github.com.
+        // Threading the base through as a parameter is what makes the loopback
+        // mock reachable; a network call here would be flaky and is not an
+        // option. Kills the `fetch_releases -> Ok(vec![])` mutant.
+        let json = br#"[
+            {"tag_name":"v9.9.9","prerelease":false,"draft":false,
+             "html_url":"https://example.invalid/r/tag/v9.9.9","assets":[]}
+        ]"#
+        .to_vec();
+        let server = one_shot("200 OK", &[], json);
+        let releases =
+            fetch_releases(&server.url, "o", "r").expect("the mock serves a valid release list");
+        assert_eq!(
+            releases.len(),
+            1,
+            "the FETCHED list must come back, not an empty stand-in"
+        );
+        assert_eq!(releases[0].tag_name, "v9.9.9");
+
+        // And it must have gone to the composed path. This is the leg the doc
+        // comment on `releases_api_url` calls load-bearing: a stale repo name
+        // here makes GitHub answer 301 to the numeric `/repositories/{id}/…`
+        // form, which the redirect ban then turns into a hard failure for every
+        // installed copy.
+        let req = server.captured();
+        assert!(
+            req.start_line
+                .starts_with("GET /repos/o/r/releases?per_page=100"),
+            "the composed request path must be the documented shape, got {:?}",
+            req.start_line
+        );
     }
 
     #[test]
