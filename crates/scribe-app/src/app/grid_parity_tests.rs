@@ -28,7 +28,7 @@ use egui_kittest::kittest::Queryable as _;
 
 /// A grid config whose rope-swap threshold is tiny, so a few KiB of text is
 /// enough to cross the "large file" cliff that the badge exists to announce.
-fn grid_config() -> Config {
+pub(super) fn grid_config() -> Config {
     let mut cfg = Config::default();
     cfg.editor.first_run_completed = true;
     cfg.appearance.frameless = false;
@@ -94,7 +94,7 @@ fn raw_frame(app: &mut ScribeApp, ctx: &egui::Context) {
 }
 
 /// Enough text to cross `grid_config`'s 1 KiB rope threshold, as `lines` lines.
-fn big_text(lines: usize) -> String {
+pub(super) fn big_text(lines: usize) -> String {
     (0..lines)
         .map(|i| format!("line {i:04} ................................"))
         .collect::<Vec<_>>()
@@ -512,18 +512,18 @@ fn pane_editor_ids_are_document_scoped_and_distinct() {
 /// `Shape::LineSegment`s in the severity colour (`render_support::paint_squiggle`
 /// emits nothing else), and a tooltip is a `Shape::Text` carrying the message.
 /// Both are decidable from the shapes alone, with no pixels and no GPU.
-struct Probe {
-    ctx: egui::Context,
+pub(super) struct Probe {
+    pub(super) ctx: egui::Context,
 }
 
 impl Probe {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             ctx: egui::Context::default(),
         }
     }
 
-    fn frame(
+    pub(super) fn frame(
         &self,
         app: &mut ScribeApp,
         modifiers: egui::Modifiers,
@@ -541,19 +541,19 @@ impl Probe {
         self.ctx.run(input, |ctx| app.frame_tick(ctx))
     }
 
-    fn idle(&self, app: &mut ScribeApp) -> egui::FullOutput {
+    pub(super) fn idle(&self, app: &mut ScribeApp) -> egui::FullOutput {
         self.frame(app, egui::Modifiers::NONE, Vec::new())
     }
 
     /// Settle the app: `sync_grid_state` allocates doc ids on the first frame
     /// and the panes lay out on the second, so nothing is measurable before
     /// the third.
-    fn settle(&self, app: &mut ScribeApp) {
+    pub(super) fn settle(&self, app: &mut ScribeApp) {
         self.idle(app);
         self.idle(app);
     }
 
-    fn hover(&self, app: &mut ScribeApp, pos: egui::Pos2) -> egui::FullOutput {
+    pub(super) fn hover(&self, app: &mut ScribeApp, pos: egui::Pos2) -> egui::FullOutput {
         self.frame(
             app,
             egui::Modifiers::NONE,
@@ -563,7 +563,7 @@ impl Probe {
 
     /// Move + press + release at `pos` in ONE frame — the same shape the
     /// single-pane link tests use.
-    fn mod_click(
+    pub(super) fn mod_click(
         &self,
         app: &mut ScribeApp,
         pos: egui::Pos2,
@@ -593,7 +593,7 @@ impl Probe {
 
 /// egui nests shapes in `Shape::Vec`, so a flat scan of `FullOutput::shapes`
 /// misses everything a panel painted.
-fn walk_shape(shape: &egui::Shape, f: &mut impl FnMut(&egui::Shape)) {
+pub(super) fn walk_shape(shape: &egui::Shape, f: &mut impl FnMut(&egui::Shape)) {
     if let egui::Shape::Vec(inner) = shape {
         for s in inner {
             walk_shape(s, f);
@@ -611,7 +611,7 @@ fn walk_shape(shape: &egui::Shape, f: &mut impl FnMut(&egui::Shape)) {
 /// be counted here. Every assertion below is additionally differential against
 /// a diagnostics-free control render, so any future same-colour painter would
 /// have to be diagnostics-DEPENDENT to fool it.
-fn squiggle_segments(out: &egui::FullOutput, color: Color32) -> Vec<[egui::Pos2; 2]> {
+pub(super) fn squiggle_segments(out: &egui::FullOutput, color: Color32) -> Vec<[egui::Pos2; 2]> {
     let mut hits = Vec::new();
     for clipped in &out.shapes {
         walk_shape(&clipped.shape, &mut |s| {
@@ -627,7 +627,7 @@ fn squiggle_segments(out: &egui::FullOutput, color: Color32) -> Vec<[egui::Pos2;
 
 /// Every string this frame actually painted as text — the tooltip's own body
 /// included, since `show_tooltip_at_pointer` lays its label out into the frame.
-fn painted_text(out: &egui::FullOutput) -> String {
+pub(super) fn painted_text(out: &egui::FullOutput) -> String {
     let mut acc = String::new();
     for clipped in &out.shapes {
         walk_shape(&clipped.shape, &mut |s| {
@@ -646,7 +646,7 @@ fn painted_text(out: &egui::FullOutput) -> String {
 /// egui_tiles picks its own column count from the container's aspect ratio, so
 /// a hard-coded "the second pane is on the right" would silently pass or fail
 /// on a layout change instead of testing the overlay.
-fn pane_rect(app: &ScribeApp, doc: crate::grid::DocId) -> Option<egui::Rect> {
+pub(super) fn pane_rect(app: &ScribeApp, doc: crate::grid::DocId) -> Option<egui::Rect> {
     let tree = app.grid_tree.as_ref()?;
     let id = tree.tiles.iter().find_map(|(id, tile)| match tile {
         egui_tiles::Tile::Pane(p) if p.doc_id == doc => Some(*id),
@@ -655,7 +655,7 @@ fn pane_rect(app: &ScribeApp, doc: crate::grid::DocId) -> Option<egui::Rect> {
     tree.tiles.rect(id)
 }
 
-fn segments_bbox(segs: &[[egui::Pos2; 2]]) -> egui::Rect {
+pub(super) fn segments_bbox(segs: &[[egui::Pos2; 2]]) -> egui::Rect {
     assert!(!segs.is_empty(), "no ink to measure");
     let mut r = egui::Rect::NOTHING;
     for [a, b] in segs {
@@ -674,7 +674,14 @@ const DIAG_SRC: &str = "0123456789abcdefghijklmnopqrstuv\n\
                         third line holds a warning token\n\
                         fourth line holds the info notic\n";
 
-fn diag(line: u32, ch: u32, end_line: u32, end_ch: u32, severity: u8, message: &str) -> Diagnostic {
+pub(super) fn diag(
+    line: u32,
+    ch: u32,
+    end_line: u32,
+    end_ch: u32,
+    severity: u8,
+    message: &str,
+) -> Diagnostic {
     Diagnostic {
         uri: "file:///grid-diag.txt".into(),
         line,
@@ -712,7 +719,7 @@ fn diag_grid_config() -> Config {
 /// past the end of the widget, gave the pane editor no focus, and failed its
 /// own `active == 1` precondition — a fixture-geometry bug that looked exactly
 /// like the focus->active sync being broken.
-fn diag_grid_text() -> String {
+pub(super) fn diag_grid_text() -> String {
     let mut s = DIAG_SRC.to_string();
     for _ in 0..200 {
         s.push_str("filler line, no diagnostic published against it\n");
@@ -731,7 +738,7 @@ fn diag_grid_app(diags: Vec<Diagnostic>) -> ScribeApp {
     app
 }
 
-fn error_color(app: &ScribeApp) -> Color32 {
+pub(super) fn error_color(app: &ScribeApp) -> Color32 {
     ui_color(&app.theme, "error", Rgba::new(0xe5, 0x3e, 0x3e, 255))
 }
 

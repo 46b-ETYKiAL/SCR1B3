@@ -316,6 +316,39 @@ impl Document {
         self.read_only_large
     }
 
+    /// Test-only seam: a document in the `read_only_large` state WITHOUT a
+    /// >= [`LARGE_FILE_THRESHOLD`] file behind it.
+    ///
+    /// `read_only_large` is set by [`Document::open`] alone, on a >= 256 MiB
+    /// file. `scribe-core`'s own tests reach the private field by struct
+    /// literal; a DOWNSTREAM crate cannot, so the two read-only-browse editor
+    /// arms (`RopeEditor::show` single-pane, and the grid's read-only pane)
+    /// were unreachable from `scribe-app`'s suite at any price short of
+    /// writing a 256 MiB temp file. A capability-parity ratchet that cannot
+    /// observe two of its seven arms is not a ratchet over those arms, so this
+    /// exists to make them observable.
+    ///
+    /// Safe by direction: `read_only_large` is the RESTRICTIVE state — it makes
+    /// [`Document::save`] and [`Document::reload_from_disk`] REFUSE. Reaching
+    /// it cannot grant a capability; it can only withhold one. That is why this
+    /// is a plain constructor rather than a mutator on an existing document.
+    ///
+    /// `#[doc(hidden)]` + the `test`-or-`test-hooks`-feature gate keep it off
+    /// the public API surface; it is NOT a production entry point.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn read_only_large_for_test(path: Option<PathBuf>, text: &str) -> Self {
+        Self {
+            rope: Rope::from_str(text),
+            path,
+            encoding: DetectedEncoding::default(),
+            eol: Eol::Lf,
+            dirty: false,
+            read_only_large: true,
+            looks_binary: false,
+        }
+    }
+
     /// Whether this file's first bytes looked BINARY on open/reload (a NUL, or
     /// over 30% control-byte noise). Advisory: the buffer is still decoded lossily
     /// so the user can inspect it, but the editor warns ("looks binary — mojibake
