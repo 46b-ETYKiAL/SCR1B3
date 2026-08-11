@@ -284,9 +284,17 @@ exclude_re = [
   'settings/appearance\.rs.*\brender\b',
   'settings/fonts\.rs.*\brender\b',
   'settings/editor\.rs.*\brender\b',
+  #   updates+privacy+plugins+default_app: render_sections 22 -> 12,
+  #                 updates.rs 9 + privacy.rs 4 + plugins.rs 3 +
+  #                 default_app.rs 6 (14 moved + 8 whole-fn, 4 call-line `|=`
+  #                 stay gated)
   'settings/motion\.rs.*\brender\b',
   'settings/window\.rs.*\brender\b',
   'settings/spellcheck\.rs.*\brender\b',
+  'settings/updates\.rs.*\brender\b',
+  'settings/privacy\.rs.*\brender\b',
+  'settings/plugins\.rs.*\brender\b',
+  'settings/default_app\.rs.*\brender\b',
   # app/chrome.rs frameless-window chrome painting
   '\bcaption_btn\b',
   '\bhandle_frameless_resize\b',
