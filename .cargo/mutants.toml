@@ -563,6 +563,58 @@ exclude_re = [
   'macos\.rs.*bundle_info_plist',
   'macos\.rs.*replace register -> RegisterReport',
 
+  # diagnostics_overlay `diagnostic_spans` / `row_segments` empty-input guards.
+  # Both are FAST PATHS, and `|| -> &&` in either is EQUIVALENT: for every input
+  # combination that widening the guard lets through, the body reaches the same
+  # empty result on its own.
+  #
+  #   * `diagnostic_spans(text, diags)` — with `text` empty the body's own
+  #     `if start >= text.len() { continue; }` is `start >= 0`, true for EVERY
+  #     usize, so every diagnostic is dropped before it can be pushed. With
+  #     `diags` empty the loop body never runs. Either way: `Vec::new()`.
+  #   * `row_segments(text, spans, visible)` — with `spans` empty the inner loop
+  #     never runs; with `visible` empty the outer loop never runs; with `text`
+  #     empty every line is `>= line_count()` (break) or has the empty byte
+  #     range `(0, 0)`, where `s >= e` skips every span. Either way: `Vec::new()`.
+  #
+  # DESCRIPTION-anchored, so neither entry can rotate on either axis and neither
+  # needs a POSITIONAL_ANCHORS registration. Each is also PRECISE: `||` appears
+  # exactly once in `diagnostic_spans` and exactly twice — both on the same
+  # guard line, both equivalent for the reason above — in `row_segments`, so
+  # nothing a test kills is swept up. Verified with the tool, not from memory:
+  # `cargo mutants --list` reports both functions' `||` mutants without these
+  # entries and none with them.
+  #
+  # Premise pinned by `the_empty_input_guards_are_fast_paths_the_body_would_
+  # reach_anyway`, which asserts the empty result for each condition on its own
+  # — so if a future edit gives either guard real behaviour, the test fails and
+  # these entries must be dropped rather than quietly covering live code.
+  # Control-checked rather than trusted: `>= -> >` in the same
+  # `start >= text.len()` bounds check, and `>= -> >` in `row_segments`'s
+  # `s >= e`, were each applied for real and came back KILLED, so the suite
+  # demonstrably exercises both bodies and these two are not hiding behind
+  # untested code.
+  'replace \|\| with && in diagnostic_spans',
+  'replace \|\| with && in row_segments',
+
+  # keymap `is_cut_command` / `is_copy_command` / `is_paste_command`: the
+  # `keycode == Key::Delete/Insert` term inside each predicate's
+  # `cfg!(target_os = "windows") && …` arm. `cfg!` is a COMPILE-TIME constant,
+  # so on the ubuntu mutation runner that arm is `false && …` and the comparison
+  # is never evaluated — flipping it to `!=` cannot change any observable
+  # behaviour on that host. Vacuous there, and killable only on Windows, which
+  # this job does not run.
+  #
+  # COLUMN-pinned, not description-pinned, and that distinction is load-bearing:
+  # each predicate ALSO opens with a bare `keycode == Key::Cut/Copy/Paste` whose
+  # `== -> !=` mutant carries a BYTE-IDENTICAL description and IS killed (by
+  # `clipboard_predicates_match_their_own_key_and_nothing_else`). A bare
+  # `in is_cut_command` would suppress that real kill too. Registered in
+  # POSITIONAL_ANCHORS.
+  'keymap\.rs:\d+:71: replace == with != in is_cut_command',
+  'keymap\.rs:\d+:70: replace == with != in is_copy_command',
+  'keymap\.rs:\d+:71: replace == with != in is_paste_command',
+
   # --- The ONLY three literal-line anchors that survive, and why -------------
   # Each pardons a mutant whose NAME is byte-identical to a NEIGHBOUR in the
   # same function at the SAME column — so neither the description nor the column

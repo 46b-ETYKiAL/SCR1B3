@@ -145,6 +145,33 @@ const POSITIONAL_ANCHORS: &[PositionalAnchor] = &[
         columns: &[(27, "< rope.len_lines()")],
         function: "line_span",
     },
+    // The three clipboard predicates' Windows-only comparison. Column-pinned
+    // rather than description-pinned because each function ALSO opens with a
+    // bare `keycode == Key::Cut/Copy/Paste` whose mutant carries a
+    // byte-identical description and IS killed; a bare `in is_cut_command`
+    // would suppress that real kill. The vacuity proof lives in
+    // `.cargo/mutants.toml`.
+    PositionalAnchor {
+        pattern: r"keymap\.rs:\d+:71: replace == with != in is_cut_command",
+        file: "app/keymap.rs",
+        line: None,
+        columns: &[(71, "== egui::Key::Delete)")],
+        function: "is_cut_command",
+    },
+    PositionalAnchor {
+        pattern: r"keymap\.rs:\d+:70: replace == with != in is_copy_command",
+        file: "app/keymap.rs",
+        line: None,
+        columns: &[(70, "== egui::Key::Insert)")],
+        function: "is_copy_command",
+    },
+    PositionalAnchor {
+        pattern: r"keymap\.rs:\d+:71: replace == with != in is_paste_command",
+        file: "app/keymap.rs",
+        line: None,
+        columns: &[(71, "== egui::Key::Insert)")],
+        function: "is_paste_command",
+    },
     PositionalAnchor {
         pattern: r"datetime\.rs:\d+:40: replace - with (\+|/) in format_iso8601_utc",
         file: "datetime.rs",

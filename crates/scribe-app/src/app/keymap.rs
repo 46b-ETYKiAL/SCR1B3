@@ -1394,4 +1394,72 @@ mod tests {
         assert!(!is_copy_command(none, egui::Key::Paste));
         assert!(!is_paste_command(none, egui::Key::Cut));
     }
+
+    /// Pins the premise of the three `keymap\.rs:\d+:7x` pardons in
+    /// `.cargo/mutants.toml`.
+    ///
+    /// Each predicate's LAST term is reached only through
+    /// `cfg!(target_os = ...)`. `cfg!` is a compile-time constant, so on the
+    /// ubuntu mutation runner that arm is `false && …` and the trailing
+    /// comparison is never evaluated — which is exactly why flipping it to
+    /// `!=` is vacuous there and is pardoned rather than tested.
+    ///
+    /// If a term ever escapes that gate it becomes real signal on every host,
+    /// and the pardon would then be silently covering live code. This fails
+    /// when that happens.
+    #[test]
+    fn the_windows_only_clipboard_terms_stay_cfg_gated_so_the_pardon_stays_honest() {
+        let src = include_str!("keymap.rs");
+        // ASSEMBLED, never written as a literal. This test reads its OWN file,
+        // so a literal needle would sit in the source and match itself,
+        // passing no matter what the real declarations said.
+        let gate = ["cfg!(target_os = ", "\"windows\"", ")"].concat();
+        let cmp = ["keycode ", "=="].concat();
+
+        for (name, key) in [
+            ("is_cut_command", "Delete"),
+            ("is_copy_command", "Insert"),
+            ("is_paste_command", "Insert"),
+        ] {
+            let head = format!("fn {name}(");
+            let start = src
+                .find(head.as_str())
+                .unwrap_or_else(|| panic!("`{name}` is gone; re-check the pardon"));
+            let body = &src[start..];
+            let body = &body[..body.find("\n}\n").expect("the function closes")];
+
+            let gated: Vec<&str> = body
+                .lines()
+                .filter(|l| l.contains(gate.as_str()) && l.contains(cmp.as_str()))
+                .collect();
+            assert_eq!(
+                gated.len(),
+                1,
+                "`{name}` no longer has exactly one {gate}-gated comparison (or \
+                 this test now self-matches). If that term compiles live off \
+                 Windows its mutant is real signal: DROP the matching \
+                 `keymap\\.rs` entry from `exclude_re` in .cargo/mutants.toml \
+                 and from POSITIONAL_ANCHORS, rather than leaving a pardon that \
+                 covers reachable code."
+            );
+            assert!(
+                gated[0].trim_end().ends_with(&format!("Key::{key})")),
+                "`{name}`'s gated term should still compare against \
+                 `Key::{key}`; the pardon's registered column text pins that \
+                 spelling too."
+            );
+
+            // The neighbour the pardon must NOT swallow: the UNGATED media-key
+            // term, which `clipboard_predicates_match_their_own_key_and_nothing_\
+            // else` kills. Its mutant's description is byte-identical to the
+            // gated one's, which is why the pardon is column-pinned.
+            assert!(
+                body.lines()
+                    .any(|l| l.contains(cmp.as_str()) && !l.contains(gate.as_str())),
+                "`{name}` no longer has an ungated comparison; if the only \
+                 comparison left is the gated one, a description anchor would \
+                 be safe and the column pin should be revisited."
+            );
+        }
+    }
 }

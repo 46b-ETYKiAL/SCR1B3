@@ -612,4 +612,87 @@ mod tests {
         // line instead of indexing past it.
         assert_eq!(row_segments(SRC, &spans, 0..9_999).len(), 1);
     }
+
+    /// The hover lists overlapping diagnostics NARROWEST-FIRST, and the width
+    /// it sorts on is `end - start`. Nothing pinned that it is a SUBTRACTION,
+    /// so the key could become `end / start` and still look like a width.
+    ///
+    /// The two spans below are chosen so width and ratio rank them in OPPOSITE
+    /// orders — that is the whole point, and it is why a casual pair would not
+    /// catch this: for most spans the two agree. `inner` is narrower (3 < 4)
+    /// but has the LARGER ratio (4 > 3), so a `/` reverses the list and the
+    /// specific message stops leading — exactly what the doc comment above
+    /// `hover_text` promises it will not do.
+    #[test]
+    fn overlapping_hovers_are_ordered_by_width_not_by_a_ratio() {
+        // outer: 2..6 -> width 4, ratio 6 / 2 = 3
+        // inner: 1..4 -> width 3, ratio 4 / 1 = 4
+        // Byte 3 is inside both. Equal severities, so the tuple's second
+        // element cannot be what orders them.
+        let spans = vec![
+            DiagSpan {
+                start: 2,
+                end: 6,
+                severity: SEVERITY_ERROR,
+                message: "outer".into(),
+            },
+            DiagSpan {
+                start: 1,
+                end: 4,
+                severity: SEVERITY_ERROR,
+                message: "inner".into(),
+            },
+        ];
+        assert_eq!(
+            hover_text(&spans, 3).as_deref(),
+            Some("error: inner\nerror: outer"),
+            "the NARROWER span must lead; a ratio key would put `outer` first"
+        );
+    }
+
+    /// The empty-input guards in `diagnostic_spans` and `row_segments` are
+    /// FAST PATHS, not behaviour: for every input combination that fires one,
+    /// the body — had it run instead — reaches the same empty result on its
+    /// own. That is why `||` mutating to `&&` in either guard is EQUIVALENT,
+    /// and this pins the premise rather than arguing it in prose.
+    ///
+    /// The load-bearing half is the empty buffer: with `text.len() == 0` the
+    /// body's own `start >= text.len()` check is `start >= 0`, which is true
+    /// for every `usize`, so every diagnostic is dropped before it can be
+    /// pushed; and `line_byte_range` returns `(0, 0)` there, so `s >= e` skips
+    /// every span. No input can reach a non-empty return through the widened
+    /// guard.
+    #[test]
+    fn the_empty_input_guards_are_fast_paths_the_body_would_reach_anyway() {
+        let span = DiagSpan {
+            start: 0,
+            end: 1,
+            severity: SEVERITY_ERROR,
+            message: "x".into(),
+        };
+
+        // diagnostic_spans: either half of its guard, on its own.
+        assert!(
+            diagnostic_spans("", &[diag(0, 0, 0, 1, 1, "x")]).is_empty(),
+            "an empty buffer yields no spans however the guard is spelled"
+        );
+        assert!(
+            diagnostic_spans(SRC, &[]).is_empty(),
+            "no diagnostics yields no spans"
+        );
+
+        // row_segments: each of its three conditions, on its own.
+        assert!(
+            row_segments("", std::slice::from_ref(&span), 0..3).is_empty(),
+            "an empty buffer yields no row segments"
+        );
+        assert!(
+            row_segments(SRC, &[], 0..3).is_empty(),
+            "no spans yields no row segments"
+        );
+        assert!(
+            row_segments(SRC, std::slice::from_ref(&span), 0..0).is_empty(),
+            "an empty visible range yields no row segments"
+        );
+    }
 }
