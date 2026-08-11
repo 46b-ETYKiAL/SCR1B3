@@ -198,7 +198,7 @@ fn expand_all_clears_folds() {
 fn app_with_text(text: &str) -> ScribeApp {
     let mut a = app();
     let active = a.active;
-    a.tabs[active].text = text.into();
+    a.tabs[active].set_text(text.into());
     a
 }
 
@@ -303,7 +303,7 @@ fn prev_bookmark_navigates_backward_not_forward() {
     // pending_scroll for line index 2). The `delete -` mutant (234:68) makes it
     // navigate_bookmark(1) -> the NEXT bookmark (line 8).
     let mut app = ScribeApp::new_test(Config::default());
-    app.tabs[0].text = "a\nb\nc\nd\ne\nf\ng\nh\ni\nj\n".into();
+    app.tabs[0].set_text("a\nb\nc\nd\ne\nf\ng\nh\ni\nj\n".into());
     app.tabs[0].bookmarks = [2usize, 8].into_iter().collect();
     app.last_cursor_line_col = Some((6, 0)); // 1-based line 6 -> cursor_line0 == 5
     app.pending_scroll = None;

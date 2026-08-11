@@ -205,7 +205,7 @@ fn motion_settings_pane_renders_without_panic() {
 #[test]
 fn goto_symbol_modal_renders() {
     let mut app = overlay_app();
-    app.tabs[0].text = "fn alpha() {}\nfn beta() {}\n".to_string();
+    app.tabs[0].set_text("fn alpha() {}\nfn beta() {}\n".to_string());
     app.execute_builtin(BuiltinCommand::GoToSymbol);
     let mut h = harness(app);
     h.run();
@@ -263,7 +263,7 @@ fn diff_view_overlay_renders() {
     let mut app = overlay_app();
     app.tabs.clear();
     let mut tab = EditorTab::from_path(f).expect("open file");
-    tab.text = "original line 1\nEDITED line 2\nadded line 3\n".to_string();
+    tab.set_text("original line 1\nEDITED line 2\nadded line 3\n".to_string());
     app.tabs.push(tab);
     app.active = 0;
     app.execute_builtin(BuiltinCommand::ToggleDiffView);
@@ -294,7 +294,7 @@ fn zen_mode_renders_without_chrome() {
 #[test]
 fn minimap_renders_when_toggled() {
     let mut app = overlay_app();
-    app.tabs[0].text = (0..200).map(|i| format!("line {i}\n")).collect::<String>();
+    app.tabs[0].set_text((0..200).map(|i| format!("line {i}\n")).collect::<String>());
     let before = app.config.editor.show_minimap;
     app.execute_builtin(BuiltinCommand::ToggleMinimap);
     let mut h = harness(app);
@@ -390,7 +390,7 @@ fn reveal_in_explorer_on_scratch_sets_toast() {
 #[test]
 fn bookmark_toggle_and_navigate_commands() {
     let mut app = overlay_app();
-    app.tabs[0].text = "l0\nl1\nl2\nl3\n".to_string();
+    app.tabs[0].set_text("l0\nl1\nl2\nl3\n".to_string());
     app.execute_builtin(BuiltinCommand::ToggleBookmark);
     // Navigate commands must not panic with a single (or zero) bookmark.
     app.execute_builtin(BuiltinCommand::NextBookmark);
@@ -645,7 +645,7 @@ fn update_prompt_update_now_starts_flow() {
 #[test]
 fn goto_line_modal_go_scrolls_and_closes() {
     let mut app = overlay_app();
-    app.tabs[0].text = (0..50).map(|i| format!("line {i}\n")).collect::<String>();
+    app.tabs[0].set_text((0..50).map(|i| format!("line {i}\n")).collect::<String>());
     app.goto_open = true;
     app.goto_query = "42".to_string();
     app.pending_scroll = None;
@@ -704,7 +704,7 @@ fn external_change_banner_reload_from_disk() {
     app.tabs.clear();
     let mut tab = EditorTab::from_path(f).expect("open file");
     // Local unsaved edit diverging from disk; the disk file changed underneath.
-    tab.text = "MY UNSAVED EDIT\n".to_string();
+    tab.set_text("MY UNSAVED EDIT\n".to_string());
     tab.external_change = true;
     app.tabs.push(tab);
     app.active = 0;
@@ -738,7 +738,7 @@ fn external_change_banner_keep_my_version() {
     let mut app = overlay_app();
     app.tabs.clear();
     let mut tab = EditorTab::from_path(f).expect("open file");
-    tab.text = "MY UNSAVED EDIT\n".to_string();
+    tab.set_text("MY UNSAVED EDIT\n".to_string());
     tab.external_change = true;
     app.tabs.push(tab);
     app.active = 0;

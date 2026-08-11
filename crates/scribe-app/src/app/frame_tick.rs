@@ -504,7 +504,7 @@ impl ScribeApp {
         let active = self.active.min(self.tabs.len().saturating_sub(1));
         let matching_text = self.tabs.get(active).and_then(|t| {
             let path = t.doc.path()?;
-            (path_to_uri(path) == open_uri).then(|| t.text.clone())
+            (path_to_uri(path) == open_uri).then(|| t.text.to_string())
         });
         if let Some(text) = matching_text {
             client.note_change(&text, std::time::Instant::now());
@@ -2334,7 +2334,7 @@ impl ScribeApp {
                 .map(|l| l == "md" || l == "markdown")
                 .unwrap_or(false);
             if is_md {
-                let md = self.tabs[active].text.clone();
+                let md = self.tabs[active].text.to_string();
                 // Bound on the size of note the live preview will render.
                 //
                 // This cap used to be justified by "the preview re-parses the
@@ -2429,7 +2429,7 @@ impl ScribeApp {
                 // Apply any preview checkbox clicks to the SOURCE (edits the real
                 // `[ ]`/`[x]` line, never a hidden state).
                 if !toggled.is_empty() && active < self.tabs.len() {
-                    let mut text = self.tabs[active].text.clone();
+                    let mut text = self.tabs[active].text.to_string();
                     for line in toggled {
                         if let Some(next) =
                             scribe_core::md_ops::toggle_task_on_lines(&text, line, line)
@@ -2438,7 +2438,7 @@ impl ScribeApp {
                         }
                     }
                     if text != self.tabs[active].text {
-                        self.tabs[active].set_text(text);
+                        self.tabs[active].set_text_keep_undo(text);
                         self.tabs[active].doc.mark_dirty();
                     }
                 }
@@ -2447,7 +2447,7 @@ impl ScribeApp {
 
         // ---- Wave-5 P1: diff vs disk (right side panel) ----
         if self.diff_view_open && !chrome_hidden {
-            let cur = self.tabs.get(active).map(|t| t.text.clone());
+            let cur = self.tabs.get(active).map(|t| t.text.to_string());
             let disk = self
                 .tabs
                 .get(active)
@@ -2775,17 +2775,11 @@ impl ScribeApp {
                     let snippets = &self.snippets;
                     let hl = &self.hl;
                     let tab = &mut self.tabs[active];
-                    // Lazily (re)build the persistent rope from `text`. Done as a
-                    // separate `is_none` check rather than `get_or_insert_with`
-                    // so the closure does not capture `tab` while `rope_buf` is
-                    // mutably borrowed (disjoint-field borrow).
-                    if tab.rope_buf.is_none() {
-                        tab.rope_buf = Some(scribe_core::buffer::Buffer::from_text(&tab.text));
-                    }
-                    let buf = tab.rope_buf.as_mut().expect("rope_buf set above");
-                    let state = tab
-                        .rope_state
-                        .get_or_insert_with(scribe_render::RopeEditorState::new);
+                    // Lazily (re)build the persistent rope from `text`, and the
+                    // editing state alongside it. Both come back from ONE call
+                    // because they are disjoint fields of one sealed struct and
+                    // the caller cannot take two `&mut` borrows into it.
+                    let (buf, state) = tab.text.ensure_rope_parts_mut();
                     let mut editor =
                         scribe_render::RopeEditor::new(buf, font.clone(), gutter_row_h)
                             .with_text_color(fg)
@@ -2799,22 +2793,16 @@ impl ScribeApp {
                     let (resp, clipboard) = editor.show_editable(ui, state);
                     // Sync `text` from the rope ONLY on a real content edit — the
                     // O(n) `to_string()` now runs on keystrokes, not every frame.
-                    if resp.content_changed {
-                        if let Some(rope) = tab.rope_buf.as_ref().and_then(|b| b.as_rope()) {
-                            tab.text = rope.to_string();
-                            tab.doc.mark_dirty();
-                        }
-                        // Wave-3: rope write-back bypasses set_text + the egui
-                        // Response, so bump the gen counter here for parity.
-                        tab.edit_gen = tab.edit_gen.wrapping_add(1);
+                    if resp.content_changed && tab.text.sync_from_rope() {
+                        tab.doc.mark_dirty();
                     }
                     // Exact content height for the minimap + the drag assist:
                     // `RopeEditor` lays out via `show_rows(ui, line_h,
                     // total_lines, ..)`, so it is `len_lines * gutter_row_h`.
                     // Read while `tab` is still borrowed, used after it drops.
                     let content_h = tab
-                        .rope_buf
-                        .as_ref()
+                        .text
+                        .rope_buf()
                         .and_then(scribe_core::buffer::Buffer::as_rope)
                         .map_or(1.0, |r| r.len_lines() as f32 * gutter_row_h);
                     // The FIRST non-test consumer of `RopeEditorResponse::buffer_mode`:
@@ -2900,6 +2888,21 @@ impl ScribeApp {
                 // highlight) and undo history bled across tabs — the reported bug.
                 let editor_id =
                     egui::Id::new("scr1b3-central-editor").with(self.tabs[active].doc_id);
+                // `set_text` replaced this buffer from an EXTERNAL source (a
+                // disk reload, a session restore, a plugin). egui keeps this
+                // widget's undo history in ITS OWN memory under `editor_id`,
+                // where `set_text` cannot reach — so drop it here, before the
+                // widget renders. The `feed_state` inside `TextEdit::show`
+                // then seeds a fresh first undo point from the NEW content,
+                // making the next Ctrl+Z a no-op instead of a wholesale
+                // overwrite with a document the user no longer has. Same
+                // honest outcome `invalidate_rope_state` gives the rope path.
+                if self.tabs[active].text.take_textedit_undo_stale() {
+                    if let Some(mut st) = egui::TextEdit::load_state(ctx, editor_id) {
+                        st.clear_undoer();
+                        st.store(ctx, editor_id);
+                    }
+                }
                 let editor_focused = ctx.memory(|m| m.has_focus(editor_id));
                 if !read_only && editor_focused && ctx.input(|i| i.key_pressed(egui::Key::Tab)) {
                     let shift = ctx.input(|i| i.modifiers.shift);
@@ -3274,15 +3277,23 @@ impl ScribeApp {
                         } else {
                             f32::INFINITY
                         };
-                        let editor = egui::TextEdit::multiline(&mut self.tabs[active].text)
-                            .id(editor_id)
-                            .code_editor()
-                            .desired_width(dw)
-                            .desired_rows(30)
-                            .lock_focus(true)
-                            .interactive(!read_only)
-                            .layouter(&mut layouter);
-                        let out = editor.show(ui);
+                        // The `&mut String` egui needs exists ONLY inside this
+                        // closure, and `edit_with_widget` reads `.changed()` off
+                        // the output and runs the full invalidation itself. The
+                        // duty that used to live in a `.changed()` arm below —
+                        // and was policed by a source-text scan — is now
+                        // discharged by the seam, so it cannot be forgotten.
+                        let out = self.tabs[active].text.edit_with_widget(|buf| {
+                            egui::TextEdit::multiline(buf)
+                                .id(editor_id)
+                                .code_editor()
+                                .desired_width(dw)
+                                .desired_rows(30)
+                                .lock_focus(true)
+                                .interactive(!read_only)
+                                .layouter(&mut layouter)
+                                .show(ui)
+                        });
                         // ---- P2 multi-cursor — galley-resolved gestures + paint ----
                         // Hit-test the pointer to a char index against the laid-out
                         // galley (deterministic geometry) for the Ctrl/Cmd+click and
@@ -3367,21 +3378,6 @@ impl ScribeApp {
                                 pick(ui, "Insert date / time", B::InsertDateTime);
                             }
                         });
-                        // Wave-3: the egui in-place edit happened inside show();
-                        // `.changed()` is true exactly on the edited frame, so this
-                        // is the ONLY hook for the default editor's text mutation.
-                        //
-                        // It must therefore run the FULL invalidation, not just the
-                        // gen bump. `edit_gen` refreshes the gen-keyed minimap and
-                        // spell caches; it does NOT clear `rope_buf`. A bare bump
-                        // left the pre-switch rope alive, and because the rope path
-                        // rebuilds only when `rope_buf.is_none()`, re-enabling the
-                        // rope editor wrote that stale rope back over `text` and
-                        // silently destroyed the user's typing. Same writer duty as
-                        // `set_text` and the two in-place splicers.
-                        if out.response.changed() {
-                            self.tabs[active].note_text_mutated();
-                        }
                         // P1-3 scroll-past-end: pad blank space below the last
                         // line so it can rest at a comfortable height instead of
                         // being pinned to the viewport bottom (VS Code
@@ -4487,7 +4483,7 @@ mod editor_link_paste_wiring_tests {
         let mut app = app_with_vault(&v.path);
         app.open_path(v.path.join("Home.md"));
         let active = app.active;
-        app.tabs[active].text = wall_of("[[Target]]");
+        app.tabs[active].set_text(wall_of("[[Target]]"));
 
         let d = Driver::new();
         d.idle(&mut app);
@@ -4526,7 +4522,7 @@ mod editor_link_paste_wiring_tests {
         let mut app = app_with_vault(&v.path);
         app.open_path(v.path.join("Home.md"));
         let active = app.active;
-        app.tabs[active].text = wall_of("[[Target]]");
+        app.tabs[active].set_text(wall_of("[[Target]]"));
 
         let d = Driver::new();
         d.idle(&mut app);
@@ -4550,7 +4546,7 @@ mod editor_link_paste_wiring_tests {
         let mut app = app_with_vault(&v.path);
         app.open_path(v.path.join("Home.md"));
         let active = app.active;
-        app.tabs[active].text = wall_of("[[../escaped]]");
+        app.tabs[active].set_text(wall_of("[[../escaped]]"));
 
         let d = Driver::new();
         d.idle(&mut app);
@@ -4596,7 +4592,7 @@ mod editor_link_paste_wiring_tests {
         d.idle(&mut app); // deliver the queued insertion
         d.idle(&mut app); // …and let the editor settle it
 
-        let text = app.tabs[active].text.clone();
+        let text = app.tabs[active].text.to_string();
         assert!(
             text.contains("![pasted image](attachments/pasted-"),
             "Ctrl+V must insert the attachment markdown, got {text:?}"

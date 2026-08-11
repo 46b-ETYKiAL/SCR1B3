@@ -276,23 +276,29 @@ impl ScribeApp {
         let Some(item) = c.items.get(c.selected).cloned() else {
             return;
         };
-        let text = &mut self.tabs[active].text;
-        let byte = char_to_byte(text, ci);
-        // `c.prefix_start` is a byte offset captured a frame EARLIER; the buffer
-        // may have mutated since (e.g. an async edit between popup-open and
-        // accept), leaving it mid-multibyte-char. `replace_range` panics on a
-        // non-boundary offset → `panic = "abort"`. `char_to_byte` already clamps
-        // `byte` to a boundary; re-validate `prefix_start` the same way before
-        // splicing. On a stale offset we drop the completion rather than crash.
-        if c.prefix_start <= byte && byte <= text.len() && text.is_char_boundary(c.prefix_start) {
-            text.replace_range(c.prefix_start..byte, &item);
-        }
-        // The in-place splice above mutates `text` outside the `set_text` seam,
-        // so it owes the buffer the SAME invalidation — not just the `edit_gen`
-        // bump this used to do alone. A bare bump leaves `rope_buf` holding
-        // pre-completion content; if this ever runs on a rope-backed tab the
-        // next write-back restores it over the accepted completion.
-        self.tabs[active].note_text_mutated();
+        // Splices IN PLACE rather than replacing wholesale, so it cannot hand
+        // `set_text` an owned `String` without cloning the whole buffer. The
+        // seam takes a closure for exactly that: the raw `&mut String` lives
+        // only for its duration and the invalidation runs after, so this
+        // splicer cannot leave `rope_buf` holding pre-completion content for a
+        // later write-back to restore over the accepted completion.
+        //
+        // `_keep_undo` because accepting a completion is a user-issued in-buffer
+        // edit — the egui undoer is supposed to be able to revert it.
+        self.tabs[active].text.splice_in_place_keep_undo(|text| {
+            let byte = char_to_byte(text, ci);
+            // `c.prefix_start` is a byte offset captured a frame EARLIER; the
+            // buffer may have mutated since (e.g. an async edit between
+            // popup-open and accept), leaving it mid-multibyte-char.
+            // `replace_range` panics on a non-boundary offset → `panic =
+            // "abort"`. `char_to_byte` already clamps `byte` to a boundary;
+            // re-validate `prefix_start` the same way before splicing. On a
+            // stale offset we drop the completion rather than crash.
+            if c.prefix_start <= byte && byte <= text.len() && text.is_char_boundary(c.prefix_start)
+            {
+                text.replace_range(c.prefix_start..byte, &item);
+            }
+        });
     }
 
     /// 0-based lines of the active buffer carrying a change-bar state, as
@@ -500,7 +506,7 @@ impl ScribeApp {
                 let natural = {
                     use std::hash::{Hash, Hasher};
                     let mut h = std::collections::hash_map::DefaultHasher::new();
-                    self.tabs[self.active].edit_gen.hash(&mut h);
+                    self.tabs[self.active].text.edit_gen().hash(&mut h);
                     self.tabs[self.active].doc_id.raw().hash(&mut h);
                     avail.x.to_bits().hash(&mut h);
                     (word_wrap as u8).hash(&mut h);
@@ -513,7 +519,7 @@ impl ScribeApp {
                             // needs `&mut`; use fonts_mut(...) instead of fonts(...).
                             let g = ui.fonts_mut(|f| {
                                 f.layout(
-                                    self.tabs[self.active].text.clone(),
+                                    self.tabs[self.active].text.to_string(),
                                     FontId::monospace(MINIMAP_BASE_PT),
                                     map_fg,
                                     wrap_w,
@@ -543,7 +549,7 @@ impl ScribeApp {
                 } else {
                     use std::hash::{Hash, Hasher};
                     let mut h = std::collections::hash_map::DefaultHasher::new();
-                    self.tabs[self.active].edit_gen.hash(&mut h);
+                    self.tabs[self.active].text.edit_gen().hash(&mut h);
                     self.tabs[self.active].doc_id.raw().hash(&mut h);
                     avail.x.to_bits().hash(&mut h);
                     (word_wrap as u8).hash(&mut h);
@@ -553,7 +559,7 @@ impl ScribeApp {
                     match slot.as_ref() {
                         Some((k, g)) if *k == key => g.clone(),
                         _ => {
-                            let text = self.tabs[self.active].text.clone();
+                            let text = self.tabs[self.active].text.to_string();
                             let lay = |pt: f32, ui: &egui::Ui| {
                                 ui.fonts_mut(|f| {
                                     f.layout(text.clone(), FontId::monospace(pt), map_fg, wrap_w)
@@ -1300,11 +1306,11 @@ mod notes_sigil_completion_tests {
     /// Type `text` into tab 0, open completion at its end, accept the first
     /// suggestion, and return the resulting buffer.
     fn complete_at_end(app: &mut ScribeApp, text: &str) -> String {
-        app.tabs[0].text = text.to_string();
+        app.tabs[0].set_text(text.to_string());
         let ci = text.chars().count();
         app.open_completion(0, Some(ci));
         app.accept_completion(0, Some(ci));
-        app.tabs[0].text.clone()
+        app.tabs[0].text.to_string()
     }
 
     #[test]
@@ -1383,7 +1389,7 @@ mod notes_sigil_completion_tests {
         let v = vault();
         std::fs::write(v.path.join("Roadmap.md"), "# Roadmap\n").unwrap();
         let mut app = app_with_vault(&v.path);
-        app.tabs[0].text = "see [[zzzz".to_string();
+        app.tabs[0].set_text("see [[zzzz".to_string());
         app.open_completion(0, Some(10));
         assert!(
             app.completion.is_none(),

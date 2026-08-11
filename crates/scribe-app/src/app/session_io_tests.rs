@@ -136,13 +136,14 @@ fn a_save_hook_that_changes_nothing_does_not_touch_the_buffer() {
     );
     let active = app.active;
     app.tabs[active].set_text("hello".into());
-    let gen_before = app.tabs[active].edit_gen;
+    let gen_before = app.tabs[active].text.edit_gen();
 
     app.save_active();
 
     assert_eq!(app.tabs[active].text, "hello", "text is unchanged");
     assert_eq!(
-        app.tabs[active].edit_gen, gen_before,
+        app.tabs[active].text.edit_gen(),
+        gen_before,
         "a hook that changes nothing must not re-set the buffer"
     );
 }

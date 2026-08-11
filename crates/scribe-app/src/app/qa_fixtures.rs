@@ -441,7 +441,7 @@ fn synth_tab(name: &str, ext: &str, body: &str, dirty: bool) -> EditorTab {
     // The path is never touched on disk; it only labels the tab.
     tab.doc.set_text(body);
     tab.doc.mark_clean();
-    tab.text = body.to_string();
+    tab.set_text(body.to_string());
     tab.disk_text = body.to_string();
     tab.session_baseline = body.to_string();
     tab.saved_baseline = body.to_string();
@@ -449,7 +449,7 @@ fn synth_tab(name: &str, ext: &str, body: &str, dirty: bool) -> EditorTab {
     if dirty {
         // Diverge the editable mirror from the saved rope → `is_dirty()` true.
         let edited = format!("{body}\n// edited (unsaved) by QA fixture\n");
-        tab.text = edited;
+        tab.set_text(edited);
     }
     tab
 }

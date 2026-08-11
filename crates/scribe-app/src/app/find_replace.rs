@@ -97,7 +97,11 @@ impl ScribeApp {
         // cannot resurrect a buffer that no longer exists) and bumps
         // `edit_gen`, which is what invalidates the gen-keyed minimap /
         // spellcheck / change-bar caches — so no separate bump is needed here.
-        self.tabs[self.active].set_text(replaced);
+        // `set_text_keep_undo`, not `set_text`: a replace-all is a user-issued
+        // in-buffer command derived from the CURRENT buffer, so the egui
+        // undoer's snapshot is a state the user genuinely had — Ctrl+Z after
+        // a bad replace-all is the feature, not the data loss.
+        self.tabs[self.active].set_text_keep_undo(replaced);
         self.status = if all {
             format!("replaced {} x '{pat}' -> '{rep}'", matches.len())
         } else {

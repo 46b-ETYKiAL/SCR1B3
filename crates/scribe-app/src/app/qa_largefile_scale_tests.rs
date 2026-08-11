@@ -535,7 +535,7 @@ fn s8_real_open_path_multiline_is_editable_rope_at_scale() {
     //     flagged so.)
     assert!(!app.tabs[active].doc.is_dirty(), "freshly opened => clean");
     let before = app.tabs[active].doc.len_bytes();
-    let mut edited = app.tabs[active].text.clone();
+    let mut edited = app.tabs[active].text.to_string();
     edited.insert_str(0, "// QA edit: prove the at-scale rope is editable\n");
     app.tabs[active].doc.set_text(&edited);
     assert!(
@@ -666,7 +666,7 @@ fn s10_document_256mib_threshold_is_read_only_below_is_editable() {
         "a file JUST below LARGE_FILE_THRESHOLD must open as an editable rope"
     );
     // Editable: an edit applies and marks dirty.
-    let mut edited = app.tabs[below_active].text.clone();
+    let mut edited = app.tabs[below_active].text.to_string();
     edited.push_str("\n// editable just below 256 MiB\n");
     app.tabs[below_active].doc.set_text(&edited);
     assert!(
@@ -725,7 +725,7 @@ fn s11_real_open_path_scroll_to_eof_no_oob_no_panic() {
     let eof_char = rope.len_chars();
     let mut st = scribe_render::RopeEditorState::new();
     st.edit = scribe_core::editing::EditState::at(eof_char);
-    app.tabs[active].rope_state = Some(st);
+    app.tabs[active].text.set_rope_state(Some(st));
     run_frames(&mut app, 1);
 
     // Still intact after EOF navigation: same line count, last line reachable.
@@ -772,7 +772,7 @@ fn s12_real_open_path_eof_render_many_frames_heavy() {
     run_frames(&mut app, 4);
     let mut st = scribe_render::RopeEditorState::new();
     st.edit = scribe_core::editing::EditState::at(eof_char);
-    app.tabs[active].rope_state = Some(st);
+    app.tabs[active].text.set_rope_state(Some(st));
     run_frames(&mut app, 4);
 
     let rope_after = app.tabs[active].doc.rope();

@@ -254,7 +254,13 @@ fn path_to_uri(p: &Path) -> String {
 /// One open document + its editable text mirror.
 struct EditorTab {
     doc: Document,
-    text: String,
+    /// The editable text mirror AND every cache derived from it, sealed behind
+    /// a private `String` in [`tab_text`]. The seal is the point: the write
+    /// funnel used to be enforced by a source-text scan, and is now enforced by
+    /// the compiler — nothing outside `tab_text` can name the `String`, so
+    /// nothing outside it can write the buffer while leaving a derived cache
+    /// stale. See that module's docs for the two-seam undo polarity.
+    text: TabText,
     /// Phase 18 T18.2 — stable id used by the multi-note grid so a pane
     /// always points at the same logical doc even after the tabs vector
     /// is reordered or other tabs close. Allocated via
@@ -275,35 +281,11 @@ struct EditorTab {
     /// The exact text last read from / written to disk. When the buffer
     /// still matches this, an external change can be silently re-read.
     disk_text: String,
-    /// KEYSTONE — per-tab editing state (caret/selection + undo history) for
-    /// the experimental owned rope editor. Lazily created on first use when
-    /// `config.editor.experimental_rope_editor` is on; `None` while the egui
-    /// TextEdit path owns this tab.
-    rope_state: Option<scribe_render::RopeEditorState>,
-    /// KEYSTONE perf — the persistent rope buffer for the experimental owned
-    /// editor. Built once from `text` (O(n)) on first use, then mutated in
-    /// place each frame; `text` is re-synced from it ONLY when an edit
-    /// actually changes content (see `RopeEditorResponse::content_changed`).
-    /// This removes the per-frame `Buffer::from_text` + `rope.to_string()`
-    /// round-trip that made the experimental path O(n)/frame. Set to `None`
-    /// to invalidate after any external mutation of `text` (reload, plugin,
-    /// find-replace, sort-lines) so the next frame rebuilds it.
-    rope_buf: Option<scribe_core::buffer::Buffer>,
     /// Per-tab line bookmarks (0-based line indices). Toggled with Ctrl+F2 on
     /// the cursor line; F2 / Shift+F2 jump to the next / previous bookmark.
     /// A dot marker is drawn in the line-number gutter for each bookmarked
     /// line. Session-scoped (not persisted to disk).
     bookmarks: std::collections::BTreeSet<usize>,
-    /// Wave-3 perf: monotonic per-tab edit generation. Bumped on EVERY
-    /// mutation of `text` (the `set_text` funnel, the direct in-place editing
-    /// commands, the egui `TextEdit` `.changed()` frame, and the experimental
-    /// rope write-back). The minimap + spellcheck caches key off this `u64`
-    /// instead of re-hashing the whole buffer every frame — a 1-frame-stale
-    /// minimap/squiggle is visually harmless, so a post-edit counter is safe
-    /// for those two surfaces. (The syntax layouter deliberately keeps its
-    /// content hash — its cached galley bakes in the text, so a lagging
-    /// counter would render stale TEXT. See wave3-perf-plan.md.)
-    edit_gen: u64,
     /// F-022b — set by `poll_external_disk_changes` when this file changed on
     /// disk WHILE the tab has unsaved local edits. Drives a persistent,
     /// actionable banner ([Reload (discard mine)] / [Keep mine]) so the user is
@@ -365,15 +347,12 @@ impl EditorTab {
     fn scratch() -> Self {
         Self {
             doc: Document::scratch(),
-            text: String::new(),
+            text: TabText::opened(String::new()),
             doc_id: crate::grid::DocId(0),
             pinned: false,
             disk_mtime: None,
             disk_text: String::new(),
-            rope_state: None,
-            rope_buf: None,
             bookmarks: std::collections::BTreeSet::new(),
-            edit_gen: 0,
             external_change: false,
             session_baseline: String::new(),
             saved_baseline: String::new(),
@@ -388,15 +367,12 @@ impl EditorTab {
         let disk_mtime = doc.path().and_then(file_mtime);
         Ok(Self {
             doc,
-            text: text.clone(),
+            text: TabText::opened(text.clone()),
             doc_id: crate::grid::DocId(0),
             pinned: false,
             disk_mtime,
             disk_text: text.clone(),
-            rope_state: None,
-            rope_buf: None,
             bookmarks: std::collections::BTreeSet::new(),
-            edit_gen: 0,
             external_change: false,
             // Just opened: both baselines are the on-disk content, so no line
             // is marked until the user edits.
@@ -419,7 +395,7 @@ impl EditorTab {
                 let disk_mtime = doc.path().and_then(file_mtime);
                 return Self {
                     doc,
-                    text: content,
+                    text: TabText::opened(content),
                     doc_id: crate::grid::DocId(0),
                     pinned: false,
                     disk_mtime,
@@ -428,10 +404,7 @@ impl EditorTab {
                     session_baseline: disk_text.clone(),
                     saved_baseline: disk_text.clone(),
                     disk_text,
-                    rope_state: None,
-                    rope_buf: None,
                     bookmarks: std::collections::BTreeSet::new(),
-                    edit_gen: 0,
                     external_change: false,
                     change_states: Vec::new(),
                     change_gen: None,
@@ -441,7 +414,10 @@ impl EditorTab {
         // Untitled, or the original file is gone: restore as a scratch buffer
         // carrying the unsaved content (dirty vs an empty saved doc).
         let mut tab = Self::scratch();
-        tab.text = content;
+        // Through the seam, not a whole-field replacement: a restored backup is
+        // content from OUTSIDE the buffer, which is exactly what `set_text` is
+        // the safe default for.
+        tab.set_text(content);
         tab
     }
 
@@ -464,92 +440,42 @@ impl EditorTab {
     }
 
     /// Replace the editable text from an EXTERNAL source (reload, plugin,
-    /// find-replace, sort-lines, the line/comment commands) and invalidate
-    /// EVERY cache derived from the old content: the persistent rope buffer
-    /// (`rope_buf`, rebuilt next frame) and the rope editor's editing state
-    /// (`rope_state` — undo history + carets, see `invalidate_rope_state`).
-    /// `edit_gen` is bumped, which is what invalidates the gen-keyed
-    /// minimap / spellcheck / change-bar (`change_gen`) caches.
+    /// find-replace, sort-lines, the line/comment commands).
     ///
-    /// EVERY external mutation of `text` MUST go through here. Writing
-    /// `tabs[i].text` directly leaves a stale `rope_buf` alive, and on the
-    /// rope path (`use_rope_editor`) the next content edit writes that stale
-    /// rope back over `text` — silently destroying the user's edit.
+    /// The SAFE DEFAULT of the two replacement seams — it additionally flags
+    /// the egui `TextEdit` undo history stale, so a Ctrl+Z after the
+    /// replacement cannot restore the PREVIOUS document over content that came
+    /// from outside the buffer. Use it for anything you have not classified; a
+    /// user-issued in-buffer command that SHOULD stay revertible calls
+    /// [`EditorTab::set_text_keep_undo`] instead.
     ///
-    /// The rope editor itself writes `text` directly (it owns the rope) and
-    /// must NOT go through here, or it would discard its own live buffer.
+    /// A convenience delegator: the invalidation, the polarity, and the seal
+    /// that makes them unskippable all live on [`TabText`]. It is kept because
+    /// `tab.set_text(..)` is what a hundred call sites already say, not because
+    /// it adds behaviour.
     fn set_text(&mut self, new: String) {
-        self.text = new;
-        self.note_text_mutated();
+        self.text.set_text(new);
     }
 
-    /// The same invalidation `set_text` performs, for the few callers that
-    /// must splice `text` IN PLACE rather than replace it wholesale
-    /// (`accept_completion`'s `replace_range`, the multi-cursor replay's
-    /// `apply_edit` loop). Those callers cannot hand `set_text` an owned
-    /// `String` without cloning the whole buffer, but they owe the buffer the
-    /// identical invalidation — a bare `edit_gen` bump refreshes the gen-keyed
-    /// caches while leaving a stale `rope_buf`/`rope_state` alive, which is the
-    /// write-back data loss `set_text` exists to prevent.
-    ///
-    /// Keeping ONE implementation (`set_text` delegates here) is the point:
-    /// two hand-maintained invalidation lists drift, and the drift is silent.
-    fn note_text_mutated(&mut self) {
-        self.rope_buf = None;
-        self.invalidate_rope_state();
-        self.edit_gen = self.edit_gen.wrapping_add(1);
-    }
-
-    /// Invalidate the rope editor's per-tab editing state after `text` was
-    /// replaced from an EXTERNAL source.
-    ///
-    /// `rope_state` is derived from the buffer: its `History` holds snapshots
-    /// of the PREVIOUS content and its caret/selection are offsets into it.
-    /// Clearing `rope_buf` alone (so the rope is rebuilt from the new `text`)
-    /// left that state behind, so the first Undo after a command-palette or
-    /// find-replace edit restored a buffer the user never had — silent data
-    /// loss — and a caret past the new end pointed out of range.
-    ///
-    /// The history is dropped (those snapshots describe content that no longer
-    /// exists, so a no-op Undo is the only honest outcome) along with any
-    /// secondary carets, whose offsets a wholesale replacement invalidates.
-    /// The primary caret is kept, clamped into the new text, so an in-place
-    /// command (comment-toggle, move/duplicate/join line) does not throw the
-    /// user back to the top of the file.
-    ///
-    /// A tab whose `rope_state` is still `None` is left alone — the rope
-    /// editor has not claimed it yet, and the next frame creates the state
-    /// fresh from the new content.
-    fn invalidate_rope_state(&mut self) {
-        let Some(prev) = self.rope_state.as_ref() else {
-            return;
-        };
-        let cursor = prev.edit.cursor;
-        // `chars().count()` is O(n); skip it for the common caret-at-origin
-        // case so a large-buffer replacement pays nothing extra.
-        let clamped = if cursor == 0 {
-            0
-        } else {
-            cursor.min(self.text.chars().count())
-        };
-        let mut fresh = scribe_render::RopeEditorState::new();
-        fresh.edit = scribe_core::editing::EditState::at(clamped);
-        self.rope_state = Some(fresh);
+    /// [`EditorTab::set_text`] MINUS the egui-undo invalidation — see
+    /// [`TabText::set_text_keep_undo`] for the precondition this seam carries.
+    fn set_text_keep_undo(&mut self, new: String) {
+        self.text.set_text_keep_undo(new);
     }
 
     /// Change-bar: record the current text as the saved baseline (called after
     /// a successful save). The session baseline stays frozen, so a line edited
     /// then saved transitions from "unsaved" to "saved" rather than to "none".
     fn mark_change_saved(&mut self) {
-        self.saved_baseline = self.text.clone();
+        self.saved_baseline = self.text.to_string();
         self.change_gen = None; // force recompute (edit_gen is unchanged by a save)
     }
 
     /// Change-bar: reset BOTH baselines to the current text (called after a
     /// reload from disk, where the new content becomes the clean reference).
     fn reset_change_baselines(&mut self) {
-        self.session_baseline = self.text.clone();
-        self.saved_baseline = self.text.clone();
+        self.session_baseline = self.text.to_string();
+        self.saved_baseline = self.text.to_string();
         self.change_gen = None;
     }
 
@@ -1555,7 +1481,7 @@ impl ScribeApp {
         // it has never been saved. Each case now gets the message written for it.
         let (lang, path, text) = match self.tabs.get(active) {
             Some(t) => match (t.doc.path(), t.doc.language_hint()) {
-                (Some(path), Some(lang)) => (lang, path.to_path_buf(), t.text.clone()),
+                (Some(path), Some(lang)) => (lang, path.to_path_buf(), t.text.to_string()),
                 (None, _) => {
                     self.toast =
                         Some("Save the file first, then start the language server.".into());
@@ -1666,7 +1592,7 @@ impl ScribeApp {
                         let clamped = cur.min(self.tabs[idx].text.chars().count());
                         let mut st = scribe_render::RopeEditorState::new();
                         st.edit = scribe_core::editing::EditState::at(clamped);
-                        self.tabs[idx].rope_state = Some(st);
+                        self.tabs[idx].text.set_rope_state(Some(st));
                     }
                 }
                 // F-012 — record on the MRU recent-files list + persist.
@@ -1709,7 +1635,7 @@ impl ScribeApp {
     /// transform and surfacing notifications.
     fn run_plugin_command(&mut self, command_id: &str) {
         let active = self.active.min(self.tabs.len().saturating_sub(1));
-        let mut pctx = PluginContext::new(self.tabs[active].text.clone());
+        let mut pctx = PluginContext::new(self.tabs[active].text.to_string());
         match self.plugins.run_command(command_id, &mut pctx) {
             Ok(()) => {
                 self.tabs[active].set_text(pctx.text);
@@ -2383,6 +2309,10 @@ pub(crate) use render_support::{
     load_theme, make_layouter, matching_bracket_char_indices, newline_with_indent, paint_squiggle,
     panel_fill, pick_bookmark, spawn_config_watcher, use_rope_editor,
 };
+/// The tab's editable text, sealed behind a private `String` so the write
+/// funnel is enforced by the compiler rather than by a source-text scan.
+mod tab_text;
+use tab_text::TabText;
 mod session_io;
 // The Settings → Keyboard page. It lives under `app/` (not beside `settings.rs`)
 // because it reads `keymap`'s token <-> key table and action consts, which are
@@ -2489,6 +2419,9 @@ mod build_plugins_tests;
 
 #[cfg(test)]
 mod deferred_actions_tests;
+
+#[cfg(test)]
+mod textedit_undo_invalidation_tests;
 
 #[cfg(test)]
 mod keyboard_input_tests;

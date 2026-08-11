@@ -186,7 +186,7 @@ impl ScribeApp {
         // always applied to what the user sees, then switch on fold-view
         // so the change is visible in the central panel.
         if act.fold_all && self.active < self.tabs.len() {
-            let text = self.tabs[self.active].text.clone();
+            let text = self.tabs[self.active].text.to_string();
             // P2-4: markdown/text notes fold by heading section, code by braces.
             // This handler predates `fold_regions_for` and was moved here
             // verbatim, so it kept calling the brace-only `fold_regions` — which

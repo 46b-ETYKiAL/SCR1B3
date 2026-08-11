@@ -118,7 +118,7 @@ mod tests {
         // due(true) && has_unsaved(true) && content_sig!=0 -> fires. Kills the
         // due `elapsed >= INTERVAL -> <` (41:38).
         let mut t = EditorTab::scratch();
-        t.text = "unsaved".into();
+        t.set_text("unsaved".into());
         t.doc_id = crate::grid::DocId(1);
         let mut app = due_backup_app(t);
         app.persist_session_and_autosave();
@@ -179,14 +179,14 @@ mod tests {
         let p = dir.path().join("edited.txt");
         std::fs::write(&p, "on disk").unwrap();
         let mut t = EditorTab::from_path(p).expect("open");
-        t.text = "edit one".into();
+        t.set_text("edit one".into());
         t.doc_id = crate::grid::DocId(1);
         let mut app = due_backup_app(t);
         app.persist_session_and_autosave();
         let sig1 = app.last_backup_sig;
         assert_ne!(sig1, 0, "first edit backed up");
         // A second, different edit + a re-due clock: the content sig must change.
-        app.tabs[0].text = "edit two is different".into();
+        app.tabs[0].set_text("edit two is different".into());
         app.last_backup_at = Some(Instant::now().checked_sub(Duration::from_secs(5)).unwrap());
         app.persist_session_and_autosave();
         assert_ne!(
@@ -208,7 +208,7 @@ mod tests {
         let mut app = ScribeApp::new_test(cfg);
         app.tabs.clear();
         let mut t = EditorTab::from_path(p.clone()).expect("open");
-        t.text = "new autosaved content".into();
+        t.set_text("new autosaved content".into());
         t.doc_id = crate::grid::DocId(1);
         app.tabs.push(t);
         app.active = 0;
@@ -272,7 +272,7 @@ mod tests {
         let p = dir.path().join("edited.txt");
         std::fs::write(&p, "on disk").unwrap();
         let mut t = EditorTab::from_path(p).expect("open");
-        t.text = "edited in memory".into();
+        t.set_text("edited in memory".into());
         t.doc_id = crate::grid::DocId(1);
         let mut app = due_backup_app(t);
         assert!(

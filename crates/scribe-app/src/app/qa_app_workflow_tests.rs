@@ -277,7 +277,7 @@ fn editing_multicaret_overlapping_selection_dedupes_no_double_insert() {
 fn editing_at_eof_without_trailing_newline_keeps_no_trailing_nl() {
     // Host-level duplicate on a newline-less last line.
     let mut app = app_ready();
-    app.tabs[0].text = "alpha\nbeta".into(); // no trailing newline
+    app.tabs[0].set_text("alpha\nbeta".into()); // no trailing newline
     app.last_cursor_line_col = Some((2, 1)); // cursor on "beta"
     app.duplicate_cursor_line();
     assert_eq!(
@@ -315,7 +315,7 @@ fn editing_at_eof_without_trailing_newline_keeps_no_trailing_nl() {
 #[test]
 fn editing_typed_input_then_duplicate_via_harness() {
     let mut app = app_ready();
-    app.tabs[0].text.clear();
+    app.tabs[0].set_text(String::new());
     let mut h = harness(app);
     h.run();
     let editor = h.get_by_role(egui::accesskit::Role::MultilineTextInput);
@@ -527,7 +527,7 @@ fn settings_legacy_config_migrates_forward_and_persists() {
 fn goto_symbol_filter_then_click_jumps_to_symbol() {
     let mut app = app_ready();
     // Two symbols on known lines: alpha @ line 1, beta @ line 3.
-    app.tabs[0].text = "fn alpha() {\n}\nfn beta() {\n}\n".into();
+    app.tabs[0].set_text("fn alpha() {\n}\nfn beta() {\n}\n".into());
     app.execute_builtin(BuiltinCommand::GoToSymbol);
     let mut h = harness(app);
     h.run();
@@ -576,7 +576,7 @@ fn goto_symbol_filter_then_click_jumps_to_symbol() {
 #[test]
 fn goto_symbol_filter_then_enter_jumps_to_first_match() {
     let mut app = app_ready();
-    app.tabs[0].text = "fn alpha() {\n}\nfn beta() {\n}\nfn gamma() {\n}\n".into();
+    app.tabs[0].set_text("fn alpha() {\n}\nfn beta() {\n}\nfn gamma() {\n}\n".into());
     app.execute_builtin(BuiltinCommand::GoToSymbol);
     let mut h = harness(app);
     h.run();
@@ -614,7 +614,7 @@ fn goto_symbol_filter_then_enter_jumps_to_first_match() {
 #[test]
 fn command_palette_filter_then_click_executes_command() {
     let mut app = app_ready();
-    app.tabs[0].text = "gamma\nalpha\nbeta\n".into();
+    app.tabs[0].set_text("gamma\nalpha\nbeta\n".into());
     let mut h = harness(app);
     h.run();
     h.get_by_label(">_").click();
@@ -651,7 +651,7 @@ fn command_palette_filter_then_click_executes_command() {
 #[test]
 fn bug_app_01_command_palette_enter_does_not_execute() {
     let mut app = app_ready();
-    app.tabs[0].text = "gamma\nalpha\nbeta\n".into();
+    app.tabs[0].set_text("gamma\nalpha\nbeta\n".into());
     let mut h = harness(app);
     h.run();
     h.get_by_label(">_").click();
@@ -741,7 +741,7 @@ fn diff_view_content_is_correct_vs_edited_buffer() {
     app.open_path(f.clone());
     let idx = app.active;
     // Edit: keep line 1, change line 2, drop line 3, add a new line.
-    app.tabs[idx].text = "line one\nLINE TWO EDITED\nline four added\n".into();
+    app.tabs[idx].set_text("line one\nLINE TWO EDITED\nline four added\n".into());
     app.execute_builtin(BuiltinCommand::ToggleDiffView);
     let mut h = harness(app);
     h.run();
@@ -751,7 +751,7 @@ fn diff_view_content_is_correct_vs_edited_buffer() {
     // The overlay computes diff_lines(disk, current) — replicate it exactly.
     let disk = std::fs::read_to_string(&f).unwrap();
     let a = h.state().active;
-    let cur = h.state().tabs[a].text.clone();
+    let cur = h.state().tabs[a].text.to_string();
     let rows = crate::diff_view::diff_lines(&disk, &cur);
     let (ins, del) = crate::diff_view::summary(&rows);
 
@@ -819,7 +819,7 @@ fn markdown_preview_renders_the_md_content() {
     // The pane renders crate::md_preview::show(.., &buffer_text, ..); the HTML
     // conversion of the same text must reflect the heading + emphasis.
     let a = h.state().active;
-    let md_text = h.state().tabs[a].text.clone();
+    let md_text = h.state().tabs[a].text.to_string();
     let html = crate::md_preview::to_html(&md_text);
     assert!(
         html.contains("Heading One"),

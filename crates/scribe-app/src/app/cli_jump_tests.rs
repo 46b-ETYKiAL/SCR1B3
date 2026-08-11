@@ -11,7 +11,7 @@ use super::*;
 #[test]
 fn apply_cli_jump_scrolls_first_tab_to_the_requested_line() {
     let mut app = ScribeApp::new_test(Config::default());
-    app.tabs[0].text = "l1\nl2\nl3\nl4\nl5\nl6\n".into();
+    app.tabs[0].set_text("l1\nl2\nl3\nl4\nl5\nl6\n".into());
     let size = app.config.fonts.clamped_editor_size();
     let lh = app.config.fonts.clamped_line_height();
     // line 4 (1-based) -> line0 = 3 -> pending = 3 * (size*lh).
@@ -35,7 +35,7 @@ fn apply_cli_jump_line_only_scrolls_without_a_column_suffix() {
     // A `file:42` jump (no column) still scrolls to the line; the status carries
     // the line-only "go to line N" message from `goto_line`.
     let mut app = ScribeApp::new_test(Config::default());
-    app.tabs[0].text = "a\nb\nc\nd\ne\n".into();
+    app.tabs[0].set_text("a\nb\nc\nd\ne\n".into());
     let size = app.config.fonts.clamped_editor_size();
     let lh = app.config.fonts.clamped_line_height();
     let expected = 2.0_f32 * (size * lh); // line 3 -> line0 = 2
@@ -55,7 +55,7 @@ fn apply_cli_jump_none_is_a_noop() {
     // `pending_scroll` untouched — this is the negative that goes red if the
     // change is reverted at the discard site.
     let mut app = ScribeApp::new_test(Config::default());
-    app.tabs[0].text = "a\nb\nc\n".into();
+    app.tabs[0].set_text("a\nb\nc\n".into());
     app.pending_scroll = None;
     app.apply_cli_jump(None);
     assert_eq!(app.pending_scroll, None, "no jump target -> no scroll");
@@ -65,7 +65,7 @@ fn apply_cli_jump_none_is_a_noop() {
 fn apply_cli_jump_line_zero_is_ignored() {
     // `file:0` is not a real 1-based position; it must not scroll.
     let mut app = ScribeApp::new_test(Config::default());
-    app.tabs[0].text = "a\nb\n".into();
+    app.tabs[0].set_text("a\nb\n".into());
     app.pending_scroll = None;
     app.apply_cli_jump(Some((0, None)));
     assert_eq!(

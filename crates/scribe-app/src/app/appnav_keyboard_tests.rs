@@ -54,7 +54,7 @@ fn pa01_goto_symbol_arrow_down_then_enter_jumps_to_second_symbol() {
     let mut app = app_ready();
     // Three top-level symbols on known 0-based lines: alpha@0, beta@2, gamma@4.
     // (1-based jump lines: alpha=1, beta=3, gamma=5.)
-    app.tabs[0].text = "fn alpha() {\n}\nfn beta() {\n}\nfn gamma() {\n}\n".into();
+    app.tabs[0].set_text("fn alpha() {\n}\nfn beta() {\n}\nfn gamma() {\n}\n".into());
     app.execute_builtin(BuiltinCommand::GoToSymbol);
     let mut h = harness(app);
     h.run();
@@ -100,7 +100,7 @@ fn pa01_goto_symbol_arrow_down_then_enter_jumps_to_second_symbol() {
 #[test]
 fn pa01_goto_symbol_new_filter_resets_selection_to_top() {
     let mut app = app_ready();
-    app.tabs[0].text = "fn alpha() {\n}\nfn beta() {\n}\nfn gamma() {\n}\n".into();
+    app.tabs[0].set_text("fn alpha() {\n}\nfn beta() {\n}\nfn gamma() {\n}\n".into());
     app.execute_builtin(BuiltinCommand::GoToSymbol);
     let mut h = harness(app);
     h.run();
@@ -429,7 +429,7 @@ fn pa06_top_tab_strip_keeps_all_tabs_addressable_at_scale() {
         let body = format!("// tab {i}\nlet v_{i} = {i};\n");
         tab.doc.set_text(&body);
         tab.doc.mark_clean();
-        tab.text = body.clone();
+        tab.set_text(body.clone());
         tab.disk_text = body.clone();
         tab.session_baseline = body.clone();
         tab.saved_baseline = body;

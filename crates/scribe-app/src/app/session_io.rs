@@ -10,7 +10,7 @@ impl ScribeApp {
         }
         // Save-time hygiene (opt-in): trim trailing whitespace + ensure a
         // final newline. Cleaned text is reflected back into the live buffer.
-        let mut text = self.tabs[active].text.clone();
+        let mut text = self.tabs[active].text.to_string();
         if self.config.editor.trim_trailing_whitespace_on_save {
             text = scribe_core::text_ops::trim_trailing_whitespace(&text);
         }
@@ -49,7 +49,7 @@ impl ScribeApp {
                 }
                 // F-022 — refresh the disk fingerprint after a successful
                 // save so the next poll doesn't false-positive.
-                self.tabs[active].disk_text = self.tabs[active].text.clone();
+                self.tabs[active].disk_text = self.tabs[active].text.to_string();
                 if let Some(p) = self.tabs[active].doc.path() {
                     if let Some(m) = file_mtime(p) {
                         self.tabs[active].disk_mtime = Some(m);
@@ -91,7 +91,7 @@ impl ScribeApp {
             let path = tab.doc.path().map(|p| p.display().to_string());
             let dirty = tab.is_dirty();
             let untitled_with_content = path.is_none() && !tab.text.is_empty();
-            let cursor = tab.rope_state.as_ref().map(|s| s.edit.cursor).unwrap_or(0);
+            let cursor = tab.text.rope_state().map(|s| s.edit.cursor).unwrap_or(0);
             let backup = if dirty || untitled_with_content {
                 let name = session::backup_name(path.as_deref(), i);
                 match session::write_backup(&bdir, &name, &tab.text) {
@@ -336,7 +336,7 @@ impl ScribeApp {
 
     /// Fire plugin `on_save` hooks; apply any text transform they make.
     fn fire_save_hooks(&mut self, active: usize) {
-        let mut pctx = PluginContext::new(self.tabs[active].text.clone());
+        let mut pctx = PluginContext::new(self.tabs[active].text.to_string());
         if self.plugins.fire_event(HookEvent::Save, &mut pctx).is_ok() {
             if pctx.text != self.tabs[active].text {
                 self.tabs[active].set_text(pctx.text);
@@ -399,7 +399,7 @@ impl ScribeApp {
         // default (so `notes` → `notes.md`); a name that already carries an
         // explicit extension is respected exactly as given.
         let path = scribe_core::config::ensure_extension(path, fmt.extension());
-        let text = self.tabs[active].text.clone();
+        let text = self.tabs[active].text.to_string();
         self.tabs[active].doc.set_text(&text);
         match self.tabs[active].doc.save_as(&path) {
             Ok(lossy) => {

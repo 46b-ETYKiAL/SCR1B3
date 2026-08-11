@@ -94,8 +94,8 @@ impl ScribeApp {
                 // Remember the caret too (best-effort; restored on reopen).
                 if self.config.editor.restore_cursor_position {
                     let cur = self.tabs[idx]
-                        .rope_state
-                        .as_ref()
+                        .text
+                        .rope_state()
                         .map(|s| s.edit.cursor)
                         .unwrap_or(0);
                     if self.config.editor.cursor_positions.len()
@@ -114,11 +114,11 @@ impl ScribeApp {
             // capturing its content + caret so an accidental close is one
             // keystroke from recovery. Skip pristine empty scratch tabs.
             let tab = &self.tabs[idx];
-            let cursor = tab.rope_state.as_ref().map(|s| s.edit.cursor).unwrap_or(0);
+            let cursor = tab.text.rope_state().map(|s| s.edit.cursor).unwrap_or(0);
             if tab.doc.path().is_some() || !tab.text.is_empty() {
                 self.closed_tabs.push(ClosedTab {
                     path: tab.doc.path().map(|p| p.to_path_buf()),
-                    text: tab.text.clone(),
+                    text: tab.text.to_string(),
                     cursor,
                 });
                 const MAX_CLOSED: usize = 20;
@@ -145,7 +145,7 @@ impl ScribeApp {
         if self.config.editor.experimental_rope_editor {
             let mut st = scribe_render::RopeEditorState::new();
             st.edit = scribe_core::editing::EditState::at(closed.cursor);
-            tab.rope_state = Some(st);
+            tab.text.set_rope_state(Some(st));
         }
         self.tabs.push(tab);
         self.active = self.tabs.len() - 1;

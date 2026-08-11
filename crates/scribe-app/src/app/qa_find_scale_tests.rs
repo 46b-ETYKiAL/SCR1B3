@@ -322,9 +322,9 @@ fn scenario4_zero_width_and_empty_queries_are_safe_no_spurious_replace() {
     //    is a clean no-op that leaves the text byte-identical (no `^`-anchored
     //    splice spray). --
     let active = app.active;
-    let original = app.tabs[active].text.clone();
+    let original = app.tabs[active].text.to_string();
     let original_len = original.len();
-    let gen_before = app.tabs[active].edit_gen;
+    let gen_before = app.tabs[active].text.edit_gen();
     for zero_width in ["^", "$", r"\b", "x*"] {
         app.find_query = zero_width.to_string();
         app.replace_query = "INJECTED".to_string();
@@ -347,7 +347,8 @@ fn scenario4_zero_width_and_empty_queries_are_safe_no_spurious_replace() {
     );
     // No real edit happened → edit_gen must not have advanced for these no-ops.
     assert_eq!(
-        app.tabs[active].edit_gen, gen_before,
+        app.tabs[active].text.edit_gen(),
+        gen_before,
         "a no-match Replace All must not bump edit_gen (no real edit occurred)"
     );
 
@@ -480,7 +481,7 @@ fn scenario6_replace_all_at_scale_count_text_and_cache_invalidation() {
         !app.tabs[active].text.contains("XQXQX"),
         "the replacement token must be absent before replace"
     );
-    let gen_before = app.tabs[active].edit_gen;
+    let gen_before = app.tabs[active].text.edit_gen();
     app.replace_query = "XQXQX".to_string();
     app.replace_in_active(true);
 
@@ -512,7 +513,8 @@ fn scenario6_replace_all_at_scale_count_text_and_cache_invalidation() {
     // edit_gen advanced → the cache is invalidated. Searching the OLD query now
     // returns zero AND forces a recompute (cache MISS on the new edit_gen).
     assert_ne!(
-        app.tabs[active].edit_gen, gen_before,
+        app.tabs[active].text.edit_gen(),
+        gen_before,
         "Replace All must bump edit_gen so gen-keyed caches invalidate"
     );
     let before_miss = app.find_recompute_count.get();
@@ -558,8 +560,8 @@ fn scenario7_default_toggles_off_is_case_insensitive_substring() {
     let active = app.active;
 
     // Controlled content: `alpha`, `ALPHA`, `Alpha`, and the substring `alphabet`.
-    app.tabs[active].text = "alpha ALPHA Alpha alphabet betaalpha\n".to_string();
-    app.tabs[active].edit_gen = app.tabs[active].edit_gen.wrapping_add(1);
+    app.tabs[active].set_text("alpha ALPHA Alpha alphabet betaalpha\n".to_string());
+    app.tabs[active].text.bump_edit_gen();
 
     app.find_query = "alpha".to_string();
     // Guard the premise: this scenario measures the DEFAULT, so every toggle

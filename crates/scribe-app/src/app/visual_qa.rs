@@ -104,7 +104,7 @@ fn scene_default() {
     let mut app = ScribeApp::new_test(qa_config());
     app.tabs.clear();
     let mut t = EditorTab::scratch();
-    t.text = SAMPLE.to_string();
+    t.set_text(SAMPLE.to_string());
     t.session_baseline = SAMPLE.to_string();
     t.saved_baseline = SAMPLE.to_string();
     app.tabs.push(t);
@@ -209,7 +209,7 @@ fn scene_status_bar_narrow() {
     let mut app = ScribeApp::new_test(qa_config());
     app.tabs.clear();
     let mut t = EditorTab::scratch();
-    t.text = SAMPLE.to_string();
+    t.set_text(SAMPLE.to_string());
     t.session_baseline = SAMPLE.to_string();
     t.saved_baseline = SAMPLE.to_string();
     app.tabs.push(t);
@@ -230,7 +230,7 @@ fn scene_change_bar() {
     app.tabs.clear();
     let mut t = EditorTab::scratch();
     // current text
-    t.text = SAMPLE.to_string();
+    t.set_text(SAMPLE.to_string());
     // session baseline differs on lines 2 AND 3 (both edited this session)
     t.session_baseline =
         "fn main() {\n    let A = 1;\n    let B = 2;\n    println!(\"{x} {y}\");\n}\n".to_string();
@@ -252,7 +252,7 @@ fn scene_find_bar() {
     let mut app = ScribeApp::new_test(qa_config());
     app.tabs.clear();
     let mut t = EditorTab::scratch();
-    t.text = SAMPLE.to_string();
+    t.set_text(SAMPLE.to_string());
     t.session_baseline = SAMPLE.to_string();
     t.saved_baseline = SAMPLE.to_string();
     app.tabs.push(t);
@@ -273,9 +273,9 @@ fn scene_trailing_ws_and_rulers() {
     let mut app = ScribeApp::new_test(cfg);
     app.tabs.clear();
     let mut t = EditorTab::scratch();
-    t.text = "fn main() {   \n    let x = 1;\n    let y = 2;    \n}\n".to_string();
-    t.session_baseline = t.text.clone();
-    t.saved_baseline = t.text.clone();
+    t.set_text("fn main() {   \n    let x = 1;\n    let y = 2;    \n}\n".to_string());
+    t.session_baseline = t.text.to_string();
+    t.saved_baseline = t.text.to_string();
     app.tabs.push(t);
     app.active = 0;
     render_scene("trailing_ws_rulers", 1100.0, 720.0, app);
@@ -289,7 +289,7 @@ fn scene_settings() {
     let mut app = ScribeApp::new_test(qa_config());
     app.tabs.clear();
     let mut t = EditorTab::scratch();
-    t.text = SAMPLE.to_string();
+    t.set_text(SAMPLE.to_string());
     t.session_baseline = SAMPLE.to_string();
     t.saved_baseline = SAMPLE.to_string();
     app.tabs.push(t);
@@ -310,7 +310,7 @@ fn render_settings_category(name: &str, category: &str) -> Option<std::path::Pat
     let mut app = ScribeApp::new_test(qa_config());
     app.tabs.clear();
     let mut t = EditorTab::scratch();
-    t.text = SAMPLE.to_string();
+    t.set_text(SAMPLE.to_string());
     app.tabs.push(t);
     app.active = 0;
     app.settings_open = true;
@@ -391,15 +391,16 @@ fn scene_tabs() {
         .enumerate()
     {
         let mut t = EditorTab::scratch();
-        t.text = format!("// {name}\n{SAMPLE}");
-        t.session_baseline = t.text.clone();
-        t.saved_baseline = t.text.clone();
+        t.set_text(format!("// {name}\n{SAMPLE}"));
+        t.session_baseline = t.text.to_string();
+        t.saved_baseline = t.text.to_string();
         t.doc_id = crate::grid::DocId(i as u64);
         app.tabs.push(t);
     }
     app.tabs[0].pinned = true;
     // Make tab 2 look dirty (text diverges from the saved doc mirror).
-    app.tabs[2].text.push_str("\nunsaved edit\n");
+    let dirtied = format!("{}\nunsaved edit\n", app.tabs[2].text);
+    app.tabs[2].set_text(dirtied);
     app.active = 1;
     render_scene("tabs", 1100.0, 720.0, app);
 }
@@ -436,7 +437,7 @@ fn scene_toolbar_frameless() {
     let mut app = ScribeApp::new_test(cfg);
     app.tabs.clear();
     let mut t = EditorTab::scratch();
-    t.text = SAMPLE.to_string();
+    t.set_text(SAMPLE.to_string());
     t.session_baseline = SAMPLE.to_string();
     t.saved_baseline = SAMPLE.to_string();
     app.tabs.push(t);
@@ -463,9 +464,9 @@ fn scene_split_divider() {
     .enumerate()
     {
         let mut t = EditorTab::scratch();
-        t.text = format!("{body}{SAMPLE}");
-        t.session_baseline = t.text.clone();
-        t.saved_baseline = t.text.clone();
+        t.set_text(format!("{body}{SAMPLE}"));
+        t.session_baseline = t.text.to_string();
+        t.saved_baseline = t.text.to_string();
         // Distinct doc ids so the grid lays out two separate panes (sync would
         // assign these anyway; setting them keeps the scene deterministic).
         t.doc_id = crate::grid::DocId(i as u64 + 1);
@@ -489,9 +490,9 @@ fn scene_highlight_occurrences() {
     let mut app = ScribeApp::new_test(qa_config());
     app.tabs.clear();
     let mut t = EditorTab::scratch();
-    t.text = "let aaa = 1; let bbb = 2; let ccc = 3;\n".to_string();
-    t.session_baseline = t.text.clone();
-    t.saved_baseline = t.text.clone();
+    t.set_text("let aaa = 1; let bbb = 2; let ccc = 3;\n".to_string());
+    t.session_baseline = t.text.to_string();
+    t.saved_baseline = t.text.to_string();
     app.tabs.push(t);
     app.active = 0;
 
@@ -609,7 +610,7 @@ fn scene_minimap_scrolled() {
             "line {i:03}  fn item_{i:03}() {{ /* row {i:03} */ }}\n"
         ));
     }
-    t.text = body.clone();
+    t.set_text(body.clone());
     t.session_baseline = body.clone();
     t.saved_baseline = body;
     app.tabs.push(t);
@@ -660,7 +661,7 @@ fn scene_tint_off() {
     let mut app = ScribeApp::new_test(cfg);
     app.tabs.clear();
     let mut t = EditorTab::scratch();
-    t.text = SAMPLE.to_string();
+    t.set_text(SAMPLE.to_string());
     t.session_baseline = SAMPLE.to_string();
     t.saved_baseline = SAMPLE.to_string();
     app.tabs.push(t);
@@ -683,7 +684,7 @@ fn scene_tint_strong_red() {
     let mut app = ScribeApp::new_test(cfg);
     app.tabs.clear();
     let mut t = EditorTab::scratch();
-    t.text = SAMPLE.to_string();
+    t.set_text(SAMPLE.to_string());
     t.session_baseline = SAMPLE.to_string();
     t.saved_baseline = SAMPLE.to_string();
     app.tabs.push(t);
@@ -705,7 +706,7 @@ fn scene_tint_disabled() {
     let mut app = ScribeApp::new_test(cfg);
     app.tabs.clear();
     let mut t = EditorTab::scratch();
-    t.text = SAMPLE.to_string();
+    t.set_text(SAMPLE.to_string());
     t.session_baseline = SAMPLE.to_string();
     t.saved_baseline = SAMPLE.to_string();
     app.tabs.push(t);
@@ -726,7 +727,7 @@ fn scene_tint_settings_open() {
     let mut app = ScribeApp::new_test(cfg);
     app.tabs.clear();
     let mut t = EditorTab::scratch();
-    t.text = SAMPLE.to_string();
+    t.set_text(SAMPLE.to_string());
     t.session_baseline = SAMPLE.to_string();
     t.saved_baseline = SAMPLE.to_string();
     app.tabs.push(t);
@@ -749,7 +750,7 @@ fn scene_tint_glass_settings_open() {
     let mut app = ScribeApp::new_test(cfg);
     app.tabs.clear();
     let mut t = EditorTab::scratch();
-    t.text = SAMPLE.to_string();
+    t.set_text(SAMPLE.to_string());
     t.session_baseline = SAMPLE.to_string();
     t.saved_baseline = SAMPLE.to_string();
     app.tabs.push(t);
@@ -775,7 +776,7 @@ fn scene_transparent_tinted() {
     let mut app = ScribeApp::new_test(cfg);
     app.tabs.clear();
     let mut t = EditorTab::scratch();
-    t.text = SAMPLE.to_string();
+    t.set_text(SAMPLE.to_string());
     t.session_baseline = SAMPLE.to_string();
     t.saved_baseline = SAMPLE.to_string();
     app.tabs.push(t);
@@ -797,7 +798,7 @@ fn scene_transparent_min_opacity() {
     let mut app = ScribeApp::new_test(cfg);
     app.tabs.clear();
     let mut t = EditorTab::scratch();
-    t.text = SAMPLE.to_string();
+    t.set_text(SAMPLE.to_string());
     t.session_baseline = SAMPLE.to_string();
     t.saved_baseline = SAMPLE.to_string();
     app.tabs.push(t);
@@ -823,7 +824,7 @@ fn scene_rotated_sidetab_drop_indicator() {
         app.tabs.clear();
         for i in 0..3 {
             let mut t = EditorTab::scratch();
-            t.text = format!("document {i}\nbody line\n");
+            t.set_text(format!("document {i}\nbody line\n"));
             app.tabs.push(t);
         }
         // Active = the BOTTOM tab so the chip-0/chip-1 gap (where the drop line
@@ -1210,7 +1211,7 @@ fn diag_app(text: &str, diags: Vec<Diagnostic>, word_wrap: bool) -> ScribeApp {
     let mut app = ScribeApp::new_test(diag_config(word_wrap));
     app.tabs.clear();
     let mut t = EditorTab::scratch();
-    t.text = text.to_string();
+    t.set_text(text.to_string());
     t.session_baseline = text.to_string();
     t.saved_baseline = text.to_string();
     app.tabs.push(t);
@@ -2258,7 +2259,7 @@ fn diag_app_rope(text: &str, diags: Vec<Diagnostic>) -> ScribeApp {
     let mut app = ScribeApp::new_test(cfg);
     app.tabs.clear();
     let mut t = EditorTab::scratch();
-    t.text = text.to_string();
+    t.set_text(text.to_string());
     t.session_baseline = text.to_string();
     t.saved_baseline = text.to_string();
     app.tabs.push(t);
@@ -2421,7 +2422,7 @@ fn diag_app_grid(diags: Vec<Diagnostic>) -> ScribeApp {
     app.tabs.clear();
     for _ in 0..2 {
         let mut t = EditorTab::scratch();
-        t.text = DIAG_SRC.to_string();
+        t.set_text(DIAG_SRC.to_string());
         t.session_baseline = DIAG_SRC.to_string();
         t.saved_baseline = DIAG_SRC.to_string();
         app.tabs.push(t);

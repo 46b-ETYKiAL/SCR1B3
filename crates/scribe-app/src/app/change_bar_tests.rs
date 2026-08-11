@@ -9,7 +9,7 @@ use crate::change_bar::LineChange::{None as NoneL, Saved, Unsaved};
 
 fn tab_with(text: &str) -> EditorTab {
     let mut t = EditorTab::scratch();
-    t.text = text.to_string();
+    t.set_text(text.to_string());
     t.session_baseline = text.to_string();
     t.saved_baseline = text.to_string();
     t
@@ -77,7 +77,7 @@ fn change_bar_cache_is_lazy_and_size_capped() {
     // First compute populates the cache and records the edit_gen.
     app.ensure_change_states(0);
     let gen = app.tabs[0].change_gen;
-    assert_eq!(gen, Some(app.tabs[0].edit_gen));
+    assert_eq!(gen, Some(app.tabs[0].text.edit_gen()));
 
     // No edit -> no recompute (cache stays at the same generation).
     app.ensure_change_states(0);
@@ -88,7 +88,7 @@ fn change_bar_cache_is_lazy_and_size_capped() {
     app.tabs[0].set_text("a\nB\n".to_string());
     app.ensure_change_states(0);
     assert!(
-        app.tabs[0].change_gen != Some(app.tabs[0].edit_gen),
+        app.tabs[0].change_gen != Some(app.tabs[0].text.edit_gen()),
         "recompute is skipped while the change bar is disabled"
     );
 }

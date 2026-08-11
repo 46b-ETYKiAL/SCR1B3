@@ -272,8 +272,8 @@ fn change_states_computed_for_a_buffer_under_the_two_mib_cap() {
     let mut app = ScribeApp::new_test(cfg);
     app.tabs[0].session_baseline = "old line\n".repeat(200_000);
     app.tabs[0].saved_baseline = app.tabs[0].session_baseline.clone();
-    app.tabs[0].text = "new line\n".repeat(180_000); // ~1.6 MiB, < 2 MiB, differs
-    app.tabs[0].edit_gen = app.tabs[0].edit_gen.wrapping_add(1);
+    app.tabs[0].set_text("new line\n".repeat(180_000)); // ~1.6 MiB, < 2 MiB, differs
+    app.tabs[0].text.bump_edit_gen();
     app.tabs[0].change_gen = None;
     app.ensure_change_states(0);
     assert!(
@@ -293,13 +293,13 @@ fn change_states_computed_for_a_buffer_exactly_at_the_cap() {
     let mut app = ScribeApp::new_test(cfg);
     app.tabs[0].session_baseline = "y".repeat(cap);
     app.tabs[0].saved_baseline = app.tabs[0].session_baseline.clone();
-    app.tabs[0].text = "x".repeat(cap);
+    app.tabs[0].set_text("x".repeat(cap));
     assert_eq!(
         app.tabs[0].text.len(),
         cap,
         "the buffer is exactly at the cap"
     );
-    app.tabs[0].edit_gen = app.tabs[0].edit_gen.wrapping_add(1);
+    app.tabs[0].text.bump_edit_gen();
     app.tabs[0].change_gen = None;
     app.ensure_change_states(0);
     assert!(

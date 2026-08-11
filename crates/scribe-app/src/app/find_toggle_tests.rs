@@ -28,7 +28,7 @@ fn find_app(text: &str, query: &str) -> ScribeApp {
     cfg.editor.first_run_completed = true;
     cfg.appearance.frameless = false;
     let mut app = ScribeApp::new_test(cfg);
-    app.tabs[0].text = text.to_string();
+    app.tabs[0].set_text(text.to_string());
     app.find_query = query.to_string();
     app.find_open = true;
     app

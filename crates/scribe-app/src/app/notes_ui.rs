@@ -361,7 +361,7 @@ impl ScribeApp {
         let active_text = self
             .tabs
             .get(active)
-            .map(|t| t.text.clone())
+            .map(|t| t.text.to_string())
             .unwrap_or_default();
         let active_path = self
             .tabs

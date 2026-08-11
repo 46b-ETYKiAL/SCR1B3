@@ -518,7 +518,7 @@ fn render_whitespace_overlay_default_editor_runs() {
     cfg.editor.render_whitespace = true;
     cfg.editor.experimental_rope_editor = false; // exercise the TextEdit path
     let mut app = ScribeApp::new_test(cfg);
-    app.tabs[0].text = "fn  main() {\n\tlet x = 1;\n}\n".into();
+    app.tabs[0].set_text("fn  main() {\n\tlet x = 1;\n}\n".into());
     run_frames(&mut app, 3);
     assert!(app.config.editor.render_whitespace);
 }
@@ -531,7 +531,7 @@ fn render_whitespace_overlay_grid_path_runs() {
     cfg.editor.render_whitespace = true;
     cfg.editor.grid_enabled = true;
     let mut app = ScribeApp::new_test(cfg);
-    app.tabs[0].text = "a  b\tc\n".into();
+    app.tabs[0].set_text("a  b\tc\n".into());
     app.new_tab();
     run_frames(&mut app, 3);
     assert!(app.tabs.len() >= 2);
@@ -543,7 +543,7 @@ fn render_spellcheck_underline_path_runs() {
     cfg.editor.first_run_completed = true;
     cfg.spellcheck.enabled = true;
     let mut app = ScribeApp::new_test(cfg);
-    app.tabs[0].text = "this zxqwyzz wordd is rong".into();
+    app.tabs[0].set_text("this zxqwyzz wordd is rong".into());
     run_frames(&mut app, 3); // paints the squiggles
     assert!(!app.misspellings_for_active().is_empty());
 }
@@ -685,7 +685,7 @@ fn middle_click_in_editor_arms_autoscroll() {
     // is ON-SCREEN — a click on off-viewport content is correctly rejected by
     // the visible-editor-area gate, which is the feature, not a bug.
     let mut app = fresh_app();
-    app.tabs[0].text = "hi\n".to_string();
+    app.tabs[0].set_text("hi\n".to_string());
     let mut h = ui_harness(app);
     h.run();
     let id = egui::Id::new("scr1b3_autoscroll");
@@ -724,7 +724,7 @@ fn command_palette_opens_then_escape_closes() {
 fn typing_updates_the_active_buffer() {
     let mut app = fresh_app();
     // Make the scratch tab empty + active so typed text is observable.
-    app.tabs[0].text.clear();
+    app.tabs[0].set_text(String::new());
     let mut h = ui_harness(app);
     h.run();
     // Focus the editor text area and type like a user.
@@ -792,7 +792,7 @@ fn dirty_tab_marker_is_ascii_not_tofu_glyph() {
     // the atlas — the "empty square in the untitled tab" report. A dirty
     // untitled tab is the exact case that showed it.
     let mut tab = EditorTab::scratch();
-    tab.text = "Hi".to_string(); // diverges from the empty saved doc → dirty
+    tab.set_text("Hi".to_string()); // diverges from the empty saved doc → dirty
     assert!(tab.is_dirty(), "tab with unsaved text must be dirty");
     let title = tab.title();
     assert!(
@@ -1147,7 +1147,7 @@ fn settings_window_renders() {
 #[test]
 fn find_bar_renders_with_query() {
     let mut app = ScribeApp::new_test(Config::default());
-    app.tabs[0].text = "foo bar foo baz foo".to_string();
+    app.tabs[0].set_text("foo bar foo baz foo".to_string());
     app.find_open = true;
     app.find_query = "foo".to_string();
     run_frames(&mut app, 1);
@@ -1169,7 +1169,7 @@ fn spellcheck_flags_misspellings_e2e() {
     let mut cfg = Config::default();
     cfg.spellcheck.enabled = true;
     let mut app = ScribeApp::new_test(cfg);
-    app.tabs[0].text = "thiss sentense has bad wrds".to_string();
+    app.tabs[0].set_text("thiss sentense has bad wrds".to_string());
     run_frames(&mut app, 1);
     assert!(app.spell_count() > 0, "misspellings should be detected");
 }
@@ -1203,7 +1203,7 @@ fn open_then_edit_then_save_e2e() {
     app.open_path(path.clone());
     run_frames(&mut app, 1);
     let idx = app.active;
-    app.tabs[idx].text = "edited via e2e\n".to_string();
+    app.tabs[idx].set_text("edited via e2e\n".to_string());
     app.save_active();
     run_frames(&mut app, 1);
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "edited via e2e\n");
@@ -1217,9 +1217,9 @@ fn split_is_unified_with_grid() {
     let mut cfg = Config::default();
     cfg.editor.grid_enabled = true;
     let mut app = ScribeApp::new_test(cfg);
-    app.tabs[0].text = "fn main() {}\n".into();
+    app.tabs[0].set_text("fn main() {}\n".into());
     app.tabs.push(EditorTab::scratch());
-    app.tabs[1].text = "second note\n".into();
+    app.tabs[1].set_text("second note\n".into());
     run_frames(&mut app, 2);
     let tree = app
         .grid_tree
@@ -1235,7 +1235,7 @@ fn split_is_unified_with_grid() {
 #[test]
 fn minimap_renders_with_viewport() {
     let mut app = ScribeApp::new_test(Config::default());
-    app.tabs[0].text = (0..200).map(|i| format!("line {i}\n")).collect();
+    app.tabs[0].set_text((0..200).map(|i| format!("line {i}\n")).collect());
     app.config.editor.show_minimap = true;
     run_frames(&mut app, 2);
     assert!(app.config.editor.show_minimap);
@@ -1246,7 +1246,7 @@ fn minimap_renders_with_viewport() {
 #[test]
 fn fold_view_collapses_region() {
     let mut app = ScribeApp::new_test(Config::default());
-    app.tabs[0].text = "fn a() {\n    body;\n    more;\n}\ntail;\n".into();
+    app.tabs[0].set_text("fn a() {\n    body;\n    more;\n}\ntail;\n".into());
     app.fold_view = true;
     run_frames(&mut app, 1);
     // Fold the first region (header at line 0) and re-render — no panic.
@@ -1274,7 +1274,7 @@ fn apply_indent_replaces_selection() {
 fn line_gutter_populated_when_line_numbers_on() {
     let mut app = ScribeApp::new_test(Config::default());
     app.config.editor.show_line_numbers = true;
-    app.tabs[0].text = "a\nb\nc\nd\n".into();
+    app.tabs[0].set_text("a\nb\nc\nd\n".into());
     run_frames(&mut app, 2);
     assert!(
         app.line_gutter.len() >= 4,
@@ -1287,7 +1287,7 @@ fn line_gutter_populated_when_line_numbers_on() {
 fn line_gutter_empty_when_line_numbers_off() {
     let mut app = ScribeApp::new_test(Config::default());
     app.config.editor.show_line_numbers = false;
-    app.tabs[0].text = "a\nb\nc\n".into();
+    app.tabs[0].set_text("a\nb\nc\n".into());
     run_frames(&mut app, 2);
     assert!(app.line_gutter.is_empty());
 }
@@ -1314,10 +1314,12 @@ fn line_gutter_is_cleared_when_the_rope_arm_takes_over() {
     cfg.editor.show_line_numbers = true;
     cfg.editor.experimental_rope_editor = false; // start on the TextEdit arm
     let mut app = ScribeApp::new_test(cfg);
-    app.tabs[0].text = (0..200)
-        .map(|i| format!("line {i:04}"))
-        .collect::<Vec<_>>()
-        .join("\n");
+    app.tabs[0].set_text(
+        (0..200)
+            .map(|i| format!("line {i:04}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
 
     run_frames(&mut app, 3);
     assert!(
@@ -1333,7 +1335,7 @@ fn line_gutter_is_cleared_when_the_rope_arm_takes_over() {
     run_frames(&mut app, 3);
 
     assert!(
-        app.tabs[0].rope_state.is_some(),
+        app.tabs[0].text.rope_state().is_some(),
         "precondition: the rope arm must be the one rendering — `rope_state` is \
          created by `show_editable`'s caller and by nothing else this test does"
     );
@@ -1363,7 +1365,7 @@ fn the_external_gutter_panel_does_not_render_on_the_rope_path() {
         cfg.editor.show_line_numbers = true;
         cfg.editor.experimental_rope_editor = experimental_rope;
         let mut app = ScribeApp::new_test(cfg);
-        app.tabs[0].text = "alpha\nbeta\ngamma\ndelta\n".to_string();
+        app.tabs[0].set_text("alpha\nbeta\ngamma\ndelta\n".to_string());
 
         // One context for the whole probe, so a panel shown on any frame is
         // observable on the last.
@@ -1380,7 +1382,7 @@ fn the_external_gutter_panel_does_not_render_on_the_rope_path() {
         }
         if experimental_rope {
             assert!(
-                app.tabs[0].rope_state.is_some(),
+                app.tabs[0].text.rope_state().is_some(),
                 "precondition: the rope arm must be the one rendering"
             );
         }
@@ -1404,7 +1406,7 @@ fn the_external_gutter_panel_does_not_render_on_the_rope_path() {
 #[test]
 fn word_wrap_toggle_renders_without_panic() {
     let mut app = ScribeApp::new_test(Config::default());
-    app.tabs[0].text = "a very long line ".repeat(40);
+    app.tabs[0].set_text("a very long line ".repeat(40));
     app.config.editor.word_wrap = true;
     run_frames(&mut app, 2);
     app.config.editor.word_wrap = false;
@@ -1442,14 +1444,14 @@ fn settings_window_renders_open() {
 #[test]
 fn completion_opens_and_accepts() {
     let mut app = ScribeApp::new_test(Config::default());
-    app.tabs[0].text = "value valuer val".into();
+    app.tabs[0].set_text("value valuer val".into());
     let cursor = app.tabs[0].text.chars().count();
     app.open_completion(0, Some(cursor));
     assert!(
         app.completion.is_some(),
         "completion opens for prefix 'val'"
     );
-    let before = app.tabs[0].text.clone();
+    let before = app.tabs[0].text.to_string();
     app.accept_completion(0, Some(cursor));
     assert_ne!(app.tabs[0].text, before, "accept inserts a completion");
     assert!(app.completion.is_none(), "popup closes after accept");
@@ -1458,7 +1460,7 @@ fn completion_opens_and_accepts() {
 #[test]
 fn completion_popup_renders_in_frame() {
     let mut app = ScribeApp::new_test(Config::default());
-    app.tabs[0].text = "alpha alphabet alph".into();
+    app.tabs[0].set_text("alpha alphabet alph".into());
     app.completion = Some(Completion {
         prefix_start: 15,
         items: vec!["alpha".into(), "alphabet".into()],
@@ -1487,6 +1489,14 @@ impl Driver {
         Self {
             ctx: egui::Context::default(),
         }
+    }
+
+    /// The persistent `Context` these frames run against, so a sibling test
+    /// module can read the egui-side widget state (`TextEditState`: caret,
+    /// selection, undo history) that lives in egui memory rather than on
+    /// `EditorTab`.
+    pub(super) fn ctx(&self) -> &egui::Context {
+        &self.ctx
     }
 
     pub(super) fn frame(
@@ -1826,7 +1836,7 @@ fn tall_editor_app() -> ScribeApp {
     let mut cfg = Config::default();
     cfg.editor.first_run_completed = true;
     let mut app = ScribeApp::new_test(cfg);
-    app.tabs[0].text = (0..400).map(|i| format!("line {i}\n")).collect();
+    app.tabs[0].set_text((0..400).map(|i| format!("line {i}\n")).collect());
     app
 }
 
@@ -1969,11 +1979,11 @@ fn input_drag_wheel_respects_opt_out() {
 fn scroll_past_end_pads_content_below_last_line() {
     let text: String = (0..6).map(|i| format!("line {i}\n")).collect();
     let mut on = ScribeApp::new_test(Config::default());
-    on.tabs[0].text = text.clone();
+    on.tabs[0].set_text(text.clone());
     run_frames(&mut on, 2);
     let mut off = ScribeApp::new_test(Config::default());
     off.config.scroll.scroll_past_end = false;
-    off.tabs[0].text = text;
+    off.tabs[0].set_text(text);
     run_frames(&mut off, 2);
     assert!(
         on.scroll_metrics.1 > off.scroll_metrics.1,
@@ -1991,7 +2001,7 @@ fn caret_scroll_off_nudges_view_on_keyboard_nav() {
     let mut cfg = Config::default(); // caret_scroll_off defaults to 3
     cfg.editor.first_run_completed = true;
     let mut app = ScribeApp::new_test(cfg);
-    app.tabs[0].text = (0..200).map(|i| format!("line {i}\n")).collect();
+    app.tabs[0].set_text((0..200).map(|i| format!("line {i}\n")).collect());
     let d = Driver::new();
     d.idle(&mut app);
     d.idle(&mut app); // caret at index 0, view at top, editor focused
@@ -2075,7 +2085,7 @@ fn pick_bookmark_navigates_and_wraps() {
 #[test]
 fn toggle_and_navigate_bookmark() {
     let mut app = ScribeApp::new_test(Config::default());
-    app.tabs[0].text = "a\nb\nc\nd\ne\n".into();
+    app.tabs[0].set_text("a\nb\nc\nd\ne\n".into());
     // Cursor on line 3 (1-based) → 0-based line 2.
     app.last_cursor_line_col = Some((3, 1));
     app.toggle_bookmark();
@@ -2110,7 +2120,7 @@ fn execute_builtin_go_to_symbol_opens_modal() {
 #[test]
 fn go_to_symbol_jump_requests_scroll() {
     let mut app = ScribeApp::new_test(Config::default());
-    app.tabs[0].text = "fn a() {\n}\nfn b() {\n}\n".into();
+    app.tabs[0].set_text("fn a() {\n}\nfn b() {\n}\n".into());
     let scopes = crate::editor_features::symbol_scopes(&app.tabs[0].text);
     assert!(!scopes.is_empty(), "two fn definitions detected");
     // Jump to the second symbol's start line (the modal calls
@@ -2129,7 +2139,7 @@ fn go_to_symbol_jump_requests_scroll() {
 #[test]
 fn goto_line_sets_pending_scroll() {
     let mut app = ScribeApp::new_test(Config::default());
-    app.tabs[0].text = "a\nb\nc\nd\ne\n".into();
+    app.tabs[0].set_text("a\nb\nc\nd\ne\n".into());
     app.goto_line(3);
     assert!(
         app.pending_scroll.is_some(),
@@ -2190,7 +2200,7 @@ fn comment_prefix_for_extension_table() {
 #[test]
 fn replace_in_active_no_op_when_pattern_empty() {
     let mut app = ScribeApp::new_test(Config::default());
-    app.tabs[0].text = "hello hello".into();
+    app.tabs[0].set_text("hello hello".into());
     app.find_query.clear();
     app.replace_query = "world".into();
     app.replace_in_active(true);
@@ -2201,7 +2211,7 @@ fn replace_in_active_no_op_when_pattern_empty() {
 #[test]
 fn replace_in_active_first_only() {
     let mut app = ScribeApp::new_test(Config::default());
-    app.tabs[0].text = "hello hello hello".into();
+    app.tabs[0].set_text("hello hello hello".into());
     app.find_query = "hello".into();
     app.replace_query = "x".into();
     app.replace_in_active(false);
@@ -2212,7 +2222,7 @@ fn replace_in_active_first_only() {
 #[test]
 fn replace_in_active_all_matches() {
     let mut app = ScribeApp::new_test(Config::default());
-    app.tabs[0].text = "hello hello hello".into();
+    app.tabs[0].set_text("hello hello hello".into());
     app.find_query = "hello".into();
     app.replace_query = "x".into();
     app.replace_in_active(true);
@@ -2227,7 +2237,7 @@ fn replace_in_active_all_matches() {
 #[test]
 fn replace_in_active_matches_find_bar_case_insensitively() {
     let mut app = ScribeApp::new_test(Config::default());
-    app.tabs[0].text = "Foo foo FOO".into();
+    app.tabs[0].set_text("Foo foo FOO".into());
     app.find_query = "foo".into();
     app.replace_query = "x".into();
     app.replace_in_active(true);
@@ -2239,7 +2249,7 @@ fn replace_in_active_matches_find_bar_case_insensitively() {
 #[test]
 fn replace_in_active_replacement_is_literal_not_regex_expanded() {
     let mut app = ScribeApp::new_test(Config::default());
-    app.tabs[0].text = "ab".into();
+    app.tabs[0].set_text("ab".into());
     app.find_query = "a".into();
     app.replace_query = "$1".into();
     app.replace_in_active(true);
@@ -2251,7 +2261,7 @@ fn replace_in_active_replacement_is_literal_not_regex_expanded() {
 #[test]
 fn accept_completion_with_stale_non_boundary_offset_does_not_panic() {
     let mut app = ScribeApp::new_test(Config::default());
-    app.tabs[0].text = "a\u{e9}".into(); // 'a' + 'é' (2 bytes) → byte len 3
+    app.tabs[0].set_text("a\u{e9}".into()); // 'a' + 'é' (2 bytes) → byte len 3
     app.completion = Some(Completion {
         prefix_start: 2, // mid-'é' — NOT a UTF-8 char boundary
         items: vec!["zz".to_string()],
@@ -2265,7 +2275,7 @@ fn accept_completion_with_stale_non_boundary_offset_does_not_panic() {
 #[test]
 fn move_cursor_line_down_swaps_lines() {
     let mut app = ScribeApp::new_test(Config::default());
-    app.tabs[0].text = "alpha\nbeta\ngamma\n".into();
+    app.tabs[0].set_text("alpha\nbeta\ngamma\n".into());
     app.last_cursor_line_col = Some((1, 1)); // 1-based line 1 = "alpha"
     app.move_cursor_line(1);
     assert_eq!(app.tabs[0].text, "beta\nalpha\ngamma\n");
@@ -2276,7 +2286,7 @@ fn move_cursor_line_down_swaps_lines() {
 #[test]
 fn move_cursor_line_up_at_top_is_noop() {
     let mut app = ScribeApp::new_test(Config::default());
-    app.tabs[0].text = "alpha\nbeta\n".into();
+    app.tabs[0].set_text("alpha\nbeta\n".into());
     app.last_cursor_line_col = Some((1, 1));
     app.move_cursor_line(-1);
     assert_eq!(app.tabs[0].text, "alpha\nbeta\n");
@@ -2289,7 +2299,7 @@ fn move_cursor_line_up_at_top_is_noop() {
 #[test]
 fn move_cursor_line_up_from_trailing_empty_line_does_not_panic() {
     let mut app = ScribeApp::new_test(Config::default());
-    app.tabs[0].text = "a\nb\n".into();
+    app.tabs[0].set_text("a\nb\n".into());
     // Caret parked on the empty trailing line (status reports it as line 3).
     app.last_cursor_line_col = Some((3, 1));
     app.move_cursor_line(-1); // must not panic
@@ -2300,7 +2310,7 @@ fn move_cursor_line_up_from_trailing_empty_line_does_not_panic() {
 #[test]
 fn duplicate_cursor_line_inserts_copy() {
     let mut app = ScribeApp::new_test(Config::default());
-    app.tabs[0].text = "alpha\nbeta\n".into();
+    app.tabs[0].set_text("alpha\nbeta\n".into());
     app.last_cursor_line_col = Some((1, 1));
     app.duplicate_cursor_line();
     assert_eq!(app.tabs[0].text, "alpha\nalpha\nbeta\n");
@@ -2310,7 +2320,7 @@ fn duplicate_cursor_line_inserts_copy() {
 #[test]
 fn join_cursor_line_with_next_uses_single_space() {
     let mut app = ScribeApp::new_test(Config::default());
-    app.tabs[0].text = "hello   \n   world\n".into();
+    app.tabs[0].set_text("hello   \n   world\n".into());
     app.last_cursor_line_col = Some((1, 1));
     app.join_cursor_line_with_next();
     assert_eq!(app.tabs[0].text, "hello world\n");
@@ -2320,7 +2330,7 @@ fn join_cursor_line_with_next_uses_single_space() {
 #[test]
 fn join_cursor_line_with_next_at_last_line_is_noop() {
     let mut app = ScribeApp::new_test(Config::default());
-    app.tabs[0].text = "only".into();
+    app.tabs[0].set_text("only".into());
     app.last_cursor_line_col = Some((1, 1));
     app.join_cursor_line_with_next();
     assert_eq!(app.tabs[0].text, "only");
@@ -2361,7 +2371,7 @@ fn external_disk_change_prompts_when_buffer_dirty() {
     let opened_idx = app.tabs.len() - 1;
     assert!(!app.tabs[opened_idx].external_change);
     // Make local edits, then an external write.
-    app.tabs[opened_idx].text = "local edits".to_string();
+    app.tabs[opened_idx].set_text("local edits".to_string());
     std::thread::sleep(std::time::Duration::from_millis(1200));
     std::fs::write(&path, "second").expect("write update");
     app.poll_external_disk_changes(0);
@@ -2493,7 +2503,7 @@ fn execute_builtin_fold_then_expand_round_trips() {
     // Replace the scratch tab text with code that has a foldable
     // region. The fold extractor scans for matched braces so any
     // multi-line braced block produces a region.
-    app.tabs[app.active].text = "fn x() {\n    1;\n}\n".to_string();
+    app.tabs[app.active].set_text("fn x() {\n    1;\n}\n".to_string());
     app.execute_builtin(BuiltinCommand::FoldAll);
     assert!(app.fold_view, "FoldAll should switch fold view on");
     assert!(
@@ -2606,9 +2616,9 @@ fn tab_swap_preserves_active_pointer() {
     app.tabs.push(EditorTab::scratch());
     app.tabs.push(EditorTab::scratch());
     // Mark each tab with a recognisable byte so swap is observable.
-    app.tabs[0].text = "A".into();
-    app.tabs[1].text = "B".into();
-    app.tabs[2].text = "C".into();
+    app.tabs[0].set_text("A".into());
+    app.tabs[1].set_text("B".into());
+    app.tabs[2].set_text("C".into());
     app.active = 1; // viewing B
     app.tabs.swap(0, 1);
     // The buffer at index 0 is now B (the user's view), but the index
@@ -2655,7 +2665,7 @@ fn input_click_and_type_inserts_text() {
 #[test]
 fn input_ctrl_space_completion_then_enter_accepts() {
     let mut app = ScribeApp::new_test(Config::default());
-    app.tabs[0].text = "value valuer ".into();
+    app.tabs[0].set_text("value valuer ".into());
     let d = Driver::new();
     d.idle(&mut app);
     d.click(&mut app, egui::pos2(550.0, 360.0));
@@ -2666,7 +2676,7 @@ fn input_ctrl_space_completion_then_enter_accepts() {
         "Ctrl+Space opens completion for prefix 'val' (buffer {:?})",
         app.tabs[0].text
     );
-    let before = app.tabs[0].text.clone();
+    let before = app.tabs[0].text.to_string();
     d.key(&mut app, egui::Key::Enter, egui::Modifiers::NONE);
     assert_ne!(
         app.tabs[0].text, before,
@@ -2684,7 +2694,7 @@ fn experimental_rope_editor_renders_without_panic() {
     let mut cfg = Config::default();
     cfg.editor.experimental_rope_editor = true;
     let mut app = ScribeApp::new_test(cfg);
-    app.tabs[0].text = "fn main() {\n    let x = 1;\n}\n".to_string();
+    app.tabs[0].set_text("fn main() {\n    let x = 1;\n}\n".to_string());
     run_frames(&mut app, 4);
     assert_eq!(app.tabs.len(), 1);
 }
@@ -2698,22 +2708,22 @@ fn experimental_editor_persists_rope_and_invalidates_on_external_edit() {
     let mut cfg = Config::default();
     cfg.editor.experimental_rope_editor = true;
     let mut app = ScribeApp::new_test(cfg);
-    app.tabs[0].text = "alpha\nbeta\n".to_string();
+    app.tabs[0].set_text("alpha\nbeta\n".to_string());
     run_frames(&mut app, 3);
     assert!(
-        app.tabs[0].rope_buf.is_some(),
+        app.tabs[0].text.has_rope_buf(),
         "experimental editor builds + persists the rope across frames"
     );
     // External mutation (reload / plugin / sort) invalidates the cache.
     app.tabs[0].set_text("gamma\n".to_string());
     assert!(
-        app.tabs[0].rope_buf.is_none(),
+        !app.tabs[0].text.has_rope_buf(),
         "set_text invalidates the persistent rope cache"
     );
     run_frames(&mut app, 2);
     let rebuilt = app.tabs[0]
-        .rope_buf
-        .as_ref()
+        .text
+        .rope_buf()
         .and_then(|b| b.as_rope())
         .map(|r| r.to_string());
     assert_eq!(
@@ -2733,7 +2743,7 @@ fn save_hygiene_configs_render_without_panic() {
     cfg.editor.trim_trailing_whitespace_on_save = true;
     cfg.editor.final_newline_on_save = true;
     let mut app = ScribeApp::new_test(cfg);
-    app.tabs[0].text = "x   \ny".to_string();
+    app.tabs[0].set_text("x   \ny".to_string());
     run_frames(&mut app, 3);
     assert_eq!(app.tabs.len(), 1);
 }
@@ -2759,7 +2769,7 @@ fn session_snapshot_writes_to_isolated_dir_not_real_config() {
 
     // The exact shape that leaked: an unsaved untitled buffer holding the
     // unit-test fixture text, driven through a frame so the snapshot fires.
-    app.tabs[0].text = "a very long line ".repeat(40);
+    app.tabs[0].set_text("a very long line ".repeat(40));
     run_frames(&mut app, 1);
 
     // The hot-exit snapshot (which DOES run — session_backup on, content
@@ -2776,7 +2786,7 @@ fn session_snapshot_writes_to_isolated_dir_not_real_config() {
 #[test]
 fn reopen_closed_tab_restores_content() {
     let mut app = ScribeApp::new_test(Config::default());
-    app.tabs[0].text = "important note".to_string();
+    app.tabs[0].set_text("important note".to_string());
     app.close_tab(0);
     // close_tab replaces the empty tab set with a fresh scratch.
     app.reopen_closed_tab();
@@ -3180,7 +3190,7 @@ fn toolbar_lsp_button_on_scratch_tab_sets_toast() {
 #[test]
 fn replace_all_button_click_rewrites_buffer() {
     let mut app = fresh_app();
-    app.tabs[0].text = "alpha alpha alpha".into();
+    app.tabs[0].set_text("alpha alpha alpha".into());
     app.find_query = "alpha".into();
     app.replace_query = "beta".into();
     app.find_open = true;
@@ -3200,7 +3210,7 @@ fn replace_all_button_click_rewrites_buffer() {
 #[test]
 fn replace_next_button_click_replaces_first_only() {
     let mut app = fresh_app();
-    app.tabs[0].text = "alpha alpha alpha".into();
+    app.tabs[0].set_text("alpha alpha alpha".into());
     app.find_query = "alpha".into();
     app.replace_query = "beta".into();
     app.find_open = true;
@@ -3254,7 +3264,7 @@ fn command_palette_type_to_filter_narrows_the_list() {
 #[test]
 fn command_palette_click_entry_executes_it() {
     let mut app = fresh_app();
-    app.tabs[0].text = "gamma\nalpha\nbeta\n".into();
+    app.tabs[0].set_text("gamma\nalpha\nbeta\n".into());
     let mut h = ui_harness(app);
     h.run();
     h.get_by_label(">_").click();
@@ -3369,7 +3379,7 @@ fn settings_manage_plugins_button_opens_manager() {
 #[test]
 fn status_bar_encoding_language_and_diagnostics_labels_present() {
     let mut app = fresh_app();
-    app.tabs[0].text = "hi\n".into();
+    app.tabs[0].set_text("hi\n".into());
     // Inject one error diagnostic so the count segment renders.
     app.diagnostics.push(Diagnostic {
         uri: "inmemory://scratch".into(),
@@ -3489,7 +3499,7 @@ fn fuzzy_finder_type_and_click_opens_file() {
 fn fold_toggle_button_click_folds_region() {
     let mut app = fresh_app();
     // A single brace region: lines 0..=2, hidden_len = 2.
-    app.tabs[0].text = "fn x() {\n  a\n}\n".into();
+    app.tabs[0].set_text("fn x() {\n  a\n}\n".into());
     app.fold_view = true;
     let mut h = ui_harness(app);
     h.run();
@@ -3576,7 +3586,7 @@ impl Driver {
 #[test]
 fn mc_typing_inserts_at_all_carets_and_esc_collapses() {
     let mut app = ScribeApp::new_test(Config::default());
-    app.tabs[0].text = "aaa\naaa".to_string();
+    app.tabs[0].set_text("aaa\naaa".to_string());
     let d = Driver::new();
     d.idle(&mut app);
     d.idle(&mut app); // editor auto-focuses
@@ -3604,7 +3614,7 @@ fn mc_typing_inserts_at_all_carets_and_esc_collapses() {
 #[test]
 fn mc_coincident_caret_inserts_once_no_phantom() {
     let mut app = ScribeApp::new_test(Config::default());
-    app.tabs[0].text = "aaaaaaaaaa".to_string();
+    app.tabs[0].set_text("aaaaaaaaaa".to_string());
     let d = Driver::new();
     d.idle(&mut app);
     d.idle(&mut app);
@@ -3625,7 +3635,7 @@ fn mc_coincident_caret_inserts_once_no_phantom() {
 #[test]
 fn mc_nested_caret_no_garbage_splice() {
     let mut app = ScribeApp::new_test(Config::default());
-    app.tabs[0].text = "foo foo".to_string();
+    app.tabs[0].set_text("foo foo".to_string());
     let d = Driver::new();
     d.idle(&mut app);
     d.idle(&mut app);
@@ -3649,7 +3659,7 @@ fn mc_nested_caret_no_garbage_splice() {
 #[test]
 fn mc_ctrl_d_selects_word_then_grows_and_renames_all() {
     let mut app = ScribeApp::new_test(Config::default());
-    app.tabs[0].text = "foo foo foo".to_string();
+    app.tabs[0].set_text("foo foo foo".to_string());
     let d = Driver::new();
     d.idle(&mut app);
     d.idle(&mut app);
@@ -3686,7 +3696,7 @@ fn mc_ctrl_d_selects_word_then_grows_and_renames_all() {
 #[test]
 fn mc_column_block_selection_inserts_on_every_line() {
     let mut app = ScribeApp::new_test(Config::default());
-    app.tabs[0].text = "abc\ndef\nghi".to_string();
+    app.tabs[0].set_text("abc\ndef\nghi".to_string());
     let d = Driver::new();
     d.idle(&mut app);
     d.idle(&mut app);
@@ -3712,7 +3722,7 @@ fn mc_column_block_selection_inserts_on_every_line() {
 #[test]
 fn mc_ctrl_click_pointer_adds_secondary_and_keeps_primary() {
     let mut app = ScribeApp::new_test(Config::default());
-    app.tabs[0].text = "hello world here\nsecond line of text".to_string();
+    app.tabs[0].set_text("hello world here\nsecond line of text".to_string());
     let d = Driver::new();
     d.idle(&mut app);
     d.idle(&mut app); // editor auto-focuses
@@ -3747,9 +3757,9 @@ fn mc_ctrl_click_pointer_adds_secondary_and_keeps_primary() {
 #[test]
 fn mc_carets_are_scoped_to_their_tab_no_cross_buffer_edit() {
     let mut app = ScribeApp::new_test(Config::default());
-    app.tabs[0].text = "AAAAAAA".to_string(); // tab A
+    app.tabs[0].set_text("AAAAAAA".to_string()); // tab A
     app.tabs.push(EditorTab::scratch());
-    app.tabs[1].text = "bbb".to_string(); // tab B (shorter, different buffer)
+    app.tabs[1].set_text("bbb".to_string()); // tab B (shorter, different buffer)
     let d = Driver::new();
     d.idle(&mut app); // sync_grid_state assigns distinct doc_ids; editor focuses
     d.idle(&mut app);
@@ -3804,7 +3814,7 @@ fn mc_carets_are_scoped_to_their_tab_no_cross_buffer_edit() {
 #[test]
 fn mc_out_of_band_transform_clears_stale_carets() {
     let mut app = ScribeApp::new_test(Config::default());
-    app.tabs[0].text = "banana\napple\ncherry\n".to_string(); // unsorted
+    app.tabs[0].set_text("banana\napple\ncherry\n".to_string()); // unsorted
     let d = Driver::new();
     d.idle(&mut app);
     d.idle(&mut app);
@@ -3838,7 +3848,7 @@ fn mc_out_of_band_transform_clears_stale_carets() {
 #[test]
 fn mc_multi_caret_edit_is_one_undo_step() {
     let mut app = ScribeApp::new_test(Config::default());
-    app.tabs[0].text = "aaa\naaa".to_string();
+    app.tabs[0].set_text("aaa\naaa".to_string());
     let d = Driver::new();
     d.idle(&mut app);
     d.idle(&mut app);
@@ -3895,7 +3905,7 @@ fn mc_alt_pointer_drag_builds_column_and_inserts_per_line() {
     let mut app = ScribeApp::new_test(Config::default());
     // A tall, uniform document so a vertical Alt-drag spans several lines, each
     // long enough to share a column band.
-    app.tabs[0].text = (0..20).map(|_| "abcdefghij\n").collect::<String>();
+    app.tabs[0].set_text((0..20).map(|_| "abcdefghij\n").collect::<String>());
     let d = Driver::new();
     d.idle(&mut app);
     d.idle(&mut app); // editor auto-focuses
@@ -3978,7 +3988,7 @@ fn topbar_click_does_not_scroll_the_note() {
         .with_size(egui::Vec2::new(1100.0, 720.0))
         .build_state(|ctx, app: &mut ScribeApp| app.frame_tick(ctx), app);
     // A note far taller than the viewport so there is real scroll range.
-    h.state_mut().tabs[0].text = (0..400).map(|i| format!("line {i}\n")).collect();
+    h.state_mut().tabs[0].set_text((0..400).map(|i| format!("line {i}\n")).collect());
     h.run();
     h.run(); // editor auto-focuses
              // Scroll to the very bottom and settle (pending_scroll consumed, offset kept).
@@ -4041,7 +4051,7 @@ fn modal_owns_keyboard_true_for_each_single_open_modal() {
 #[test]
 fn replace_in_active_empty_pattern_early_returns_without_touching_status() {
     let mut app = ScribeApp::new_test(Config::default());
-    app.tabs[0].text = "hello hello".into();
+    app.tabs[0].set_text("hello hello".into());
     app.find_query.clear();
     app.replace_query = "world".into();
     let status_before = app.status.clone();
@@ -4099,12 +4109,12 @@ fn rope_app(text: &str) -> (Driver, ScribeApp) {
     cfg.editor.first_run_completed = true;
     cfg.editor.experimental_rope_editor = true;
     let mut app = ScribeApp::new_test(cfg);
-    app.tabs[0].text = text.to_string();
+    app.tabs[0].set_text(text.to_string());
     let d = Driver::new();
     d.idle(&mut app);
     d.idle(&mut app);
     assert!(
-        app.tabs[0].rope_state.is_some(),
+        app.tabs[0].text.rope_state().is_some(),
         "precondition: the rope path is the one rendering this tab"
     );
     assert!(
@@ -4117,8 +4127,8 @@ fn rope_app(text: &str) -> (Driver, ScribeApp) {
 /// Select `[a, b)` in the rope editor's own caret state.
 fn rope_select(app: &mut ScribeApp, a: usize, b: usize) {
     let st = app.tabs[0]
-        .rope_state
-        .as_mut()
+        .text
+        .rope_state_mut()
         .expect("rope state built by rope_app");
     st.edit.anchor = a;
     st.edit.cursor = b;
@@ -4179,8 +4189,8 @@ fn same_length_rope_edit_reaches_text_and_marks_the_tab_dirty() {
     let app = typed_over_selection("HELLO");
 
     let rope = app.tabs[0]
-        .rope_buf
-        .as_ref()
+        .text
+        .rope_buf()
         .and_then(scribe_core::buffer::Buffer::as_rope)
         .map(std::string::ToString::to_string)
         .expect("precondition - the rope path holds the buffer");
@@ -4278,8 +4288,8 @@ fn palette_action_on_rope_path_keeps_editor_focus() {
 /// the same silent-no-op the mode-aware drain exists to prevent.
 fn parked_on_rope_queue(app: &ScribeApp) -> usize {
     app.tabs[app.active]
-        .rope_state
-        .as_ref()
+        .text
+        .rope_state()
         .map_or(0, scribe_render::RopeEditorState::injected_len)
 }
 
@@ -4295,7 +4305,7 @@ fn palette_action_in_grid_mode_is_never_parked_on_the_rope_queue() {
     cfg.editor.grid_enabled = true;
     cfg.editor.experimental_rope_editor = true;
     let mut app = ScribeApp::new_test(cfg);
-    app.tabs[0].text = "hello world".to_string();
+    app.tabs[0].set_text("hello world".to_string());
     let d = Driver::new();
     d.idle(&mut app);
     d.idle(&mut app);
@@ -4321,7 +4331,7 @@ fn palette_action_in_fold_view_is_never_parked_on_the_rope_queue() {
     cfg.editor.first_run_completed = true;
     cfg.editor.experimental_rope_editor = true;
     let mut app = ScribeApp::new_test(cfg);
-    app.tabs[0].text = "# h\n\nbody\n".to_string();
+    app.tabs[0].set_text("# h\n\nbody\n".to_string());
     let d = Driver::new();
     d.idle(&mut app);
     app.fold_view = true;
@@ -4347,7 +4357,7 @@ fn palette_cut_on_textedit_path_removes_the_selected_text() {
     cfg.editor.first_run_completed = true;
     cfg.editor.experimental_rope_editor = false;
     let mut app = ScribeApp::new_test(cfg);
-    app.tabs[0].text = "hello world".to_string();
+    app.tabs[0].set_text("hello world".to_string());
     let d = Driver::new();
     d.idle(&mut app);
     d.idle(&mut app); // editor auto-focuses
@@ -4375,7 +4385,7 @@ fn rope_context_menu_cut_removes_the_selected_text() {
     cfg.editor.first_run_completed = true;
     cfg.editor.experimental_rope_editor = true;
     let mut app = ScribeApp::new_test(cfg);
-    app.tabs[0].text = "hello world".to_string();
+    app.tabs[0].set_text("hello world".to_string());
     let mut h = egui_kittest::Harness::builder()
         .with_size(egui::Vec2::new(900.0, 600.0))
         .build_state(|ctx, app: &mut ScribeApp| app.frame_tick(ctx), app);
@@ -4383,8 +4393,8 @@ fn rope_context_menu_cut_removes_the_selected_text() {
     h.run();
     {
         let st = h.state_mut().tabs[0]
-            .rope_state
-            .as_mut()
+            .text
+            .rope_state_mut()
             .expect("rope path is rendering");
         st.edit.anchor = 0;
         st.edit.cursor = 6;
