@@ -70,6 +70,14 @@ fn test_app() -> ScribeApp {
 /// orphans pile up across a test run and were observed blocking the next
 /// `link.exe` with `LNK1104` on the test binary. One process, killable, no
 /// grandchild.
+///
+/// The stand-in is `ping` on Windows and `sleep` everywhere else — both are
+/// present on every host this suite runs on, so there is NO platform where a
+/// `None` is a legitimate skip, and the availability assert is unconditional.
+/// Gating it on `cfg!(windows)` folded it to `true` off Windows — i.e. on
+/// exactly the platforms CI's mutation and coverage jobs use — so a `None`
+/// client made every caller's `let Some(..) else { return }` skip its whole
+/// body while the test still reported green.
 fn fake_server_client() -> Option<scribe_core::lsp::LspClient> {
     let cfg = if cfg!(windows) {
         scribe_core::lsp::LspServerConfig {
@@ -86,9 +94,10 @@ fn fake_server_client() -> Option<scribe_core::lsp::LspClient> {
     };
     let c = scribe_core::lsp::LspClient::spawn(&cfg, "file:///proj").ok();
     assert!(
-        c.is_some() || !cfg!(windows),
-        "the stand-in server must be spawnable on Windows — a None here is a \
-         broken harness, not an absent dependency"
+        c.is_some(),
+        "the stand-in server (`ping` on Windows, `sleep` elsewhere) must be \
+         spawnable on every host — a None here is a broken harness or a \
+         regression in `LspClient::spawn`'s handshake, not an absent dependency"
     );
     c
 }

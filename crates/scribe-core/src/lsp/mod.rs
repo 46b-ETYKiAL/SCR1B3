@@ -794,9 +794,14 @@ mod tests {
     /// Spawn a benign, long-lived, stdin-piped child so `LspClient`'s
     /// enqueue/id/Drop machinery can be exercised without a real language server.
     /// The child reads/holds stdin and stays alive until killed (which Drop does).
-    /// Returns `None` if no such helper binary exists on this host (CI-skip — a
-    /// genuine absence, never a false pass; the asserts below only run when a real
-    /// client was constructed).
+    ///
+    /// The helper binary is `cmd` on Windows and `cat` everywhere else — both are
+    /// present on every host this suite runs on, so there is NO platform where a
+    /// `None` is a legitimate skip. It is asserted unconditionally: a `None` here
+    /// is a broken harness (or a regression in `LspClient::spawn`'s handshake,
+    /// which returns `BrokenPipe` when the writer thread dies), never an absent
+    /// dependency. Without this the callers' `let Some(..) else { return }` would
+    /// silently skip their whole body and report green while asserting nothing.
     fn spawn_benign_lsp_client() -> Option<LspClient> {
         let cfg = if cfg!(windows) {
             LspServerConfig {
@@ -811,7 +816,15 @@ mod tests {
                 languages: vec!["rs".into()],
             }
         };
-        LspClient::spawn(&cfg, "file:///proj").ok()
+        let c = LspClient::spawn(&cfg, "file:///proj").ok();
+        assert!(
+            c.is_some(),
+            "the benign stand-in server (`cmd /c pause` on Windows, `cat` \
+             elsewhere) must be spawnable on every host — a None here is a \
+             broken harness or a regression in the spawn handshake, not an \
+             absent dependency"
+        );
+        c
     }
 
     #[test]
@@ -821,7 +834,7 @@ mod tests {
         // request id and never advance — breaking response correlation. `spawn`
         // consumes id 1 for `initialize`, so the next allocations are 2, 3, ….
         let Some(client) = spawn_benign_lsp_client() else {
-            return; // no benign child available on this host; nothing to assert
+            return; // unreachable: the helper asserts `is_some()` on every host
         };
         let first = client.id();
         let second = client.id();
@@ -1023,13 +1036,17 @@ mod tests {
         out
     }
 
-    /// A live client, with the host-availability check made explicit: on Windows
-    /// `cmd` always exists, so a `None` there is a real failure and not a skip.
+    /// A live client, with the host-availability check made explicit on EVERY
+    /// platform: `cmd` (Windows) and `cat` (elsewhere) both always exist, so a
+    /// `None` is always a real failure and never a skip. Gating this on
+    /// `cfg!(windows)` folded it to `true` off Windows — i.e. on exactly the
+    /// platforms CI's mutation and coverage jobs use — so a `None` client
+    /// silently skipped every caller's body while the test still reported green.
     fn live_client() -> Option<LspClient> {
         let c = spawn_benign_lsp_client();
         assert!(
-            c.is_some() || !cfg!(windows),
-            "`cmd /c pause` must be spawnable on Windows — a None here is a \
+            c.is_some(),
+            "the benign stand-in server must be spawnable — a None here is a \
              broken harness, not an absent dependency"
         );
         c
