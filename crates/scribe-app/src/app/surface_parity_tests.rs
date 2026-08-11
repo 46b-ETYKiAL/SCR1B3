@@ -38,6 +38,26 @@
 //!    A pin that cannot be grafted red would silently survive the fix it exists
 //!    to detect.
 //!
+//! Falsification ledger. Every cell below was OBSERVED red once before being
+//! committed — 27 mutations of the PRODUCT source, 27 killed, each hash-verified
+//! as applied and hash-verified as restored (a mutate-and-restore pass that
+//! never confirms the file changed reports fake kills).
+//!
+//! Cuts (18), one per present cell: the mode publish on each of S-FOLD / S-RO /
+//! S-ROPE / G-*; `EditorMode::Standard` swapped for `Rope`, which is what proves
+//! the badge-LESS assertion discriminates rather than passing on absence;
+//! `show_fold_view`; the diagnostics painter on each of S-ROPE / S-TE / G-ROPE /
+//! G-TE; the metrics publish on S-TE, on `finish_embedded_scroll` (S-RO+S-ROPE)
+//! and on the grid apply; the gutter feed on S-TE and G-TE plus the rope/browse
+//! CLEAR; the focus->active sync; the S-TE auto-focus.
+//!
+//! Grafts (9), one per expected-absent cell, each a rehearsal of the edit that
+//! will one day flip its pin: a guessed-height publish into the fold arm;
+//! `fold_view` added to the gutter-clear predicate; the fold check hoisted above
+//! the grid fork; a rope pane made reachable by the focus sync; auto-focus added
+//! to the grid pane; a minimal ink painter into each of S-FOLD / S-RO / G-RO;
+//! and an arm made to publish `RopeMmap`.
+//!
 //! Scope, stated so no row is over-read: these pin the RENDERING wire, not the
 //! language server (every diagnostics fixture injects `app.diagnostics`
 //! directly), and the shape LIST, not the composited frame — presence and
