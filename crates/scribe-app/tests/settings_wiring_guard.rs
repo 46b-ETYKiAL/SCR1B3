@@ -409,6 +409,71 @@ fn a_test_only_file_is_excluded_from_the_corpus() {
     ));
 }
 
+/// The settings exclusion covers the whole MODULE, not just `settings.rs`.
+///
+/// The settings panel is being decomposed into per-page files under `settings/`.
+/// Those pages render the same controls the old single file did, so they must be
+/// excluded for the same reason — otherwise a `config.foo` read inside
+/// `settings/appearance.rs` would count as a runtime consumer and a control that
+/// nothing else reads would silently start looking wired. That is the quiet
+/// failure this test exists to prevent: the guard would keep passing while it
+/// had stopped guarding.
+#[test]
+fn every_file_in_the_settings_module_is_excluded_from_the_corpus() {
+    let none: [String; 0] = [];
+    let mods = BTreeSet::new();
+    for page in [
+        "src/settings.rs",
+        "src/settings/chrome.rs",
+        "src/settings/appearance.rs",
+        "src/settings/editor.rs",
+        // Nested a level deeper: still settings UI, still excluded.
+        "src/settings/pages/appearance.rs",
+    ] {
+        assert!(
+            is_excluded(Path::new(page), &mods, &none),
+            "`{page}` is settings UI, so a config read inside it must not count \
+             as a runtime consumer",
+        );
+    }
+    // Windows path separators reach `is_excluded` from the real tree walk, which
+    // builds absolute paths from CARGO_MANIFEST_DIR.
+    assert!(is_excluded(
+        Path::new(r"C:\repo\crates\scribe-app\src\settings\fonts.rs"),
+        &mods,
+        &none
+    ));
+}
+
+/// Fail-proof for the test above: the exclusion is scoped to the settings
+/// directory and does NOT swallow the rest of the tree.
+///
+/// Widening the key from a file name to a directory is only safe if it stays
+/// anchored on that directory. A predicate that matched `settings` anywhere in
+/// the path — or every file with a `settings` prefix — would drop real consumers
+/// out of the corpus, and every dormant control would then look unwired at once.
+#[test]
+fn fail_proof_the_settings_exclusion_does_not_swallow_its_neighbours() {
+    let none: [String; 0] = [];
+    let mods = BTreeSet::new();
+    for kept in [
+        // A real consumer that merely NAMES settings.
+        "src/app/settings_keys.rs",
+        "src/app/settings_glue.rs",
+        // A sibling directory one level up must be unaffected.
+        "src/app/mod.rs",
+        "src/config/mod.rs",
+        // A directory that merely STARTS with `settings` is not the module.
+        "src/settings_backup/appearance.rs",
+    ] {
+        assert!(
+            !is_excluded(Path::new(kept), &mods, &none),
+            "`{kept}` is not a settings-module page, so it must stay in the \
+             corpus — dropping it would hide a real runtime consumer",
+        );
+    }
+}
+
 /// The real tree's test-only files really are absent from the corpus. This is the
 /// end-to-end proof of the exclusion above, anchored on a symbol that exists only
 /// inside a `#[cfg(test)] mod …;` file.
