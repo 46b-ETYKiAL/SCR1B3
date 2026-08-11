@@ -601,4 +601,67 @@ mod tests {
             "the lock must sit INSIDE the root it was given, so detection is per-root"
         );
     }
+
+    /// Pins the premise of the `open_lock` pardon in `.cargo/mutants.toml`.
+    ///
+    /// That pardon rests on TWO facts, and this test fails if either changes:
+    ///
+    /// 1. `open_lock` is TWO cfg-split twins. Whichever one the mutation runner
+    ///    is not built for is absent from the binary, so a mutation inside it is
+    ///    vacuous — no test on that host can kill it.
+    /// 2. `Startup` has no `Default`. cargo-mutants' whole-body mutant for a
+    ///    `-> io::Result<Startup>` function is `Ok(Default::default())`, so
+    ///    wherever the body IS compiled the mutant does not build: it is
+    ///    UNVIABLE, never a survivor.
+    ///
+    /// Together those make the mutant unkillable AND non-signal on every
+    /// platform, which is why a bare description anchor is safe here even though
+    /// it matches both twins. Merge the twins, or derive `Default` on `Startup`,
+    /// and the pardon would start covering compiled, killable code — so this
+    /// test forces it out first.
+    #[test]
+    fn the_open_lock_twins_stay_cfg_split_so_the_pardon_stays_honest() {
+        let src = include_str!("single_instance.rs");
+        // ASSEMBLED, never written as a literal. This test reads its OWN file,
+        // so a literal needle would sit in the source and match itself, passing
+        // no matter what the real declarations said.
+        let win = ["#[cfg(", "windows", ")]\n", "fn open_lock("].concat();
+        let not_win = ["#[cfg(", "not(windows)", ")]\n", "fn open_lock("].concat();
+        assert_eq!(
+            src.matches(win.as_str()).count(),
+            1,
+            "the Windows `open_lock` twin is gone or no longer cfg-gated (or this \
+             test now self-matches). If ONE `open_lock` compiles everywhere, its \
+             mutant is real signal: DROP the open_lock entry from \
+             .cargo/mutants.toml and delete this test."
+        );
+        assert_eq!(
+            src.matches(not_win.as_str()).count(),
+            1,
+            "the non-Windows `open_lock` twin is gone or no longer cfg-gated; see \
+             the message above — the pardon's premise is the SPLIT."
+        );
+
+        // `Startup` must stay Default-less: that is what makes the mutant
+        // unviable wherever the body IS compiled.
+        // ASSEMBLED for the same reason as the needles above: written as a
+        // literal it would sit in this very file and match itself.
+        let hand_written = ["impl ", "Default", " for Startup"].concat();
+        assert!(
+            !src.contains(hand_written.as_str()),
+            "`Startup` gained a hand-written Default; `Ok(Default::default())` \
+             would now COMPILE, and the pardoned mutant would become a real, \
+             killable survivor. Drop the pardon."
+        );
+        let derives = src
+            .split_once("pub enum Startup")
+            .and_then(|(before, _)| before.rsplit_once("#[derive("))
+            .map(|(_, tail)| tail.split(')').next().unwrap_or_default().to_string())
+            .unwrap_or_default();
+        assert!(
+            !derives.is_empty() && !derives.contains("Default"),
+            "`Startup` now derives Default (or the derive list could not be read); \
+             see the message above. Derives were: {derives:?}"
+        );
+    }
 }

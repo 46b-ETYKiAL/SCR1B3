@@ -447,11 +447,52 @@ exclude_re = [
   # than letting them silently start hiding compiled, untested code.
   'tray\.rs.*\bimp::icon\b',
   'tray\.rs.*\bimp::init\b',
+  # single_instance.rs `open_lock`: TWO twins, `#[cfg(windows)]` (227) and
+  # `#[cfg(not(windows))]` (249), whose mutant descriptions are byte-identical
+  # AND share column 5 — so neither a description nor a column anchor can tell
+  # them apart. That is fine here, because NEITHER twin can ever be real signal,
+  # and the proof does not depend on which platform runs:
+  #
+  #   * Where the body is NOT compiled (the other-platform twin — on the ubuntu
+  #     runner that is the `#[cfg(windows)]` one at 227, the one CI actually
+  #     reported MISSED) the mutation lands inside an item that never reaches the
+  #     build. Vacuous; no test can kill it.
+  #   * Where the body IS compiled, the mutant does not build: `Startup` derives
+  #     only `Debug`, so `Ok(Default::default())` has no `Default` impl to call.
+  #     UNVIABLE, which cargo-mutants reports separately and never as a survivor.
+  #
+  # So a description anchor over-suppresses nothing, and no positional
+  # registration is needed. Confirmed by applying the real mutant to the WINDOWS
+  # twin on a Windows host, where that body IS compiled: it failed to build
+  # (`Startup: !Default`) rather than surviving. Control, on the same host, that
+  # the pardon is not hiding an untested body: `LockVerdict::Busy =>
+  # Ok(Startup::Secondary)` was rewritten to `Err(err)` and
+  # `a_second_acquire_while_the_first_is_held_is_secondary` KILLED it.
+  #
+  # `the_open_lock_twins_stay_cfg_split_so_the_pardon_stays_honest` pins both
+  # halves of the premise (the cfg split, and `Startup`'s lack of a `Default`),
+  # so merging the twins or deriving `Default` turns the suite RED and forces
+  # this entry out instead of letting it start hiding compiled, killable code.
+  'single_instance\.rs.*replace open_lock -> io::Result<Startup> with Ok\(Default::default\(\)\)',
   # The OUTER `tray::init`'s `#[cfg(not(windows))]` body is `let _ = ctx;` — no
   # return value, no side effect — so `with ()` is provably equivalent on the
   # runner's target. Bounded to `with \(\)` deliberately, exactly like the
   # scribe-win32-chrome wrappers above.
-  'replace tray::init with \(\)',
+  #
+  # SPELLING, and why this line changed. It read `replace tray::init with \(\)`
+  # and matched NOTHING: cargo-mutants names a FREE function bare, so the mutant
+  # it prints is `tray.rs:185:5: replace init with ()`. The pardon was therefore
+  # inert and `185:5` kept coming back as a survivor on every CI shard — the
+  # exact "anchor matching zero mutants" failure this file's header warns about,
+  # reproduced by a module-qualified name rather than by a rotated line. Verified
+  # with the tool, not from memory: `cargo mutants --list -f tray.rs` returned
+  # 13 WITH the config and 16 without, i.e. the config removed only the three
+  # `imp::` entries and left this one. The bare-name form below removes exactly
+  # `185:5` (13 -> 12) and nothing else; in particular it cannot reach
+  # `149:5 replace apply_toggle with ()`, whose description does not contain
+  # "replace init with". `tray_imp_is_cfg_gated_so_the_mutation_pardon_stays_honest`
+  # now pins this spelling so the qualified form cannot come back.
+  'tray\.rs.*replace init with \(\)',
   # md_preview.rs table Start-arms: both clears are DEFENSIVE. `t.row` is
   # `mem::take`n at End(TableHead)/End(TableRow) and `runs` at End(TableCell),
   # so both buffers are already empty at every Start and deleting either arm is

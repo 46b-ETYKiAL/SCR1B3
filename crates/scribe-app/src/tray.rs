@@ -509,4 +509,43 @@ mod tests {
              than leaving a pardon that silently hides code it claims cannot compile."
         );
     }
+
+    /// The `init` pardon must be spelled the way cargo-mutants NAMES the mutant.
+    ///
+    /// This entry read `replace tray::init with \(\)` and matched nothing:
+    /// cargo-mutants names a FREE function bare, so the mutant it prints is
+    /// `tray.rs:185:5: replace init with ()`. The pardon was inert and `185:5`
+    /// came back as a survivor on every shard — the same "anchor matching zero
+    /// mutants" failure the mutants.toml header documents, reached by a
+    /// module-qualified name instead of by a rotated line. A stale POSITIONAL
+    /// anchor is caught by `every_positional_anchor_still_points_at_the_code_it
+    /// _pardons`; a stale DESCRIPTION anchor was not caught by anything, so this
+    /// pins the one that bit us.
+    #[test]
+    fn the_tray_init_pardon_uses_the_bare_function_name_cargo_mutants_prints() {
+        let cfg = include_str!("../../../.cargo/mutants.toml");
+        // Only the real ENTRIES, never the prose: the comment above the entry
+        // quotes the broken spelling to explain it, and a whole-file `contains`
+        // would read that explanation as the defect it warns about.
+        let entries: String = cfg
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // ASSEMBLED so the needles are not themselves literals a future
+        // whole-file scan could trip over.
+        let qualified = ["replace ", "tray::init", " with"].concat();
+        let bare = ["replace ", "init", " with \\(\\)"].concat();
+        assert!(
+            !entries.contains(qualified.as_str()),
+            "the module-qualified spelling is back in .cargo/mutants.toml. \
+             cargo-mutants prints free functions bare, so that form matches NO \
+             mutant and the pardon is silently inert."
+        );
+        assert!(
+            entries.contains(bare.as_str()),
+            "the bare-name `init` pardon is missing from .cargo/mutants.toml; \
+             tray.rs:185 would be reported as a survivor again."
+        );
+    }
 }
