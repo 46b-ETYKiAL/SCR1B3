@@ -1073,9 +1073,146 @@ fn paint_whitespace_markers(
 
 #[cfg(test)]
 mod grid_methods_tests {
-    use super::{same_galley_row, ws_marker};
-    use crate::app::ScribeApp;
+    use super::{same_galley_row, ws_marker, ActivePaneObserved};
+    use crate::app::{EditorTab, ScribeApp};
+    use crate::grid::DocId;
+    use crate::multi_cursor::Caret;
     use scribe_core::Config;
+
+    /// A `ScribeApp` carrying `n` tabs with DISTINCT, non-sentinel doc ids.
+    ///
+    /// `EditorTab::scratch` stamps every tab with the reserved `DocId(0)`
+    /// sentinel, so the ids are re-stamped here — a test that left them equal
+    /// could not tell "found the right pane" from "found the first pane".
+    fn app_with_tabs(n: usize) -> ScribeApp {
+        let mut app = ScribeApp::new_test(Config::default());
+        while app.tabs.len() < n {
+            app.tabs.push(EditorTab::scratch());
+        }
+        for (i, tab) in app.tabs.iter_mut().enumerate() {
+            tab.doc_id = DocId(10 * (i as u64 + 1));
+        }
+        app
+    }
+
+    /// Three equal-length lines, so an Alt-drag column selection spanning all
+    /// of them yields exactly THREE carets (heads at 1, 5 and 9).
+    const COLUMN_TEXT: &str = "aaa\nbbb\nccc\n";
+
+    /// Char offset of the drag head used by the column tests: line 2, column 1.
+    const COLUMN_HEAD: usize = 9;
+
+    #[test]
+    fn a_right_clicked_pane_becomes_the_active_tab() {
+        // `position(|t| t.doc_id == doc_id)` locates the pane that was
+        // right-clicked. Inverted to `!=` it matches the first tab that is NOT
+        // the menu pane, so a menu opened over pane 3 activates pane 1 and
+        // "Bold" emboldens the wrong document. Kills 728:69.
+        let mut app = app_with_tabs(3);
+        let ctx = egui::Context::default();
+        let menu_doc = app.tabs[2].doc_id;
+        app.active = 0;
+        let seen = ActivePaneObserved::default();
+        seen.menu_pane.set(Some(menu_doc));
+        app.apply_active_pane_observations(&ctx, &seen, None, 16.0);
+        assert_eq!(
+            app.active, 2,
+            "the right-clicked pane must become the active tab"
+        );
+    }
+
+    #[test]
+    fn a_stale_active_index_is_clamped_to_the_last_tab() {
+        // `self.active.min(self.tabs.len() - 1)` is the ONLY clamp standing
+        // between a stale index and `self.tabs[active]`. `len + 1` and
+        // `len / 1` both clamp to a tab that does not exist. Kills 732:54 for
+        // BOTH the `+` and the `/` arm.
+        let mut app = app_with_tabs(2);
+        let ctx = egui::Context::default();
+        // Supplying a focus id keeps the `tabs[active]` fallback out of the
+        // way, so the assertion observes the CLAMP and nothing else.
+        let seen = ActivePaneObserved::default();
+        seen.focus_id.set(Some(egui::Id::new("clamp_probe")));
+        app.active = 7;
+        app.apply_active_pane_observations(&ctx, &seen, None, 16.0);
+        assert_eq!(
+            app.active, 1,
+            "a stale active index clamps to the LAST tab, never past it"
+        );
+    }
+
+    #[test]
+    fn an_empty_gutter_observation_leaves_the_previous_rows_intact() {
+        // `if !rows.is_empty()` is what stops a pane that laid out no galley
+        // from wiping the external gutter. Delete the `!` and the guard
+        // inverts: an empty observation clears the rows and a REAL one is
+        // discarded. Kills 747:16 — and the second half pins the inverse so a
+        // test that only asserted "unchanged" could not pass by doing nothing.
+        let ctx = egui::Context::default();
+
+        let mut app = app_with_tabs(1);
+        app.line_gutter = vec![3.0, 6.0, 9.0];
+        let seen = ActivePaneObserved::default();
+        app.apply_active_pane_observations(&ctx, &seen, None, 16.0);
+        assert_eq!(
+            app.line_gutter,
+            vec![3.0, 6.0, 9.0],
+            "an empty observation must not wipe the gutter"
+        );
+
+        let mut app = app_with_tabs(1);
+        app.line_gutter = vec![3.0];
+        let seen = ActivePaneObserved::default();
+        seen.gutter.borrow_mut().extend_from_slice(&[11.0, 22.0]);
+        app.apply_active_pane_observations(&ctx, &seen, None, 16.0);
+        assert_eq!(
+            app.line_gutter,
+            vec![11.0, 22.0],
+            "a real observation replaces the rows"
+        );
+    }
+
+    #[test]
+    fn a_multi_line_column_drag_keeps_the_extra_carets_as_secondaries() {
+        // `carets.len() >= 2` selects the multi-caret branch. Flipped to `<`, a
+        // three-caret column selection falls into the single-caret else-arm,
+        // which CLEARS the multi-cursor — the Alt-drag silently collapses to
+        // one caret. Kills 775:29.
+        let mut app = app_with_tabs(1);
+        app.tabs[0].text = COLUMN_TEXT.into();
+        let ctx = egui::Context::default();
+        app.column_anchor = Some(0);
+        let seen = ActivePaneObserved::default();
+        seen.mc_alt_head_idx.set(Some(COLUMN_HEAD));
+        app.apply_active_pane_observations(&ctx, &seen, None, 16.0);
+        assert_eq!(
+            app.multi_cursor.secondaries().len(),
+            2,
+            "a three-line column drag keeps two secondaries beside the primary"
+        );
+    }
+
+    #[test]
+    fn the_column_drag_primary_is_the_caret_nearest_the_drag_head() {
+        // `(c.head as isize - head_idx as isize).unsigned_abs()` picks the
+        // caret the pointer is actually on. With `+` the distances become
+        // 10/14/18 and with `/` they become 0/0/1 — both elect the FIRST caret,
+        // so the primary lands on the line the drag STARTED on and the dragged
+        // line is demoted to a secondary. Kills 779:59 for both arms.
+        let mut app = app_with_tabs(1);
+        app.tabs[0].text = COLUMN_TEXT.into();
+        let ctx = egui::Context::default();
+        app.column_anchor = Some(0);
+        let seen = ActivePaneObserved::default();
+        seen.mc_alt_head_idx.set(Some(COLUMN_HEAD));
+        app.apply_active_pane_observations(&ctx, &seen, None, 16.0);
+        assert_eq!(
+            app.multi_cursor.secondaries(),
+            &[Caret::selection(0, 1), Caret::selection(4, 5)],
+            "the caret ON the drag head is the primary; the earlier lines stay \
+             secondary, in order"
+        );
+    }
 
     #[test]
     fn apply_pending_caret_ops_ignores_an_out_of_range_active_index() {
