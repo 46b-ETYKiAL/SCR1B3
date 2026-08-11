@@ -514,6 +514,35 @@ exclude_re = [
   # here would have hidden it.
   'replace \* with (\+|/) in ScribeApp::render_notes_pane',
 
+  # rope_editor/mod.rs `line_span`: the last-line boundary test. Two of the
+  # eleven mutants on this condition are EQUIVALENT, and the equivalence is a
+  # proof, not a difficulty argument.
+  #
+  #     let end = if line + 1 < rope.len_lines() { rope.line_to_char(line + 1) }
+  #               else { n };                            // n = rope.len_chars()
+  #
+  # `line` comes from `rope.char_to_line(c)`, so `0 <= line <= len_lines() - 1`
+  # and `line < len_lines()` is ALWAYS true. Therefore:
+  #   * `+ 1` -> `* 1` turns the condition into `line < len_lines()`, and
+  #   * `<`   -> `<=`  turns it into `line + 1 <= len_lines()`,
+  # and BOTH differ from the original in exactly one case: `line + 1 ==
+  # len_lines()`, i.e. the cursor is on the last line. In that case the original
+  # takes the else branch and yields `len_chars()`, while the mutants take the
+  # then branch and yield `line_to_char(len_lines())`. Ropey defines those to be
+  # the same value, so the output is identical for every input. []
+  #
+  # That premise is asserted, not assumed: `line_to_char_past_the_last_line_is_
+  # len_chars` pins it over empty / no-trailing-newline / trailing-newline
+  # ropes, so if ropey ever changes the equivalence fails loudly.
+  #
+  # COLUMN-pinned, not description-pinned, because 9 of the 11 line_span mutants
+  # ARE killed by the existing tests (the `+ -> -`, `< -> ==`, `< -> >` and the
+  # four whole-body tuple mutants) — verified by running each as a control. A
+  # bare `in line_span` description would suppress all of them. Registered in
+  # POSITIONAL_ANCHORS.
+  'rope_editor/mod\.rs:\d+:23: replace \+ with \* in line_span',
+  'rope_editor/mod\.rs:\d+:27: replace < with <= in line_span',
+
   # --- The ONLY three literal-line anchors that survive, and why -------------
   # Each pardons a mutant whose NAME is byte-identical to a NEIGHBOUR in the
   # same function at the SAME column — so neither the description nor the column

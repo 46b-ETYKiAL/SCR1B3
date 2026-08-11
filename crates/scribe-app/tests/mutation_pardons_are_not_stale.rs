@@ -127,6 +127,24 @@ struct PositionalAnchor {
 /// coverage silently.
 const POSITIONAL_ANCHORS: &[PositionalAnchor] = &[
     // --- Column-pinned (line left as `\d+`) --------------------------------
+    // `line_span`'s last-line boundary. Column-pinned rather than
+    // description-pinned because 9 of the 11 mutants on this condition ARE
+    // killed by the suite; a bare `in line_span` would suppress them all. The
+    // equivalence proof for these two lives in `.cargo/mutants.toml`.
+    PositionalAnchor {
+        pattern: r"rope_editor/mod\.rs:\d+:23: replace \+ with \* in line_span",
+        file: "rope_editor/mod.rs",
+        line: None,
+        columns: &[(23, "+ 1")],
+        function: "line_span",
+    },
+    PositionalAnchor {
+        pattern: r"rope_editor/mod\.rs:\d+:27: replace < with <= in line_span",
+        file: "rope_editor/mod.rs",
+        line: None,
+        columns: &[(27, "< rope.len_lines()")],
+        function: "line_span",
+    },
     PositionalAnchor {
         pattern: r"datetime\.rs:\d+:40: replace - with (\+|/) in format_iso8601_utc",
         file: "datetime.rs",

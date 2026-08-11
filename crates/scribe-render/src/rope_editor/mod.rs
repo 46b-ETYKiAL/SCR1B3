@@ -3649,4 +3649,100 @@ mod tests {
             "taking it clears it — a pick must never be executed twice"
         );
     }
+
+    // ---- RopeRowGeom column <-> x (what a host hangs overlays off) ----
+
+    /// Build a `RopeRowGeom` for `line` with a deliberately non-zero, non-one
+    /// `text_left`. Both magnitudes matter: at `text_left == 0` a `*` reads the
+    /// same as a `+` for column 0, and at `text_left == 1` a `/` reads the same
+    /// as a `-`, so a lazy gutter offset would hide half the arithmetic.
+    fn row_geom(line: &str, text_left: f32) -> RopeRowGeom {
+        let ctx = egui::Context::default();
+        let font = egui::FontId::monospace(14.0);
+        let mut galley = None;
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                galley = Some(tab_geometry::layout_line(
+                    ui,
+                    line,
+                    font.clone(),
+                    egui::Color32::WHITE,
+                ));
+            });
+        });
+        RopeRowGeom {
+            row_left: text_left - 20.0,
+            text_left,
+            top: 0.0,
+            bottom: 14.0,
+            galley: galley.expect("a frame ran, so the galley was laid out"),
+        }
+    }
+
+    #[test]
+    fn col_x_offsets_the_galley_position_by_the_text_left_edge() {
+        const LEFT: f32 = 100.0;
+        let geom = row_geom("abcd", LEFT);
+
+        // Column 0 sits exactly on the text edge: this is what pins the whole
+        // body being replaced by a constant, and `+` becoming `*` (which would
+        // zero the offset out).
+        assert!(
+            (geom.col_x(0) - LEFT).abs() < 0.01,
+            "column 0 is the text left edge, got {}",
+            geom.col_x(0)
+        );
+
+        // A later column must be to the RIGHT of the edge by the galley's own
+        // advance — the half that catches `+` becoming `-`.
+        let x2 = geom.col_x(2);
+        assert!(
+            x2 > LEFT,
+            "column 2 must lie right of the text edge, got {x2} vs {LEFT}"
+        );
+        assert!(
+            (x2 - (LEFT + tab_geometry::col_to_rel_x(&geom.galley, 2))).abs() < 0.01,
+            "column 2 must be the edge plus the galley's own advance, got {x2}"
+        );
+    }
+
+    #[test]
+    fn col_at_x_inverts_col_x() {
+        const LEFT: f32 = 100.0;
+        let geom = row_geom("abcd", LEFT);
+        for col in 0..=4usize {
+            let round_tripped = geom.col_at_x(geom.col_x(col));
+            assert_eq!(
+                round_tripped, col,
+                "col_at_x(col_x({col})) must return {col}, got {round_tripped}"
+            );
+        }
+    }
+
+    /// `line_to_char(len_lines())` is the premise that makes the two
+    /// `line_span` boundary mutants equivalent (see the disposition note in
+    /// `.cargo/mutants.toml`). If ropey ever stops returning `len_chars` there,
+    /// the equivalence argument collapses and those pardons must be revisited —
+    /// so the premise is asserted rather than assumed.
+    #[test]
+    fn line_to_char_past_the_last_line_is_len_chars() {
+        for text in ["", "alpha", "alpha\n", "alpha\nbeta", "alpha\nbeta\n"] {
+            let r = Rope::from_str(text);
+            assert_eq!(
+                r.line_to_char(r.len_lines()),
+                r.len_chars(),
+                "ropey premise broken for {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn injected_len_reports_the_queue_depth() {
+        let mut st = RopeEditorState::new();
+        assert_eq!(st.injected_len(), 0, "a fresh state has an empty queue");
+        st.inject_event(text_event("a"));
+        assert_eq!(st.injected_len(), 1, "one injected event is one queued");
+        st.inject_event(text_event("b"));
+        assert_eq!(st.injected_len(), 2, "the queue accumulates");
+    }
 }
