@@ -37,6 +37,15 @@ _WIN_BS = "C:\\Users" + "\\"
 _HOME = "/home" + "/"
 _MAC = "/Users" + "/"
 _DOT = "."
+_BS = chr(92)
+# A path written into a source literal that is ITSELF inside another literal
+# is escaped twice; this is that form, assembled so it is not a leak here.
+_WIN_BS4 = "C:" + (_BS * 4) + "Users" + (_BS * 4)
+# Cross-OS mount prefixes. A home path under one of these identifies its owner
+# exactly as well as the unmounted form does.
+_MNT = "/mnt/c"
+_CYG = "/cygdrive/c"
+_WSL_UNC = (_BS * 2) + "wsl$" + _BS + "Ubuntu"
 
 
 # (description, sample) - each MUST produce at least one finding.
@@ -55,14 +64,49 @@ MUST_CATCH: list[tuple[str, str]] = [
     # false positive it fixes. These pin that it stayed narrow.
     ("colon-prefixed prose is not a uri scheme", "Contact:who@gmail" + ".com"),
     ("author label is not a uri scheme", "Author:a.person@pm" + ".me"),
+    # The vendor/forge no-reply classes are matched by LOCAL PART at an EXACT
+    # domain. Every case below is one step away from a permitted form, and each
+    # is the step that would turn the exemption into a hole:
+    #   - a real inbox AT a vendor domain is still a real inbox;
+    #   - `noreply` at an arbitrary domain proves nothing about that domain;
+    #   - a permitted domain used as a PREFIX of an attacker host would be
+    #     exempted by any suffix/`in`-style comparison.
+    ("real mailbox at a vendor domain", "someone@anthropic" + ".com"),
+    ("real mailbox at the forge domain", "a.person@github" + ".com"),
+    ("noreply local part at a consumer domain", "noreply@gmail" + ".com"),
+    ("vendor domain as a prefix of an attacker host", "noreply@anthropic.com" + ".evil" + ".net"),
+    ("forge domain as a prefix of an attacker host", "noreply@github.com" + ".evil" + ".net"),
+    ("vendor noreply lookalike, wrong tld", "noreply@anthropic" + ".io"),
     # Home paths must not require a trailing slash.
     ("linux home, no trailing slash", "service runs as " + _HOME + "deploy"),
     ("linux home, real account", "cd " + _HOME + "j.smith/build"),
     ("macos home", "open " + _MAC + "jbloggs/dev/x"),
+    # Doubly-escaped separators. The `{1,2}` quantifier this replaced could not
+    # see this form at all, so a path embedded in a nested string literal was
+    # invisible to a rule that claimed to cover Windows user paths.
+    ("windows path, doubly-escaped separators", 'cfg = "' + _WIN_BS4 + 'a.dev_"'),
+    # Home paths reached through a cross-OS mount. Every mount prefix ends in
+    # an alphanumeric, so the `(?<![A-Za-z0-9])` lookbehind on the plain
+    # patterns silently made all three of these invisible.
+    ("wsl mount to a windows profile", "cd " + _MNT + "/Users/" + "a.dev_/src"),
+    ("cygwin mount to a windows profile", _CYG + "/Users/" + "jsmith/build"),
+    ("wsl unc to a linux home", "explorer " + _WSL_UNC + "/home/" + "jsmith"),
+    # Internal tooling directories that were not previously registered.
+    ("tooling dir, plans", "see " + _DOT + "plans/active/x.md"),
+    ("tooling dir, codex", "path: " + _DOT + "codex/config.toml"),
+    # A bare fragment of the internal monorepo identifier, with no surrounding
+    # path or sibling segment to give it away.
+    ("bare monorepo id fragment", "the R0" + "UT3 arbiter module"),
+    # The workstation account name as a BARE token, with no path around it -
+    # the form no path pattern can see.
+    ("os account name, bare token", "profile = " + _DOT + "46b" + "_"),
     # Internal tooling / monorepo / work-item tokens (hash-matched).
     ("tooling dir", "see " + _DOT + "s4f3-data/notes.md"),
     ("tooling dir, second", "path: " + _DOT + "claude/agents"),
-    ("monorepo id embedded in a longer path", "C:/x/Itasha.Corp_S4F3-" + "R0UT3-4RB" + "1T3R/y"),
+    # NOTE the split points: a bare fragment of the identifier is now a
+    # suppressed token in its own right, so the previous 3-way split left a
+    # detectable token in THIS file's bytes. The runtime value is unchanged.
+    ("monorepo id embedded in a longer path", "C:/x/Itasha.Corp_S4F3-" + "R0U" + "T3-4RB" + "1T3R/y"),
     ("work-item token", "<!-- bespoke instrument (plan-" + "611). -->"),
     # Secret shapes.
     ("private key block", "-----BEGIN OPENSSH PRIVATE " + "KEY-----"),
@@ -95,6 +139,18 @@ MUST_NOT_FIRE: list[tuple[str, str]] = [
     ("placeholder home, user", 'format_dropped_path("' + _HOME + 'user/file.txt")'),
     ("placeholder home, alice", "cwd=" + _HOME + "alice/proj"),
     ("placeholder home, op", 'insert(PaneId(0), "' + _HOME + 'op/work")'),
+    # Vendor- and forge-issued no-reply addresses. These exist so that a real
+    # mailbox never has to be published, and they are public by design.
+    #
+    # This is the class that made a `--history` run unusable: the co-author
+    # trailer below appears on several hundred commits, every one of them was
+    # reported as a "personal email address", and a verifier whose count can
+    # never reach zero cannot be used to prove anything was removed.
+    ("vendor noreply in a co-author trailer",
+     "Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic" + ".com>"),
+    ("vendor noreply, mixed case", "NoReply@Anthropic" + ".Com"),
+    ("vendor noreply, hyphenated local part", "no-reply@anthropic" + ".com"),
+    ("bare forge noreply, web-ui commits", "noreply@github" + ".com"),
     # RFC 2606 / RFC 6761 reserved domains are documentation, not mailboxes.
     ("reserved domain, example.com", "maintainer@example.com"),
     ("reserved domain, .test", 'mailto_url("a@b.test", &title, &body)'),
@@ -125,6 +181,27 @@ MUST_NOT_FIRE: list[tuple[str, str]] = [
     ("apple iconset member", 'cp "${D}/app-32.png" "${S}/icon_16x16@2x.png"'),
     # A single-character account name identifies nobody.
     ("single-letter account in a prompt fixture", r't.advance(b"line\r\nC:\Users\x>");'),
+    # The placeholder allowlist must reach the MOUNTED patterns too. If it did
+    # not, adding mount coverage would have turned every documentation example
+    # written against a WSL path into a false positive.
+    ("placeholder account under a wsl mount", "cd " + _MNT + "/Users/" + "user/proj"),
+    ("placeholder account under a cygwin mount", _CYG + "/Users/" + "runner/work"),
+    ("placeholder account under a wsl unc", _WSL_UNC + "/home/" + "alice"),
+    # A mount path that is not a home path at all.
+    ("mount path, not a home dir", "mount " + _MNT + "/ProgramData/cache"),
+    ("mount path, data volume", "/mnt/data" + "/backups/2026"),
+    # The relative-path false positives the `(?<![A-Za-z0-9])` lookbehind
+    # exists to prevent. The mounted patterns are additive and must not have
+    # reintroduced them.
+    ("relative docs path containing 'home'", "see docs/home/index.md for setup"),
+    ("relative path containing 'Users'", "crates/core/Users/mod.rs"),
+    ("word 'home' in prose", "return to the home screen"),
+    # Tokens that share digits with the account name but are not it. The
+    # account probe carries a LEADING DOT; these do not, so registering it must
+    # not have caught them.
+    ("version-like token", "bumped to 0.46b in the changelog"),
+    ("public handle, no leading dot", "https://github.com/46b-ETYKiAL/SCR1B3"),
+    ("public handle in prose", "46b-ETYKiAL maintains this repository"),
 ]
 
 
@@ -145,6 +222,78 @@ def test_third_party_attribution_is_exempt_from_the_email_rule_only() -> None:
     assert not csa.scan_text(email, "THIRD-PARTY-LICENSES.md", third_party=True)
     # ...but the exemption is email-only: a path still fires in the same file.
     assert csa.scan_text(_WIN + "a.dev_/x", "THIRD-PARTY-LICENSES.md", third_party=True)
+
+
+def test_vendor_noreply_is_a_distinct_named_class_not_a_silent_drop() -> None:
+    """A recognised address must be CLASSIFIED, not merely "not a violation".
+
+    "Suppress the class until the count reaches zero" and "classify the class
+    correctly" produce the same violation count and are not the same thing.
+    The difference is observable only if the audit can name what it saw, so
+    the class label is asserted here and the caller prints its tally.
+    """
+    vendor = "noreply@anthropic" + ".com"
+    forge_user = "133311911+46b-ETYKiAL@users.noreply.github.com"
+
+    assert csa.email_class(vendor) == "vendor noreply address"
+    assert csa.email_class("noreply@github" + ".com") == "forge noreply address"
+    assert csa.email_class(forge_user) == "forge per-contributor noreply address"
+    assert csa.email_class("x@example.com") == "reserved documentation domain"
+
+    tally: dict[str, int] = {}
+    findings = csa.scan_text(f"Co-Authored-By: A B <{vendor}>", "probe", non_pii=tally)
+    assert not findings, f"a vendor noreply address was reported as a leak: {findings}"
+    assert tally == {"vendor noreply address": 1}, f"class not tallied: {tally}"
+
+
+def test_a_mailbox_at_a_vendor_domain_is_still_a_mailbox() -> None:
+    """The exemption is by LOCAL PART, never by domain.
+
+    Exempting a whole vendor domain would be the "widen it until the count
+    drops" failure: an ordinary local part at a vendor domain is a person's
+    work inbox, and is exactly as much PII as any other address.
+    """
+    for local in ("someone", "first.last", "a.person"):
+        addr = local + "@anthropic" + ".com"
+        assert csa.email_class(addr) is None, f"a real mailbox was exempted: {local}"
+        assert csa.scan_text(addr, "probe"), f"a real mailbox produced no finding: {local}"
+
+
+def test_noreply_domains_are_compared_by_equality_not_by_suffix() -> None:
+    """A suffix/substring comparison would exempt an attacker-controlled host."""
+    for host in ("anthropic.com" + ".evil" + ".net",
+                 "github.com" + ".evil" + ".net",
+                 "users.noreply.github.com" + ".evil" + ".net",
+                 "evil-anthropic" + ".com"):
+        addr = "noreply@" + host
+        assert csa.noreply_class(addr) is None, f"suffix match exempted {host}"
+        assert csa.scan_text(addr, "probe"), f"no finding for {host}"
+
+
+def test_history_message_scan_classifies_the_trailer_at_the_real_entry_point() -> None:
+    """Drive the function `--history` actually calls, not just the matcher.
+
+    The reported defect lives in the `--history` run: `audit_commit_messages`
+    is what turned every co-author trailer into a "personal email address"
+    violation. Asserting only on `scan_text` would leave that path unpinned.
+    """
+    vendor = "noreply@anthropic" + ".com"
+    leak = "someone@proton" + ".me"
+    fake_log = (
+        "aaaaaaaaaaaa\x1fsubject\n\nCo-Authored-By: A B <" + vendor + ">\n\x1e"
+        "bbbbbbbbbbbb\x1fsubject\n\nReported-by: <" + leak + ">\n\x1e"
+    )
+    real_git = csa.git
+    tally: dict[str, int] = {}
+    try:
+        csa.git = lambda *a: fake_log  # type: ignore[assignment]
+        found = csa.audit_commit_messages(10, tally)
+    finally:
+        csa.git = real_git
+
+    assert tally.get("vendor noreply address") == 1, f"trailer not classified: {tally}"
+    assert len(found) == 1, f"expected exactly the real mailbox, got: {found}"
+    assert found[0].startswith("commit bbbbbbbbbbbb"), f"wrong commit flagged: {found}"
 
 
 def test_audit_does_not_exempt_itself() -> None:
@@ -175,6 +324,10 @@ def _main() -> int:
             failures += 1
     for fn in (
         test_third_party_attribution_is_exempt_from_the_email_rule_only,
+        test_vendor_noreply_is_a_distinct_named_class_not_a_silent_drop,
+        test_a_mailbox_at_a_vendor_domain_is_still_a_mailbox,
+        test_noreply_domains_are_compared_by_equality_not_by_suffix,
+        test_history_message_scan_classifies_the_trailer_at_the_real_entry_point,
         test_audit_does_not_exempt_itself,
         test_this_suite_carries_no_literal_leak,
     ):
