@@ -656,6 +656,50 @@ exclude_re = [
   'keymap\.rs:\d+:70: replace == with != in is_copy_command',
   'keymap\.rs:\d+:71: replace == with != in is_paste_command',
 
+  # md_preview/math.rs `read_group`: the `entry < src.len()` half of the
+  # advance-clamp guard. EQUIVALENT by a reachability proof, not a difficulty
+  # argument.
+  #
+  #     let entry = *i;
+  #     let group = read_group_inner(src, i);
+  #     if entry < src.len() && *i <= entry { *i = entry.saturating_add(1); }
+  #
+  # The clamp body is DEAD while `read_group_inner` is correct. Whenever
+  # `entry < src.len()` there is a character to consume, and every path through
+  # the inner function then advances by at least one: the leading whitespace
+  # skip either consumes characters or leaves one at `*i`; each arm reachable
+  # from there (`{`, `\`, a single character) increments before returning; and
+  # the `None` arm is reachable only once the skip has consumed the rest. So
+  # `*i <= entry` is false whenever the bound is true, and the clamp never
+  # fires. `entry` is only ever a cursor into `src`, so `entry <= src.len()`
+  # always holds and `entry > src.len()` is false for every input — the mutant
+  # therefore stops a clamp that already never fired, which is no change at all.
+  #
+  # DESCRIPTION-anchored, so it cannot rotate on either axis and needs no
+  # POSITIONAL_ANCHORS entry. `$`-terminated deliberately: without it the
+  # pattern would also swallow `read_group_inner`'s own `< with >` at the
+  # end-of-input bound, which IS killed. `read_group` is the only function of
+  # that name in the workspace (`grep -rn "fn read_group"`), so the bare
+  # description cannot reach another file.
+  #
+  # PRECISE, verified with the tool rather than from memory: the same `<`
+  # carries `== ` and `<=` mutants that are NOT pardoned and ARE killed — both
+  # make the clamp fire at end-of-input and run the cursor to `src.len() + 1`.
+  # The `&&` and the `<=` later on the same line are likewise unpardoned and
+  # killed (both make it fire on a CORRECT parse and rewind the cursor). That is
+  # why the bound was NOT rewritten to dodge the mutant the way the `entry + 1`
+  # step was (spelled `saturating_add`, generating nothing): removing the `<`
+  # would have deleted two working mutants to hide one equivalent sibling.
+  #
+  # Control-checked rather than trusted. All FOUR unpardoned mutants at this
+  # site were applied to real source and run: `< with ==` (1 failure) and
+  # `< with <=` (1) are caught by `read_group_advances_past_every_first_
+  # character`; `<= with >` (10) and `&& with ||` (10) are caught across the
+  # math suite. The clamp body was additionally replaced by a `panic!` and the
+  # whole md_preview corpus still passed 97/97 — the reachability premise above
+  # measured, not assumed. So this entry hides no untested code.
+  'replace < with > in read_group$',
+
   # --- The ONLY three literal-line anchors that survive, and why -------------
   # Each pardons a mutant whose NAME is byte-identical to a NEIGHBOUR in the
   # same function at the SAME column — so neither the description nor the column

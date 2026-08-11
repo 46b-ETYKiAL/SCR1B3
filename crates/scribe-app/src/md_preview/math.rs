@@ -93,7 +93,19 @@ fn render_command(src: &[char], i: &mut usize, out: &mut String, depth: u8) {
         return;
     };
     if !first.is_ascii_alphabetic() {
-        *i += 1;
+        // `saturating_add`, not `+= 1` — the same reason as `render`'s loop
+        // head and the brace scan in `read_group_inner`, and the reason this
+        // function's "always advances" contract above is true for the
+        // single-character command form.
+        //
+        // This step is the ONLY thing that consumes `first`, and perturbed to
+        // `-=` it exactly cancels the caller's own advance: `render` steps past
+        // the `\`, this rewinds onto it, and `$\,$` re-dispatches on the same
+        // backslash forever. That is a hang, not a wrong render — a fault no
+        // assertion can observe, only a timeout, and it fails the gate while
+        // teaching nothing (it was a measured TIMEOUT survivor). Written
+        // without an operator there is nothing left to perturb.
+        *i = i.saturating_add(1);
         match first {
             // Thin/medium/thick spaces and an explicit inter-word space.
             ',' | ';' | ':' | ' ' => out.push(' '),
@@ -211,8 +223,35 @@ fn read_group(src: &[char], i: &mut usize) -> Vec<char> {
     //
     // It is also a real robustness property in its own right: a user's `$…$`
     // fragment must never be able to wedge the markdown preview.
+    //
+    // REACHABILITY — the body below is DEAD while `read_group_inner` is
+    // correct, and that is the point: this is a guard, not a step. Whenever
+    // `entry < src.len()` there is a character to consume, and every path
+    // through the inner function then advances by at least one — the
+    // whitespace skip either consumes characters or leaves one at `*i`, each
+    // arm reachable from there (`{`, `\`, a single character) increments
+    // before it returns, and the `None` arm is reachable only when the skip
+    // already consumed the rest of the fragment. So `*i <= entry` is false
+    // whenever the bound is true, the clamp never fires, and its ARITHMETIC is
+    // unobservable.
+    //
+    // That makes the step's two mutants (`+` -> `-`, `+` -> `*`) EQUIVALENT —
+    // nothing could ever kill them — so it is spelled `saturating_add`, which
+    // generates none, rather than pardoned. The bound's `<` -> `>` mutant is
+    // equivalent for the same reason (`entry <= src.len()` always holds, so
+    // `>` only ever stops a clamp that already never fires), but it must NOT
+    // be dodged the same way: the same `<` also carries `==` and `<=` mutants
+    // that ARE killed, because they make the clamp fire at end-of-input and
+    // run the cursor to `src.len() + 1`. Rewriting the bound to remove one
+    // equivalent mutant would delete two working ones, so `< with >` alone is
+    // pardoned by description in `.cargo/mutants.toml`.
+    //
+    // Those two killed siblings — together with the `&&` -> `||` and `<=` ->
+    // `>` mutants on this same line, which make the clamp fire on a CORRECT
+    // parse and rewind the cursor — are the standing control that this region
+    // is observed rather than assumed.
     if entry < src.len() && *i <= entry {
-        *i = entry + 1;
+        *i = entry.saturating_add(1);
     }
     group
 }
@@ -1106,27 +1145,51 @@ mod tests {
     /// still or rewinds does not mis-render: it hangs the preview, which is a
     /// fault only a timeout can observe. The `entry`-clamp in `read_group` is
     /// what converts such a perturbation into a wrong parse this can catch.
+    ///
+    /// The resting position is asserted EXACTLY, not as `0 < i <= len`. A range
+    /// assertion is satisfied by any wrong-but-in-range cursor, so it cannot
+    /// tell a correct parse from an off-by-one one — and each shape below has
+    /// exactly one right answer. (This strengthens the whole `read_group_inner`
+    /// scan; it does not make the unreachable clamp in `read_group` observable,
+    /// which nothing can — see the REACHABILITY note there.)
     #[test]
     fn read_group_advances_past_every_first_character() {
-        for frag in [
-            "{ab}", "{", "}", r"\alpha", r"\{", r"\\", "a", " ", "  x", "",
+        for (frag, want) in [
+            // `{` consumed, body scanned, closing `}` stepped over.
+            ("{ab}", 4),
+            // Unbalanced `{`: the scan takes the rest and stops at the end.
+            ("{", 1),
+            // A bare `}` is just an ordinary single-character argument.
+            ("}", 1),
+            // `\` plus the whole alphabetic command name.
+            (r"\alpha", 6),
+            // `\` plus exactly one non-alphabetic character.
+            (r"\{", 2),
+            (r"\\", 2),
+            ("a", 1),
+            // All whitespace: the leading skip consumes it and finds no
+            // argument, so the cursor rests at the end rather than rewinding.
+            (" ", 1),
+            // Skip two spaces, then take `x`.
+            ("  x", 3),
+            ("", 0),
         ] {
             let src: Vec<char> = frag.chars().collect();
             let mut i = 0usize;
             let _ = read_group(&src, &mut i);
-            if src.is_empty() {
-                assert_eq!(i, 0, "an empty fragment has nothing to consume");
-            } else {
-                assert!(
-                    i > 0,
-                    "read_group({frag:?}) left the cursor at {i} — a caller's                      loop would never terminate"
-                );
-                assert!(
-                    i <= src.len(),
-                    "read_group({frag:?}) ran the cursor to {i}, past the end                      ({} chars)",
-                    src.len()
-                );
-            }
+            assert_eq!(
+                i, want,
+                "read_group({frag:?}) left the cursor at {i}, expected {want}"
+            );
+            assert!(
+                i > 0 || src.is_empty(),
+                "read_group({frag:?}) consumed nothing — a caller's loop would never terminate"
+            );
+            assert!(
+                i <= src.len(),
+                "read_group({frag:?}) ran the cursor to {i}, past the end ({} chars)",
+                src.len()
+            );
         }
 
         // A `\command` argument that runs out of input is the end-of-input edge
