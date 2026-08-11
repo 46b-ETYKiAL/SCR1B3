@@ -32,6 +32,20 @@ Four design decisions are load-bearing - read them before editing:
 4.  **Both identities, every commit.** `git commit --amend --author=...`
     changes `%ae` alone; a rebase changes `%ce` alone. Checking one of the two
     leaves the other wide open, so both are checked on every commit.
+
+A contributor's NAME is deliberately unconstrained. Names are public
+attribution and are welcome, in commits and in the contributor list. It is
+only the mailbox that must stay out - with one exception, which is why the
+name fields are read at all: a name field that carries a WORKSTATION ACCOUNT
+NAME, a home path, or an internal token is not attribution, it is the same
+leak the content-safety audit exists to catch, wearing a different field.
+`git` fills `user.name` from the OS account by default, so this is the
+accidental case, not the adversarial one - and by volume it is the LARGER
+exposure here: on this repository 549 commits carry the account name in a name
+field against 30 carrying a personal mailbox in an address field, and the
+address rules cannot see any of the 549. The name is therefore passed through
+the content-safety audit's scanner: whatever that scanner already refuses is
+refused here too, and every other name is accepted untouched.
 """
 
 from __future__ import annotations
@@ -51,9 +65,6 @@ ROOT = Path(__file__).resolve().parents[1]
 #      These are the addresses the forge issues precisely so a real mailbox
 #      never has to be published.
 #   2. Bot identities, which are forge accounts and carry no personal mailbox.
-#
-# A contributor's NAME is deliberately not constrained - names are public
-# attribution and are welcome. Only the mailbox is.
 ALLOWED_IDENTITY_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     (
         "github noreply",
@@ -74,6 +85,16 @@ ALLOWED_IDENTITY_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
 # first push of a long-lived branch cannot turn into a full-history scan, but
 # large enough that a normal feature branch is covered end to end.
 FALLBACK_DEPTH = 200
+
+# How many shas are passed to one `git show`. One process for the whole range
+# is tempting and wrong: every sha adds 41 bytes to the command line, and
+# Windows caps a command line at 32767 characters, so a range of a few hundred
+# commits aborts the guard with an OS-level "the filename or extension is too
+# long" rather than producing a verdict. `--all` on this repository (960+
+# commits, ~39 kB of argv) hit that exactly, which means a WIDE scan silently
+# did nothing at all. The batch is kept large enough that the process cost
+# stays negligible and small enough that the argv stays far under the cap.
+_SHOW_CHUNK = 300
 
 _ZERO_SHA = re.compile(r"^0{7,40}$")
 
@@ -97,6 +118,30 @@ def redact(addr: str) -> str:
     dmask = (dparts[0][:1] + "***") if dparts[0] else "***"
     tld = "." + ".".join(dparts[1:]) if len(dparts) > 1 else ""
     return f"{local[:2]}***@{dmask}{tld}"
+
+
+def name_findings(name: str) -> list[str]:
+    """Violation CLASSES carried by a commit name field, or an empty list.
+
+    Delegates to the content-safety audit rather than re-deriving the rules:
+    the account name is stored there only as a salted digest, so duplicating
+    the check here would mean either duplicating the digest table or writing
+    the plaintext into a second public file.
+
+    Fails CLOSED. The audit sits beside this module and the falsification
+    suite asserts that adjacency; if it cannot be imported, the name has NOT
+    been checked, and reporting that is the only honest outcome.
+    """
+    if not name.strip():
+        return []
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import content_safety_audit as csa
+    except ImportError as e:  # pragma: no cover - exercised by the suite
+        return [f"name could not be checked ({e})"]
+    # Strip the "origin:line: " prefix: the class is what may be printed, and
+    # the name itself must never be echoed back into a log.
+    return [f.split(": ", 1)[-1] for f in csa.scan_text(name, "name")]
 
 
 def git(*args: str) -> str:
@@ -130,11 +175,32 @@ def resolve_range(base: str, head: str) -> tuple[list[str], str]:
             pass
 
     # Base unresolvable (force-push, shallow clone, or a brand-new branch).
-    # Fall back to a bounded ancestry walk rather than checking nothing.
-    out = git("rev-list", f"-n{FALLBACK_DEPTH}", head)
+    # Fall back to a bounded ancestry walk rather than checking nothing - but
+    # exclude what is already on a remote.
+    #
+    # `--not --remotes` is what keeps this consistent with the resolvable-base
+    # case above. A plain `rev-list -n<N> <head>` walks into commits that were
+    # published long ago, and this repository's history carries identities and
+    # name fields that only a history rewrite - an owner decision - can clear.
+    # The first push of any new branch would therefore be blocked by commits
+    # the pusher did not write and cannot fix, which is exactly the
+    # permanently-red gate that design decision 2 exists to prevent. Measured
+    # here: all 200 commits the old fallback walked were already published.
+    # Scoping to unpublished commits keeps the guard on what this push
+    # actually makes public.
+    #
+    # With no remote refs configured, `--not --remotes` excludes nothing and
+    # this degrades to the plain bounded walk on its own.
+    try:
+        out = git("rev-list", f"-n{FALLBACK_DEPTH}", head, "--not", "--remotes")
+        scope = "not yet on any remote"
+    except subprocess.CalledProcessError:
+        out = git("rev-list", f"-n{FALLBACK_DEPTH}", head)
+        scope = "ancestry"
     return (
         [c for c in out.split() if c],
-        f"last {FALLBACK_DEPTH} commit(s) of {head[:12]} (base unresolvable)",
+        f"<= {FALLBACK_DEPTH} commit(s) of {head[:12]}, {scope} "
+        "(base unresolvable)",
     )
 
 
@@ -143,25 +209,43 @@ def audit_commits(shas: list[str]) -> list[str]:
     if not shas:
         return []
     out: list[str] = []
-    # Batch: one `git show` per commit would be O(n) processes.
-    raw = git("show", "--no-patch", "--format=%H%x1f%ae%x1f%ce%x1e", *shas)
-    for rec in raw.split("\x1e"):
-        rec = rec.strip()
-        if not rec:
-            continue
-        parts = rec.split("\x1f")
-        if len(parts) != 3:
-            continue
-        sha, ae, ce = parts
-        for role, addr in (("author", ae), ("committer", ce)):
-            if not addr.strip():
-                out.append(f"{sha[:12]}: empty {role} identity")
+    seen = 0
+    # Batched: one `git show` per commit would be O(n) processes, and one
+    # `git show` for the whole range overflows the OS argv cap (see
+    # `_SHOW_CHUNK`). Every chunk is parsed, so no commit is skipped.
+    for i in range(0, len(shas), _SHOW_CHUNK):
+        chunk = shas[i : i + _SHOW_CHUNK]
+        raw = git(
+            "show", "--no-patch", "--format=%H%x1f%an%x1f%ae%x1f%cn%x1f%ce%x1e", *chunk
+        )
+        for rec in raw.split("\x1e"):
+            rec = rec.strip()
+            if not rec:
                 continue
-            if identity_is_allowed(addr) is None:
-                out.append(
-                    f"{sha[:12]}: {role} identity is not allowlisted "
-                    f"({redact(addr)})"
-                )
+            parts = rec.split("\x1f")
+            if len(parts) != 5:
+                continue
+            sha, an, ae, cn, ce = parts
+            seen += 1
+            for role, name, addr in (("author", an, ae), ("committer", cn, ce)):
+                if not addr.strip():
+                    out.append(f"{sha[:12]}: empty {role} identity")
+                elif identity_is_allowed(addr) is None:
+                    out.append(
+                        f"{sha[:12]}: {role} identity is not allowlisted "
+                        f"({redact(addr)})"
+                    )
+                for cls in name_findings(name):
+                    out.append(f"{sha[:12]}: {role} NAME carries a {cls}")
+    if seen != len(shas):
+        # Fail CLOSED. Fewer commits parsed than requested means the batching
+        # silently dropped some, and a guard that checked a subset while
+        # reporting on the whole range is indistinguishable from one that
+        # passed.
+        out.append(
+            f"internal: parsed {seen} of {len(shas)} commit(s); the range was "
+            "not fully checked"
+        )
     return out
 
 
@@ -201,8 +285,9 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  {v}")
         print(
             "\nCommit metadata is public and cannot be redacted after a push.\n"
-            "Set a forge noreply address and re-author the offending commits:\n"
+            "Set a publishable identity and re-author the offending commits:\n"
             "  git config user.email '<id>+<handle>@users.noreply.github.com'\n"
+            "  git config user.name '<handle>'   # a NAME violation is this one\n"
             "  git rebase -r --reset-author-date --exec "
             "'git commit --amend --no-edit --reset-author' <base>"
         )

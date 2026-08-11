@@ -64,6 +64,19 @@ MUST_CATCH: list[tuple[str, str]] = [
     # false positive it fixes. These pin that it stayed narrow.
     ("colon-prefixed prose is not a uri scheme", "Contact:who@gmail" + ".com"),
     ("author label is not a uri scheme", "Author:a.person@pm" + ".me"),
+    # The vendor/forge no-reply classes are matched by LOCAL PART at an EXACT
+    # domain. Every case below is one step away from a permitted form, and each
+    # is the step that would turn the exemption into a hole:
+    #   - a real inbox AT a vendor domain is still a real inbox;
+    #   - `noreply` at an arbitrary domain proves nothing about that domain;
+    #   - a permitted domain used as a PREFIX of an attacker host would be
+    #     exempted by any suffix/`in`-style comparison.
+    ("real mailbox at a vendor domain", "someone@anthropic" + ".com"),
+    ("real mailbox at the forge domain", "a.person@github" + ".com"),
+    ("noreply local part at a consumer domain", "noreply@gmail" + ".com"),
+    ("vendor domain as a prefix of an attacker host", "noreply@anthropic.com" + ".evil" + ".net"),
+    ("forge domain as a prefix of an attacker host", "noreply@github.com" + ".evil" + ".net"),
+    ("vendor noreply lookalike, wrong tld", "noreply@anthropic" + ".io"),
     # Home paths must not require a trailing slash.
     ("linux home, no trailing slash", "service runs as " + _HOME + "deploy"),
     ("linux home, real account", "cd " + _HOME + "j.smith/build"),
@@ -126,6 +139,18 @@ MUST_NOT_FIRE: list[tuple[str, str]] = [
     ("placeholder home, user", 'format_dropped_path("' + _HOME + 'user/file.txt")'),
     ("placeholder home, alice", "cwd=" + _HOME + "alice/proj"),
     ("placeholder home, op", 'insert(PaneId(0), "' + _HOME + 'op/work")'),
+    # Vendor- and forge-issued no-reply addresses. These exist so that a real
+    # mailbox never has to be published, and they are public by design.
+    #
+    # This is the class that made a `--history` run unusable: the co-author
+    # trailer below appears on several hundred commits, every one of them was
+    # reported as a "personal email address", and a verifier whose count can
+    # never reach zero cannot be used to prove anything was removed.
+    ("vendor noreply in a co-author trailer",
+     "Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic" + ".com>"),
+    ("vendor noreply, mixed case", "NoReply@Anthropic" + ".Com"),
+    ("vendor noreply, hyphenated local part", "no-reply@anthropic" + ".com"),
+    ("bare forge noreply, web-ui commits", "noreply@github" + ".com"),
     # RFC 2606 / RFC 6761 reserved domains are documentation, not mailboxes.
     ("reserved domain, example.com", "maintainer@example.com"),
     ("reserved domain, .test", 'mailto_url("a@b.test", &title, &body)'),
@@ -199,6 +224,78 @@ def test_third_party_attribution_is_exempt_from_the_email_rule_only() -> None:
     assert csa.scan_text(_WIN + "a.dev_/x", "THIRD-PARTY-LICENSES.md", third_party=True)
 
 
+def test_vendor_noreply_is_a_distinct_named_class_not_a_silent_drop() -> None:
+    """A recognised address must be CLASSIFIED, not merely "not a violation".
+
+    "Suppress the class until the count reaches zero" and "classify the class
+    correctly" produce the same violation count and are not the same thing.
+    The difference is observable only if the audit can name what it saw, so
+    the class label is asserted here and the caller prints its tally.
+    """
+    vendor = "noreply@anthropic" + ".com"
+    forge_user = "133311911+46b-ETYKiAL@users.noreply.github.com"
+
+    assert csa.email_class(vendor) == "vendor noreply address"
+    assert csa.email_class("noreply@github" + ".com") == "forge noreply address"
+    assert csa.email_class(forge_user) == "forge per-contributor noreply address"
+    assert csa.email_class("x@example.com") == "reserved documentation domain"
+
+    tally: dict[str, int] = {}
+    findings = csa.scan_text(f"Co-Authored-By: A B <{vendor}>", "probe", non_pii=tally)
+    assert not findings, f"a vendor noreply address was reported as a leak: {findings}"
+    assert tally == {"vendor noreply address": 1}, f"class not tallied: {tally}"
+
+
+def test_a_mailbox_at_a_vendor_domain_is_still_a_mailbox() -> None:
+    """The exemption is by LOCAL PART, never by domain.
+
+    Exempting a whole vendor domain would be the "widen it until the count
+    drops" failure: an ordinary local part at a vendor domain is a person's
+    work inbox, and is exactly as much PII as any other address.
+    """
+    for local in ("someone", "first.last", "a.person"):
+        addr = local + "@anthropic" + ".com"
+        assert csa.email_class(addr) is None, f"a real mailbox was exempted: {local}"
+        assert csa.scan_text(addr, "probe"), f"a real mailbox produced no finding: {local}"
+
+
+def test_noreply_domains_are_compared_by_equality_not_by_suffix() -> None:
+    """A suffix/substring comparison would exempt an attacker-controlled host."""
+    for host in ("anthropic.com" + ".evil" + ".net",
+                 "github.com" + ".evil" + ".net",
+                 "users.noreply.github.com" + ".evil" + ".net",
+                 "evil-anthropic" + ".com"):
+        addr = "noreply@" + host
+        assert csa.noreply_class(addr) is None, f"suffix match exempted {host}"
+        assert csa.scan_text(addr, "probe"), f"no finding for {host}"
+
+
+def test_history_message_scan_classifies_the_trailer_at_the_real_entry_point() -> None:
+    """Drive the function `--history` actually calls, not just the matcher.
+
+    The reported defect lives in the `--history` run: `audit_commit_messages`
+    is what turned every co-author trailer into a "personal email address"
+    violation. Asserting only on `scan_text` would leave that path unpinned.
+    """
+    vendor = "noreply@anthropic" + ".com"
+    leak = "someone@proton" + ".me"
+    fake_log = (
+        "aaaaaaaaaaaa\x1fsubject\n\nCo-Authored-By: A B <" + vendor + ">\n\x1e"
+        "bbbbbbbbbbbb\x1fsubject\n\nReported-by: <" + leak + ">\n\x1e"
+    )
+    real_git = csa.git
+    tally: dict[str, int] = {}
+    try:
+        csa.git = lambda *a: fake_log  # type: ignore[assignment]
+        found = csa.audit_commit_messages(10, tally)
+    finally:
+        csa.git = real_git
+
+    assert tally.get("vendor noreply address") == 1, f"trailer not classified: {tally}"
+    assert len(found) == 1, f"expected exactly the real mailbox, got: {found}"
+    assert found[0].startswith("commit bbbbbbbbbbbb"), f"wrong commit flagged: {found}"
+
+
 def test_audit_does_not_exempt_itself() -> None:
     """The audit is scanned like any other tracked file."""
     src = (_HERE / "content_safety_audit.py").read_text(encoding="utf-8")
@@ -227,6 +324,10 @@ def _main() -> int:
             failures += 1
     for fn in (
         test_third_party_attribution_is_exempt_from_the_email_rule_only,
+        test_vendor_noreply_is_a_distinct_named_class_not_a_silent_drop,
+        test_a_mailbox_at_a_vendor_domain_is_still_a_mailbox,
+        test_noreply_domains_are_compared_by_equality_not_by_suffix,
+        test_history_message_scan_classifies_the_trailer_at_the_real_entry_point,
         test_audit_does_not_exempt_itself,
         test_this_suite_carries_no_literal_leak,
     ):

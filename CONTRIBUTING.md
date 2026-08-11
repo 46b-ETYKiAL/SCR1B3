@@ -58,18 +58,32 @@ The hook refuses a push when:
 - a tracked file carries an absolute home path, a personal mailbox, an internal
   tooling reference, or a secret-shaped string;
 - any commit in the range being pushed carries an identity that is not on the
-  allowlist.
+  allowlist, or a **name field** that carries something the content-safety
+  audit refuses anywhere else.
 
 Set a publishing identity before you commit:
 
 ```bash
 git config user.email '<id>+<handle>@users.noreply.github.com'
+git config user.name  '<handle>'
 ```
 
 GitHub issues that address under **Settings → Emails → Keep my email address
 private**. Your **name** is welcome in commits and in the contributor list —
-it is only the mailbox that must stay out. Contributions from a bot or forge
-noreply address are equally fine.
+real names, handles and pseudonyms all pass, and it is the mailbox that must
+stay out. Contributions from a bot or forge noreply address are equally fine.
+
+The one thing a name field must not carry is content that is not attribution
+at all: a **workstation account name**, a home path, or an internal token.
+`git` fills `user.name` from your OS account by default, so this is easy to
+publish by accident and the address rules cannot see it — set `user.name`
+explicitly and it never arises.
+
+Vendor- and forge-issued **no-reply** addresses (`noreply@github.com`,
+`<handle>@users.noreply.github.com`, `noreply@anthropic.com`) are not personal
+mailboxes and are not findings; the audit reports them as their own class with
+a count. An ordinary local part at one of those domains *is* a real inbox and
+is still a finding.
 
 Run the checks yourself at any time:
 
