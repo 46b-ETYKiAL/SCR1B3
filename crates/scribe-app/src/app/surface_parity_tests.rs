@@ -39,11 +39,11 @@
 //!    to detect.
 //!
 //! Falsification ledger. Every cell below was OBSERVED red once before being
-//! committed — 27 mutations of the PRODUCT source, 27 killed, each hash-verified
+//! committed — 33 mutations of the PRODUCT source, 33 killed, each hash-verified
 //! as applied and hash-verified as restored (a mutate-and-restore pass that
 //! never confirms the file changed reports fake kills).
 //!
-//! Cuts (19), one per present cell: the mode publish on each of S-FOLD / S-RO /
+//! Cuts (22), one per present cell: the mode publish on each of S-FOLD / S-RO /
 //! S-ROPE / G-*; `EditorMode::Standard` swapped for `Rope`, which is what proves
 //! the badge-LESS assertion discriminates rather than passing on absence;
 //! `show_fold_view`; the diagnostics painter on each of S-ROPE / S-TE / G-ROPE /
@@ -51,13 +51,18 @@
 //! and on the grid apply; the gutter feed on S-TE and G-TE plus the CLEAR on the
 //! rope/browse arms and — since the fold gap below was closed — on the fold arm
 //! too, cut at BOTH its pin and its navigation consequence; the focus->active
-//! sync; the S-TE auto-focus.
+//! sync; the S-TE auto-focus; and — for the R2 hover row — the tooltip's span
+//! lookup on each of the THREE painters that carry it (G-TE's, S-TE's, and the
+//! one S-ROPE and G-ROPE share). Those three are cut at the LOOKUP rather than
+//! at the painter, so the squiggle keeps rendering: R1 stayed green through all
+//! three, which is what proves the hover row measures something R1 cannot see.
 //!
-//! Grafts (8), one per still-expected-absent cell, each a rehearsal of the edit
+//! Grafts (11), one per still-expected-absent cell, each a rehearsal of the edit
 //! that will one day flip its pin: a guessed-height publish into the fold arm;
 //! the fold check hoisted above the grid fork; a rope pane made reachable by the
 //! focus sync; auto-focus added to the grid pane; a minimal ink painter into
-//! each of S-FOLD / S-RO / G-RO; and an arm made to publish `RopeMmap`.
+//! each of S-FOLD / S-RO / G-RO; an arm made to publish `RopeMmap`; and a
+//! minimal hover registration into each of S-FOLD / S-RO / G-RO.
 //!
 //! The ninth graft — `fold_view` added to the gutter-clear predicate — is no
 //! longer a rehearsal. It was the real defect this matrix found, and landing it
@@ -839,4 +844,206 @@ fn the_grid_textedit_pane_is_missing_the_single_pane_conveniences_and_says_it_is
              OTHER acceptable fix, and this pin must move with it"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// R2 — the diagnostic HOVER: the message the ink stands for
+// ---------------------------------------------------------------------------
+
+/// The message `err_on_line_1` must surface, severity-prefixed.
+const ERR_HOVER: &str = "error: cannot find value `error` in this scope";
+
+/// The prefix alone, for the absence and off-row assertions: those must fail on
+/// ANY diagnostic tooltip, not merely on this exact wording.
+const ERR_HOVER_PREFIX: &str = "error: cannot find value";
+
+/// The text of the document line the fixture's error is published against, used
+/// to LOCATE that line's painted row on screen — never to assert anything.
+const ERR_LINE_TEXT: &str = "second line holds the error span";
+
+/// A line two below it, carrying no diagnostic of its own. The off-row control
+/// hovers here.
+const CLEAN_LINE_TEXT: &str = "fourth line holds the info notice";
+
+/// The character column the hover is taken at: the middle of the published span
+/// (chars 5..20), so the pointer is unambiguously ON the diagnostic rather than
+/// merely somewhere on its line — the "same line, wrong character" bug the hover
+/// resolver exists to avoid.
+const ERR_HOVER_COL: usize = 12;
+
+/// Rows shorter than this are the MINIMAP's, which paints the same buffer text
+/// minified (~3px rows against the editor's ~17px). A height floor is what
+/// discriminates the editor's own row from that copy; the caller additionally
+/// requires the survivor to be UNIQUE, so an ambiguity fails loudly instead of
+/// silently picking the wrong one.
+const EDITOR_ROW_MIN_H: f32 = 8.0;
+
+/// The one editor-sized painted ROW whose text contains `needle`: its screen
+/// rect and the row itself (for `x_offset`).
+///
+/// Read back from the frame's own shape list rather than guessed from the
+/// window, which is what lets ONE target rule serve all seven arms. The
+/// `TextEdit` arms lay the whole buffer out as a single galley and report the
+/// line as one `PlacedRow` inside it; the rope and browse arms report one galley
+/// per row they painted; the fold arm projects a different line set at a
+/// different origin entirely. What every one of them has in common is that the
+/// erroring line is painted as a row somewhere on screen — and that row is where
+/// a user would put the pointer.
+///
+/// This derives a pointer POSITION (an input). It asserts nothing about the
+/// overlay, so it cannot supply the wire the hover cells measure.
+fn painted_row(
+    out: &egui::FullOutput,
+    needle: &str,
+) -> (egui::Rect, std::sync::Arc<egui::epaint::text::Row>) {
+    let mut hits: Vec<(egui::Rect, std::sync::Arc<egui::epaint::text::Row>)> = Vec::new();
+    for clipped in &out.shapes {
+        super::grid_parity_tests::walk_shape(&clipped.shape, &mut |s| {
+            if let egui::Shape::Text(t) = s {
+                for prow in &t.galley.rows {
+                    if prow.row.text().contains(needle) {
+                        let rect =
+                            egui::Rect::from_min_size(t.pos + prow.pos.to_vec2(), prow.row.size);
+                        if rect.height() >= EDITOR_ROW_MIN_H {
+                            hits.push((rect, prow.row.clone()));
+                        }
+                    }
+                }
+            }
+        });
+    }
+    assert_eq!(
+        hits.len(),
+        1,
+        "the frame must paint exactly ONE editor-sized row carrying {needle:?} to \
+         aim the pointer at; it painted {} ({:?}). Zero means the arm never \
+         rendered that line, so a no-tooltip verdict would measure the FIXTURE \
+         rather than the overlay; more than one means the target is ambiguous",
+        hits.len(),
+        hits.iter().map(|(r, _)| *r).collect::<Vec<_>>()
+    );
+    hits.pop().expect("exactly one hit asserted above")
+}
+
+/// What `arm` painted while the pointer sat on the middle of the published error
+/// span, and — when asked for — what it painted while the pointer sat on a clean
+/// row two lines further down.
+struct ArmHover {
+    on_span: String,
+    off_row: Option<String>,
+}
+
+/// Publish one error, settle `arm`, and hover it.
+///
+/// Two preconditions make a silent result mean "the arm painted no tooltip" and
+/// nothing else: the arm is proven to have rendered (`assert_arm`), and the
+/// published diagnostic is proven to resolve onto a real byte span. Without the
+/// latter a silent tooltip could mean the RESOLVER produced nothing, and
+/// grafting a hover into an expected-absent arm would not turn its pin red —
+/// which is the one property an absence pin has to have.
+fn arm_hover(arm: Arm, with_control: bool) -> ArmHover {
+    let mut app = app_for(arm);
+    app.diagnostics = err_on_line_1();
+    let (p, out) = settled(&mut app, arm);
+    assert!(
+        !app.diagnostic_spans_for_active(app.active).is_empty(),
+        "{arm:?}: the fixture must resolve the published diagnostic onto a real \
+         byte span, otherwise a silent hover measures the RESOLVER rather than \
+         the arm"
+    );
+
+    let (rect, row) = painted_row(&out, ERR_LINE_TEXT);
+    let target = egui::pos2(rect.min.x + row.x_offset(ERR_HOVER_COL), rect.center().y);
+    // Twice: egui raises a tooltip for a pointer that was ALREADY there, so a
+    // single move frame shows nothing on any arm.
+    p.hover(&mut app, target);
+    let on_span = painted_text(&p.hover(&mut app, target));
+
+    let off_row = with_control.then(|| {
+        let (clean, crow) = painted_row(&p.idle(&mut app), CLEAN_LINE_TEXT);
+        assert!(
+            !clean.intersects(rect),
+            "{arm:?}: the control row must be a DIFFERENT row from the erroring \
+             one (error {rect:?}, control {clean:?})"
+        );
+        let away = egui::pos2(clean.min.x + crow.x_offset(ERR_HOVER_COL), clean.center().y);
+        p.hover(&mut app, away);
+        painted_text(&p.hover(&mut app, away))
+    });
+
+    ArmHover { on_span, off_row }
+}
+
+/// The ink says WHERE; only the hover says WHAT. Exactly the four editable arms
+/// surface the message, and the three read-only arms surface nothing.
+///
+/// R1 above pins the squiggle, and a squiggle alone is the two status-bar
+/// integers' worth of information placed on the right line: it does not name the
+/// problem. Cutting the tooltip block out of either painter leaves R1 completely
+/// green, so without this row the whole payload of the diagnostics overlay is
+/// unratcheted on three of the four arms that carry it — `grid_parity_tests`
+/// covers the grid `TextEdit` pane alone.
+///
+/// The two rope arms are the ones this most needed to reach. Their painter's own
+/// doc comment asserts that the hover tooltip is "deliberately the SAME" as the
+/// `TextEdit` overlay's, and `EditorMode::Rope`'s entry-notice tells the user
+/// inline diagnostics still work — two user-facing claims with nothing behind
+/// them. The single-pane `TextEdit` arm was equally unpinned.
+///
+/// The three read-only arms are expected-absent, and deliberately pinned at a
+/// point where a user WOULD hover: `painted_row` proves each of them really
+/// paints the erroring line on screen, so the silence is the missing overlay
+/// rather than a missing line, and grafting a hover registration into any of
+/// them turns this red.
+#[test]
+fn the_diagnostic_hover_names_the_problem_on_exactly_the_four_editable_arms() {
+    // Every cell is evaluated and reported, rather than the first failure
+    // aborting the row. Two arms share ONE painter here (`SRope` and `GRope`
+    // both reach `paint_rope_pane_diagnostics`), so a run that stopped at the
+    // first red would name one of them and leave the other's verdict unstated —
+    // and a matrix that cannot say WHICH cells went red is not a ratchet over
+    // them.
+    let mut red: Vec<String> = Vec::new();
+
+    for arm in [Arm::SRope, Arm::STe, Arm::GRope, Arm::GTe] {
+        let h = arm_hover(arm, true);
+        if !h.on_span.contains(ERR_HOVER) {
+            red.push(format!(
+                "{arm:?}: must paint the severity-prefixed message while the \
+                 pointer sits on the published span — the squiggle says WHERE, \
+                 the hover is the only thing that says WHAT. The frame painted \
+                 no such text"
+            ));
+        }
+        if h.off_row
+            .expect("the control was requested")
+            .contains(ERR_HOVER_PREFIX)
+        {
+            red.push(format!(
+                "{arm:?}: hovering a clean row two lines below must paint NO \
+                 diagnostic tooltip — a tooltip that follows the pointer \
+                 anywhere on the surface is not resolving the span, and would \
+                 make the presence cell pass without the resolver"
+            ));
+        }
+    }
+
+    for arm in [Arm::SFold, Arm::SRo, Arm::GRo] {
+        if arm_hover(arm, false).on_span.contains(ERR_HOVER_PREFIX) {
+            red.push(format!(
+                "{arm:?}: pinned expected-absent for the diagnostic hover — it \
+                 paints no squiggle (R1) and registers no hover rect, so a \
+                 pointer sitting directly on the erroring text names nothing. A \
+                 tooltip appeared, so the arm grew an overlay — flip this pin to \
+                 enforcement rather than weakening it"
+            ));
+        }
+    }
+
+    assert!(
+        red.is_empty(),
+        "{} cell(s) red:\n{}",
+        red.len(),
+        red.join("\n")
+    );
 }
