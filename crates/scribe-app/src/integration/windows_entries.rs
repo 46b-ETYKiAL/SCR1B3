@@ -1490,4 +1490,25 @@ mod unregister_tests {
         }];
         assert_ne!(entries_digest(&a, &[]), entries_digest(&b, &[]));
     }
+
+    /// The stamp is PERSISTED, so `fnv1a64` must produce the specification's
+    /// values and not merely "some stable hash" — that is the whole reason the
+    /// doc comment gives for not using `DefaultHasher`. These are the published
+    /// FNV-1a 64-bit vectors, so the test is anchored OUTSIDE this
+    /// implementation: it cannot be satisfied by whatever the code happens to
+    /// compute, which is what an `assert_ne!`-style self-comparison would do.
+    #[test]
+    fn fnv1a64_matches_the_published_specification_vectors() {
+        for (input, expected) in [
+            ("", 0xcbf2_9ce4_8422_2325_u64),
+            ("a", 0xaf63_dc4c_8601_ec8c),
+            ("foobar", 0x8594_4171_f739_67e8),
+        ] {
+            assert_eq!(
+                fnv1a64(input.as_bytes()),
+                expected,
+                "FNV-1a-64 of {input:?} must match the specification"
+            );
+        }
+    }
 }

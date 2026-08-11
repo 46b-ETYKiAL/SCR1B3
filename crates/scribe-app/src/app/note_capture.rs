@@ -1452,4 +1452,49 @@ mod tests {
             "no edits is genuinely zero links"
         );
     }
+
+    /// A zero in EITHER dimension is a corrupt payload on its own. Asserted
+    /// only with both dimensions zero, the `||` could become `&&` and a
+    /// 0 x N (or N x 0) image would sail past the guard into the encoder.
+    #[test]
+    fn either_zero_dimension_alone_is_rejected() {
+        for (w, h) in [(0usize, 4usize), (4, 0), (0, 0)] {
+            let img = ClipboardImage {
+                width: w,
+                height: h,
+                rgba: Vec::new(),
+            };
+            let err = encode_png(&img).expect_err("{w}x{h} must not encode");
+            assert!(
+                err.contains("no pixels"),
+                "a zero dimension must be rejected as having no pixels, got: {err}"
+            );
+        }
+    }
+
+    /// The date and time digit-count checks are one `||` chain, so EITHER being
+    /// wrong must fall back to the bare stem. Asserted only with both wrong,
+    /// the chain could become `&&` and a half-malformed stamp would produce a
+    /// truncated name like `pasted-20260810-` instead of `pasted`.
+    #[test]
+    fn a_stamp_wrong_in_only_one_half_still_falls_back() {
+        assert_eq!(
+            attachment_stem("2026-08-10T12:34:56Z"),
+            "pasted-20260810-123456",
+            "the control stamp must format, or this test proves nothing"
+        );
+        // Right shape (20 chars, `T` at 10, `Z` at 19) and a well-formed date,
+        // but a time half carrying no digits at all.
+        assert_eq!(
+            attachment_stem("2026-08-10Tab:cd:efZ"),
+            "pasted",
+            "a bad time half alone falls back"
+        );
+        // ...and the mirror: a good time half with a date carrying no digits.
+        assert_eq!(
+            attachment_stem("abcd-ef-ghT12:34:56Z"),
+            "pasted",
+            "a bad date half alone falls back"
+        );
+    }
 }
