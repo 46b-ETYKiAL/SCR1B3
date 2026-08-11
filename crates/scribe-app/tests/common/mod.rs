@@ -447,7 +447,25 @@ pub fn is_excluded(path: &Path, test_mods: &BTreeSet<String>, skip_names: &[Stri
         .unwrap_or_default();
     // The settings UI RENDERS the control; reading a field there is what makes
     // it a control, not what makes it wired.
-    if file_name == "settings.rs" || skip_names.contains(&file_name) {
+    //
+    // Keyed on the whole settings MODULE, not the single file name: the panel is
+    // being decomposed from one 4.5k-line `settings.rs` into per-page siblings
+    // under `settings/`, and those pages are the same UI doing the same thing.
+    // A name-only key would let `settings/appearance.rs` re-enter the corpus the
+    // moment it was created, where its `config.appearance.*` reads would count
+    // as a runtime consumer — and a control that NOTHING outside settings reads
+    // would start looking wired. That failure is silent and permanent: the guard
+    // keeps passing while it has stopped guarding. Widening here is the safe
+    // direction (it can only make MORE fields look unwired, which fails loudly);
+    // narrowing is what kills the check.
+    // Matched on the ANCESTOR chain, not just the immediate parent, so a page
+    // later nested one level deeper cannot quietly re-enter the corpus. Taking
+    // `parent()` first means a FILE called `settings` is not caught by this arm.
+    let in_settings_module = file_name == "settings.rs"
+        || path
+            .parent()
+            .is_some_and(|p| p.components().any(|c| c.as_os_str() == "settings"));
+    if in_settings_module || skip_names.contains(&file_name) {
         return true;
     }
     let stem = path

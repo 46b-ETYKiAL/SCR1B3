@@ -231,6 +231,70 @@ exclude_re = [
   '\brender_toolbar_editor\b',
   '\btoolbar_list_editor\b',
   'settings\.rs.*\bshow\b',
+  # settings/chrome.rs — the page-chrome helpers (`space`/`group`/`head`) that
+  # were closures INSIDE `render_sections` until the settings decomposition.
+  # Their bodies are unchanged: ui.add_space / ui.label / ui.heading /
+  # ui.separator only — painted pixels, `-> ()`, no app-observable state
+  # (ADR-0007 egui-paint). They were already pardoned as part of
+  # `\brender_sections\b`; lifting them to free functions is why they now need
+  # to be named, and the pardon set is SCOPE-PRESERVING, not widened: the lift
+  # moved 1 mutant out of render_sections (192 -> 191) and produced 4 here, the
+  # 3 extra being the whole-function `with ()` shape a closure never generates.
+  # FILE-QUALIFIED, not `\b`-bounded bare: `space`, `group` and `head` are
+  # common words that would collide across the tree (the same reason `show` is
+  # file-scoped above). `head` in particular must not reach `TableHead` arms in
+  # md_preview.rs, and `group` must not reach egui `group(` calls elsewhere.
+  'settings/chrome\.rs.*\bspace\b',
+  'settings/chrome\.rs.*\bgroup\b',
+  'settings/chrome\.rs.*\bhead\b',
+  # settings/<page>.rs — the category pages lifted OUT of `render_sections` by
+  # the settings decomposition. Each is one `if section_visible(…) { … }` block
+  # moved verbatim, at the same indent, into its own module; the bodies are
+  # unchanged. They were already pardoned as part of `\brender_sections\b`, and
+  # the pardon set stays SCOPE-PRESERVING rather than widened — measured per
+  # page with `cargo mutants --list`, the mutants leaving `render_sections`
+  # match the mutants arriving in the page, plus exactly two whole-function
+  # `-> bool` shapes (`with true` / `with false`) that a nested block never
+  # generates, minus one `|=` mutant on the new call line that STAYS gated in
+  # `render_sections`. Every page is a pure egui-paint surface under the
+  # ADR-0007 policy: its survivors are observable only through GPU-painted
+  # pixels or live-frame widget interaction. The pure LOGIC each block once
+  # inlined is EXTRACTED and separately unit-tested (parse_hex_color,
+  # step_theme_index, step_index, nudge_up/nudge_down, section_visible,
+  # row_visible, action_label, apply_toolbar_drop, apply_keyboard_move,
+  # reporting_mode_label) and those helpers live in `settings.rs`, NOT in these
+  # pages — so a whole-page pardon hides no logic gap.
+  #
+  # FILE-QUALIFIED, never `\b`-bounded bare. Every page's entry point is called
+  # `render`, and a bare `\brender\b` would also match the two OTHER functions
+  # named exactly `render` in this tree — `md_preview/math.rs::render` and
+  # `scribe-core/src/notes/template.rs::render`. Both are pure `-> String` logic
+  # that IS unit-testable and MUST stay mutation-gated; pardoning them by
+  # accident would be a silent green. File-qualifying is the same discipline
+  # `show`, `space`, `group` and `head` already follow above.
+  #
+  # Per-page mutant accounting (render_sections baseline 191 after the chrome
+  # lift):
+  #   appearance : render_sections 191 -> 177, appearance.rs 17 (15 moved + 2)
+  #   fonts+editor: render_sections 177 ->  81, fonts.rs 40 + editor.rs 62
+  #                 (98 moved + 4 whole-fn, 2 call-line `|=` stay gated)
+  #   motion+window+spellcheck: render_sections 81 -> 22, motion.rs 45 +
+  #                 window.rs 11 + spellcheck.rs 12 (62 moved + 6 whole-fn,
+  #                 3 call-line `|=` stay gated)
+  'settings/appearance\.rs.*\brender\b',
+  'settings/fonts\.rs.*\brender\b',
+  'settings/editor\.rs.*\brender\b',
+  #   updates+privacy+plugins+default_app: render_sections 22 -> 12,
+  #                 updates.rs 9 + privacy.rs 4 + plugins.rs 3 +
+  #                 default_app.rs 6 (14 moved + 8 whole-fn, 4 call-line `|=`
+  #                 stay gated)
+  'settings/motion\.rs.*\brender\b',
+  'settings/window\.rs.*\brender\b',
+  'settings/spellcheck\.rs.*\brender\b',
+  'settings/updates\.rs.*\brender\b',
+  'settings/privacy\.rs.*\brender\b',
+  'settings/plugins\.rs.*\brender\b',
+  'settings/default_app\.rs.*\brender\b',
   # app/chrome.rs frameless-window chrome painting
   '\bcaption_btn\b',
   '\bhandle_frameless_resize\b',
