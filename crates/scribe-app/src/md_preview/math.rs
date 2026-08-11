@@ -733,306 +733,6 @@ mod tests {
         assert_eq!(math_to_unicode("ℝ^2"), "ℝ²");
     }
 
-    /// Every arm of the `superscript` table, exhaustively.
-    ///
-    /// cargo-mutants plants a `delete match arm 'X'` mutant on each arm; a
-    /// deleted arm falls through to the `_ => return None` catch-all, so
-    /// asserting the whole table kills that family in one test. The negative
-    /// cases pin the catch-all itself, so widening the table is also a failure.
-    #[test]
-    fn superscript_table_maps_every_arm() {
-        const TABLE: &[(char, char)] = &[
-            ('0', '⁰'),
-            ('1', '¹'),
-            ('2', '²'),
-            ('3', '³'),
-            ('4', '⁴'),
-            ('5', '⁵'),
-            ('6', '⁶'),
-            ('7', '⁷'),
-            ('8', '⁸'),
-            ('9', '⁹'),
-            ('+', '⁺'),
-            ('-', '⁻'),
-            ('−', '⁻'),
-            ('=', '⁼'),
-            ('(', '⁽'),
-            (')', '⁾'),
-            ('a', 'ᵃ'),
-            ('b', 'ᵇ'),
-            ('c', 'ᶜ'),
-            ('d', 'ᵈ'),
-            ('e', 'ᵉ'),
-            ('f', 'ᶠ'),
-            ('g', 'ᵍ'),
-            ('h', 'ʰ'),
-            ('i', 'ⁱ'),
-            ('j', 'ʲ'),
-            ('k', 'ᵏ'),
-            ('l', 'ˡ'),
-            ('m', 'ᵐ'),
-            ('n', 'ⁿ'),
-            ('o', 'ᵒ'),
-            ('p', 'ᵖ'),
-            ('r', 'ʳ'),
-            ('s', 'ˢ'),
-            ('t', 'ᵗ'),
-            ('u', 'ᵘ'),
-            ('v', 'ᵛ'),
-            ('w', 'ʷ'),
-            ('x', 'ˣ'),
-            ('y', 'ʸ'),
-            ('z', 'ᶻ'),
-            ('A', 'ᴬ'),
-            ('B', 'ᴮ'),
-            ('D', 'ᴰ'),
-            ('E', 'ᴱ'),
-            ('G', 'ᴳ'),
-            ('H', 'ᴴ'),
-            ('I', 'ᴵ'),
-            ('J', 'ᴶ'),
-            ('K', 'ᴷ'),
-            ('L', 'ᴸ'),
-            ('M', 'ᴹ'),
-            ('N', 'ᴺ'),
-            ('O', 'ᴼ'),
-            ('P', 'ᴾ'),
-            ('R', 'ᴿ'),
-            ('T', 'ᵀ'),
-            ('U', 'ᵁ'),
-            ('V', 'ⱽ'),
-            ('W', 'ᵂ'),
-        ];
-        for &(input, expected) in TABLE {
-            assert_eq!(
-                superscript(input),
-                Some(expected),
-                "superscript({input:?}) must map to {expected:?}"
-            );
-        }
-        for input in ['q', 'C', 'F', 'Q', 'S', 'X', 'Y', 'Z', '*', '/', '%'] {
-            assert_eq!(
-                superscript(input),
-                None,
-                "superscript({input:?}) has no Unicode form and must return None"
-            );
-        }
-    }
-
-    /// Every arm of the `subscript` table, exhaustively (see the superscript
-    /// twin above for why this is table-driven rather than per-arm).
-    #[test]
-    fn subscript_table_maps_every_arm() {
-        const TABLE: &[(char, char)] = &[
-            ('0', '₀'),
-            ('1', '₁'),
-            ('2', '₂'),
-            ('3', '₃'),
-            ('4', '₄'),
-            ('5', '₅'),
-            ('6', '₆'),
-            ('7', '₇'),
-            ('8', '₈'),
-            ('9', '₉'),
-            ('+', '₊'),
-            ('-', '₋'),
-            ('−', '₋'),
-            ('=', '₌'),
-            ('(', '₍'),
-            (')', '₎'),
-            ('a', 'ₐ'),
-            ('e', 'ₑ'),
-            ('h', 'ₕ'),
-            ('i', 'ᵢ'),
-            ('j', 'ⱼ'),
-            ('k', 'ₖ'),
-            ('l', 'ₗ'),
-            ('m', 'ₘ'),
-            ('n', 'ₙ'),
-            ('o', 'ₒ'),
-            ('p', 'ₚ'),
-            ('r', 'ᵣ'),
-            ('s', 'ₛ'),
-            ('t', 'ₜ'),
-            ('u', 'ᵤ'),
-            ('v', 'ᵥ'),
-            ('x', 'ₓ'),
-        ];
-        for &(input, expected) in TABLE {
-            assert_eq!(
-                subscript(input),
-                Some(expected),
-                "subscript({input:?}) must map to {expected:?}"
-            );
-        }
-        for input in [
-            'b', 'c', 'd', 'f', 'g', 'q', 'w', 'y', 'z', 'A', 'Z', '*', '/',
-        ] {
-            assert_eq!(
-                subscript(input),
-                None,
-                "subscript({input:?}) has no Unicode form and must return None"
-            );
-        }
-    }
-
-    /// Every arm of the `symbol` command table, exhaustively — including both
-    /// names of every aliased arm (`\leq`/`\le`, `\to`/`\rightarrow`, …), so
-    /// deleting a whole multi-pattern arm cannot hide behind its twin.
-    #[test]
-    fn symbol_table_maps_every_arm() {
-        const TABLE: &[(&str, &str)] = &[
-            ("alpha", "α"),
-            ("beta", "β"),
-            ("gamma", "γ"),
-            ("delta", "δ"),
-            ("epsilon", "ε"),
-            ("varepsilon", "ε"),
-            ("zeta", "ζ"),
-            ("eta", "η"),
-            ("theta", "θ"),
-            ("vartheta", "ϑ"),
-            ("iota", "ι"),
-            ("kappa", "κ"),
-            ("lambda", "λ"),
-            ("mu", "μ"),
-            ("nu", "ν"),
-            ("xi", "ξ"),
-            ("pi", "π"),
-            ("rho", "ρ"),
-            ("sigma", "σ"),
-            ("tau", "τ"),
-            ("upsilon", "υ"),
-            ("phi", "φ"),
-            ("varphi", "ϕ"),
-            ("chi", "χ"),
-            ("psi", "ψ"),
-            ("omega", "ω"),
-            ("Gamma", "Γ"),
-            ("Delta", "Δ"),
-            ("Theta", "Θ"),
-            ("Lambda", "Λ"),
-            ("Xi", "Ξ"),
-            ("Pi", "Π"),
-            ("Sigma", "Σ"),
-            ("Upsilon", "Υ"),
-            ("Phi", "Φ"),
-            ("Psi", "Ψ"),
-            ("Omega", "Ω"),
-            ("leq", "≤"),
-            ("le", "≤"),
-            ("geq", "≥"),
-            ("ge", "≥"),
-            ("neq", "≠"),
-            ("ne", "≠"),
-            ("approx", "≈"),
-            ("equiv", "≡"),
-            ("sim", "∼"),
-            ("simeq", "≃"),
-            ("cong", "≅"),
-            ("propto", "∝"),
-            ("ll", "≪"),
-            ("gg", "≫"),
-            ("times", "×"),
-            ("div", "÷"),
-            ("pm", "±"),
-            ("mp", "∓"),
-            ("cdot", "·"),
-            ("ast", "∗"),
-            ("star", "⋆"),
-            ("circ", "∘"),
-            ("bullet", "∙"),
-            ("oplus", "⊕"),
-            ("otimes", "⊗"),
-            ("sum", "∑"),
-            ("prod", "∏"),
-            ("coprod", "∐"),
-            ("int", "∫"),
-            ("iint", "∬"),
-            ("oint", "∮"),
-            ("bigcup", "⋃"),
-            ("bigcap", "⋂"),
-            ("in", "∈"),
-            ("notin", "∉"),
-            ("ni", "∋"),
-            ("subset", "⊂"),
-            ("subseteq", "⊆"),
-            ("supset", "⊃"),
-            ("supseteq", "⊇"),
-            ("cup", "∪"),
-            ("cap", "∩"),
-            ("setminus", "∖"),
-            ("emptyset", "∅"),
-            ("varnothing", "∅"),
-            ("forall", "∀"),
-            ("exists", "∃"),
-            ("nexists", "∄"),
-            ("neg", "¬"),
-            ("lnot", "¬"),
-            ("land", "∧"),
-            ("wedge", "∧"),
-            ("lor", "∨"),
-            ("vee", "∨"),
-            ("therefore", "∴"),
-            ("because", "∵"),
-            ("to", "→"),
-            ("rightarrow", "→"),
-            ("leftarrow", "←"),
-            ("gets", "←"),
-            ("leftrightarrow", "↔"),
-            ("Rightarrow", "⇒"),
-            ("implies", "⇒"),
-            ("Leftarrow", "⇐"),
-            ("Leftrightarrow", "⇔"),
-            ("iff", "⇔"),
-            ("mapsto", "↦"),
-            ("uparrow", "↑"),
-            ("downarrow", "↓"),
-            ("infty", "∞"),
-            ("partial", "∂"),
-            ("nabla", "∇"),
-            ("angle", "∠"),
-            ("perp", "⊥"),
-            ("parallel", "∥"),
-            ("degree", "°"),
-            ("prime", "′"),
-            ("hbar", "ℏ"),
-            ("ell", "ℓ"),
-            ("Re", "ℜ"),
-            ("Im", "ℑ"),
-            ("aleph", "ℵ"),
-            ("ldots", "…"),
-            ("dots", "…"),
-            ("cdots", "⋯"),
-            ("vdots", "⋮"),
-            ("ddots", "⋱"),
-            ("checkmark", "✓"),
-            ("sin", "sin"),
-            ("cos", "cos"),
-            ("tan", "tan"),
-            ("log", "log"),
-            ("ln", "ln"),
-            ("exp", "exp"),
-            ("min", "min"),
-            ("max", "max"),
-            ("lim", "lim"),
-        ];
-        for &(input, expected) in TABLE {
-            assert_eq!(
-                symbol(input),
-                Some(expected),
-                "symbol({input:?}) must map to {expected:?}"
-            );
-        }
-        for input in ["", "notacommand", "alpha_", "Alpha", "LEQ"] {
-            assert_eq!(
-                symbol(input),
-                None,
-                "symbol({input:?}) is not a known command and must return None"
-            );
-        }
-    }
-
     /// The depth cap must be driven by EVERY recursing construct, not just
     /// `\sqrt` (which the test above already pins). Each fragment below nests
     /// one construct past `MAX_DEPTH`; if that construct stopped incrementing
@@ -1234,5 +934,561 @@ mod tests {
         // carry the kill — and to keep a later reader from assuming the two
         // directions are interchangeable.
         assert_eq!(math_to_unicode(r"\sqrt{a\{b}"), "√(a{b)");
+    }
+
+    /// Every `(input, output)` pair in [`superscript`]'s table, transcribed
+    /// arm-for-arm from the source. The two-input arm `'-' | '−'` appears as
+    /// both of its inputs.
+    const SUPERSCRIPT_CASES: &[(char, char)] = &[
+        ('0', '⁰'),
+        ('1', '¹'),
+        ('2', '²'),
+        ('3', '³'),
+        ('4', '⁴'),
+        ('5', '⁵'),
+        ('6', '⁶'),
+        ('7', '⁷'),
+        ('8', '⁸'),
+        ('9', '⁹'),
+        ('+', '⁺'),
+        ('-', '⁻'),
+        ('−', '⁻'),
+        ('=', '⁼'),
+        ('(', '⁽'),
+        (')', '⁾'),
+        ('a', 'ᵃ'),
+        ('b', 'ᵇ'),
+        ('c', 'ᶜ'),
+        ('d', 'ᵈ'),
+        ('e', 'ᵉ'),
+        ('f', 'ᶠ'),
+        ('g', 'ᵍ'),
+        ('h', 'ʰ'),
+        ('i', 'ⁱ'),
+        ('j', 'ʲ'),
+        ('k', 'ᵏ'),
+        ('l', 'ˡ'),
+        ('m', 'ᵐ'),
+        ('n', 'ⁿ'),
+        ('o', 'ᵒ'),
+        ('p', 'ᵖ'),
+        ('r', 'ʳ'),
+        ('s', 'ˢ'),
+        ('t', 'ᵗ'),
+        ('u', 'ᵘ'),
+        ('v', 'ᵛ'),
+        ('w', 'ʷ'),
+        ('x', 'ˣ'),
+        ('y', 'ʸ'),
+        ('z', 'ᶻ'),
+        ('A', 'ᴬ'),
+        ('B', 'ᴮ'),
+        ('D', 'ᴰ'),
+        ('E', 'ᴱ'),
+        ('G', 'ᴳ'),
+        ('H', 'ᴴ'),
+        ('I', 'ᴵ'),
+        ('J', 'ᴶ'),
+        ('K', 'ᴷ'),
+        ('L', 'ᴸ'),
+        ('M', 'ᴹ'),
+        ('N', 'ᴺ'),
+        ('O', 'ᴼ'),
+        ('P', 'ᴾ'),
+        ('R', 'ᴿ'),
+        ('T', 'ᵀ'),
+        ('U', 'ᵁ'),
+        ('V', 'ⱽ'),
+        ('W', 'ᵂ'),
+    ];
+
+    /// Every `(input, output)` pair in [`subscript`]'s table.
+    const SUBSCRIPT_CASES: &[(char, char)] = &[
+        ('0', '₀'),
+        ('1', '₁'),
+        ('2', '₂'),
+        ('3', '₃'),
+        ('4', '₄'),
+        ('5', '₅'),
+        ('6', '₆'),
+        ('7', '₇'),
+        ('8', '₈'),
+        ('9', '₉'),
+        ('+', '₊'),
+        ('-', '₋'),
+        ('−', '₋'),
+        ('=', '₌'),
+        ('(', '₍'),
+        (')', '₎'),
+        ('a', 'ₐ'),
+        ('e', 'ₑ'),
+        ('h', 'ₕ'),
+        ('i', 'ᵢ'),
+        ('j', 'ⱼ'),
+        ('k', 'ₖ'),
+        ('l', 'ₗ'),
+        ('m', 'ₘ'),
+        ('n', 'ₙ'),
+        ('o', 'ₒ'),
+        ('p', 'ₚ'),
+        ('r', 'ᵣ'),
+        ('s', 'ₛ'),
+        ('t', 'ₜ'),
+        ('u', 'ᵤ'),
+        ('v', 'ᵥ'),
+        ('x', 'ₓ'),
+    ];
+
+    /// The only arm in either script table that accepts more than one input:
+    /// ASCII hyphen-minus and U+2212 MINUS SIGN share one mapping.
+    const MINUS_ALIASES: &[char] = &['-', '−'];
+
+    /// Every `(command name, output)` pair in [`symbol`]'s table, including
+    /// each alias of a multi-name arm (`\leq` / `\le`, …).
+    const SYMBOL_CASES: &[(&str, &str)] = &[
+        // ---- lower-case Greek ----
+        ("alpha", "α"),
+        ("beta", "β"),
+        ("gamma", "γ"),
+        ("delta", "δ"),
+        ("epsilon", "ε"),
+        ("varepsilon", "ε"),
+        ("zeta", "ζ"),
+        ("eta", "η"),
+        ("theta", "θ"),
+        ("vartheta", "ϑ"),
+        ("iota", "ι"),
+        ("kappa", "κ"),
+        ("lambda", "λ"),
+        ("mu", "μ"),
+        ("nu", "ν"),
+        ("xi", "ξ"),
+        ("pi", "π"),
+        ("rho", "ρ"),
+        ("sigma", "σ"),
+        ("tau", "τ"),
+        ("upsilon", "υ"),
+        ("phi", "φ"),
+        ("varphi", "ϕ"),
+        ("chi", "χ"),
+        ("psi", "ψ"),
+        ("omega", "ω"),
+        // ---- upper-case Greek ----
+        ("Gamma", "Γ"),
+        ("Delta", "Δ"),
+        ("Theta", "Θ"),
+        ("Lambda", "Λ"),
+        ("Xi", "Ξ"),
+        ("Pi", "Π"),
+        ("Sigma", "Σ"),
+        ("Upsilon", "Υ"),
+        ("Phi", "Φ"),
+        ("Psi", "Ψ"),
+        ("Omega", "Ω"),
+        // ---- relations ----
+        ("leq", "≤"),
+        ("le", "≤"),
+        ("geq", "≥"),
+        ("ge", "≥"),
+        ("neq", "≠"),
+        ("ne", "≠"),
+        ("approx", "≈"),
+        ("equiv", "≡"),
+        ("sim", "∼"),
+        ("simeq", "≃"),
+        ("cong", "≅"),
+        ("propto", "∝"),
+        ("ll", "≪"),
+        ("gg", "≫"),
+        // ---- operators ----
+        ("times", "×"),
+        ("div", "÷"),
+        ("pm", "±"),
+        ("mp", "∓"),
+        ("cdot", "·"),
+        ("ast", "∗"),
+        ("star", "⋆"),
+        ("circ", "∘"),
+        ("bullet", "∙"),
+        ("oplus", "⊕"),
+        ("otimes", "⊗"),
+        // ---- big operators ----
+        ("sum", "∑"),
+        ("prod", "∏"),
+        ("coprod", "∐"),
+        ("int", "∫"),
+        ("iint", "∬"),
+        ("oint", "∮"),
+        ("bigcup", "⋃"),
+        ("bigcap", "⋂"),
+        // ---- sets & logic ----
+        ("in", "∈"),
+        ("notin", "∉"),
+        ("ni", "∋"),
+        ("subset", "⊂"),
+        ("subseteq", "⊆"),
+        ("supset", "⊃"),
+        ("supseteq", "⊇"),
+        ("cup", "∪"),
+        ("cap", "∩"),
+        ("setminus", "∖"),
+        ("emptyset", "∅"),
+        ("varnothing", "∅"),
+        ("forall", "∀"),
+        ("exists", "∃"),
+        ("nexists", "∄"),
+        ("neg", "¬"),
+        ("lnot", "¬"),
+        ("land", "∧"),
+        ("wedge", "∧"),
+        ("lor", "∨"),
+        ("vee", "∨"),
+        ("therefore", "∴"),
+        ("because", "∵"),
+        // ---- arrows ----
+        ("to", "→"),
+        ("rightarrow", "→"),
+        ("leftarrow", "←"),
+        ("gets", "←"),
+        ("leftrightarrow", "↔"),
+        ("Rightarrow", "⇒"),
+        ("implies", "⇒"),
+        ("Leftarrow", "⇐"),
+        ("Leftrightarrow", "⇔"),
+        ("iff", "⇔"),
+        ("mapsto", "↦"),
+        ("uparrow", "↑"),
+        ("downarrow", "↓"),
+        // ---- misc ----
+        ("infty", "∞"),
+        ("partial", "∂"),
+        ("nabla", "∇"),
+        ("angle", "∠"),
+        ("perp", "⊥"),
+        ("parallel", "∥"),
+        ("degree", "°"),
+        ("prime", "′"),
+        ("hbar", "ℏ"),
+        ("ell", "ℓ"),
+        ("Re", "ℜ"),
+        ("Im", "ℑ"),
+        ("aleph", "ℵ"),
+        ("ldots", "…"),
+        ("dots", "…"),
+        ("cdots", "⋯"),
+        ("vdots", "⋮"),
+        ("ddots", "⋱"),
+        ("checkmark", "✓"),
+        // ---- named functions ----
+        ("sin", "sin"),
+        ("cos", "cos"),
+        ("tan", "tan"),
+        ("log", "log"),
+        ("ln", "ln"),
+        ("exp", "exp"),
+        ("min", "min"),
+        ("max", "max"),
+        ("lim", "lim"),
+    ];
+
+    /// Characters with NO arm in [`superscript`] — the control that proves the
+    /// table's fallthrough really is `_ => return None`.
+    const SUPERSCRIPT_UNMAPPED: &[char] = &[
+        ' ', '!', '"', '#', '$', '%', '&', '\'', '*', ',', '.', '/', ':', ';', '<', '>', '?', '@',
+        'C', 'F', 'Q', 'S', 'X', 'Y', 'Z', '[', '\\', ']', '^', '_', '`', 'q', '{', '|', '}', '~',
+        'α', 'π', '日', '→',
+    ];
+
+    /// Characters with NO arm in [`subscript`].
+    const SUBSCRIPT_UNMAPPED: &[char] = &[
+        ' ', '!', '"', '#', '$', '%', '&', '\'', '*', ',', '.', '/', ':', ';', '<', '>', '?', '@',
+        'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R',
+        'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z', '[', '\\', ']', '^', '_', '`', 'b', 'c', 'd', 'f',
+        'g', 'q', 'w', 'y', 'z', '{', '|', '}', '~', 'α', 'π', '日', '→',
+    ];
+
+    #[test]
+    fn superscript_maps_every_arm_of_its_table() {
+        // One assertion per arm. `superscript`'s ONLY fallthrough is
+        // `_ => return None` (math.rs:314), so deleting any arm turns that
+        // key's answer from `Some(glyph)` into `None` — which is exactly what
+        // this loop catches. Reaching these arms through `math_to_unicode`
+        // instead would leave most of the table unasserted.
+        for &(input, expected) in SUPERSCRIPT_CASES {
+            assert_eq!(
+                superscript(input),
+                Some(expected),
+                "superscript({input:?}) must map to {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn subscript_maps_every_arm_of_its_table() {
+        for &(input, expected) in SUBSCRIPT_CASES {
+            assert_eq!(
+                subscript(input),
+                Some(expected),
+                "subscript({input:?}) must map to {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn script_tables_return_none_for_every_unmapped_character() {
+        // The control that keeps the two tests above from being vacuous. They
+        // assert `Some(x)`; this asserts the fallthrough really is `None`, so a
+        // deleted arm genuinely changes the answer rather than landing on some
+        // other arm that happens to produce the same glyph.
+        for &c in SUPERSCRIPT_UNMAPPED {
+            assert_eq!(superscript(c), None, "superscript({c:?}) must not map");
+        }
+        for &c in SUBSCRIPT_UNMAPPED {
+            assert_eq!(subscript(c), None, "subscript({c:?}) must not map");
+        }
+    }
+
+    #[test]
+    fn script_table_outputs_are_distinct_within_each_table() {
+        // Two arms producing the SAME glyph would be indistinguishable in the
+        // preview. The one sanctioned collision is the single two-input arm
+        // `'-' | '−'` (math.rs:266 / :332), which is one arm, not two.
+        //
+        // The outputs are read back from the FUNCTIONS, not from the const
+        // tables above: asserting distinctness over the fixture data would only
+        // prove this file is self-consistent, which no change to the source
+        // could ever falsify.
+        use std::collections::HashMap;
+
+        let check = |label: &str, cases: &[(char, char)], map: fn(char) -> Option<char>| {
+            let mut by_output: HashMap<char, Vec<char>> = HashMap::new();
+            for &(input, _) in cases {
+                if let Some(output) = map(input) {
+                    by_output.entry(output).or_default().push(input);
+                }
+            }
+            for (output, inputs) in &by_output {
+                assert!(
+                    inputs.len() == 1 || inputs.as_slice() == MINUS_ALIASES,
+                    "{label}: {output:?} is produced by more than one arm: {inputs:?}"
+                );
+            }
+        };
+        check("superscript", SUPERSCRIPT_CASES, superscript);
+        check("subscript", SUBSCRIPT_CASES, subscript);
+    }
+
+    #[test]
+    fn symbol_maps_every_command_name_in_its_table() {
+        // Same shape as the script tables: `symbol`'s only fallthrough is
+        // `_ => return None` (math.rs:491), so a deleted arm turns its name(s)
+        // into an unknown command and `render_command` then emits the raw TeX.
+        // Every alias of a multi-name arm is listed so a future edit that
+        // splits an arm cannot silently drop one of its names.
+        for &(name, expected) in SYMBOL_CASES {
+            assert_eq!(
+                symbol(name),
+                Some(expected),
+                "\\{name} must map to {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn symbol_returns_none_for_everything_outside_its_table() {
+        // The control for the test above, and the boundary with
+        // `render_command`: `frac`/`sqrt`/`text`/`left`/`quad` are handled by
+        // the command match (math.rs:107-134) and are deliberately NOT symbols,
+        // so `symbol` must reject them. Matching is exact — no prefix, no
+        // suffix, no case folding.
+        let unknown = [
+            "frac",
+            "dfrac",
+            "tfrac",
+            "sqrt",
+            "text",
+            "mathrm",
+            "mathbf",
+            "left",
+            "right",
+            "quad",
+            "qquad",
+            "displaystyle",
+            "weirdmacro",
+            "notacommand",
+            "alpha_",
+            "unknown",
+            "",
+            "alph",
+            "alphaa",
+            "Alpha",
+            "ALPHA",
+            "Sin",
+            "LEQ",
+            "l",
+            "s",
+        ];
+        for name in unknown {
+            assert_eq!(symbol(name), None, "\\{name} must not resolve to a symbol");
+        }
+    }
+
+    #[test]
+    fn variant_greek_letters_agree_or_differ_exactly_as_the_table_says() {
+        // `epsilon`/`varepsilon` are two separate arms (math.rs:365-366) that
+        // deliberately share one glyph; the other `var*` pairs deliberately do
+        // NOT. This pins the intent so a copy-paste edit cannot quietly make
+        // `vartheta` render as `theta`.
+        assert_eq!(symbol("epsilon"), symbol("varepsilon"));
+        assert_ne!(symbol("theta"), symbol("vartheta"));
+        assert_ne!(symbol("phi"), symbol("varphi"));
+    }
+
+    #[test]
+    fn to_script_maps_only_when_every_character_has_a_form() {
+        // All-or-nothing: one unmappable character rejects the whole group.
+        assert_eq!(to_script("x2", true), Some("ˣ²".to_string()));
+        assert_eq!(to_script("x2", false), Some("ₓ₂".to_string()));
+        assert_eq!(to_script("q", true), None, "'q' has no superscript form");
+        assert_eq!(to_script("b", false), None, "'b' has no subscript form");
+        assert_eq!(
+            to_script("2q", true),
+            None,
+            "one bad char rejects the group"
+        );
+        // An empty string is None, NOT `Some("")` — that is what keeps the
+        // caller emitting a bare `^` for an empty group instead of nothing.
+        assert_eq!(to_script("", true), None);
+        assert_eq!(to_script("", false), None);
+        // The `sup` flag really does select the table: 'i' has BOTH forms and
+        // they are different glyphs, so a flipped flag cannot hide here.
+        assert_ne!(to_script("i", true), to_script("i", false));
+    }
+
+    #[test]
+    fn paren_if_compound_wraps_only_multi_character_fragments() {
+        assert_eq!(paren_if_compound(""), "");
+        assert_eq!(paren_if_compound("a"), "a");
+        assert_eq!(paren_if_compound("ab"), "(ab)");
+        // Counted in CHARACTERS, not bytes: a single multi-byte glyph is one
+        // character and must not be parenthesised.
+        assert_eq!(paren_if_compound("α"), "α");
+        assert_eq!(paren_if_compound("αβ"), "(αβ)");
+    }
+
+    #[test]
+    fn math_to_unicode_trims_the_rendered_result() {
+        assert_eq!(math_to_unicode("  x + y  "), "x + y");
+        // A leading command that renders to whitespace is trimmed too.
+        assert_eq!(math_to_unicode("\\quad x"), "x");
+    }
+
+    #[test]
+    fn every_explicit_space_command_renders_one_space() {
+        // `\,` `\;` `\:` and `\ ` all collapse to a single space (math.rs:89),
+        // and a `\\` line break becomes one too (math.rs:93). Without those
+        // arms each falls through to `other => out.push(other)` and the raw
+        // punctuation would appear instead.
+        for tex in ["a\\,b", "a\\;b", "a\\:b", "a\\ b", "a\\\\b"] {
+            assert_eq!(math_to_unicode(tex), "a b", "{tex} must render as `a b`");
+        }
+        // The negative thin space renders as nothing at all (math.rs:91).
+        assert_eq!(math_to_unicode("a\\!b"), "ab");
+    }
+
+    #[test]
+    fn frac_aliases_and_font_wrappers_all_resolve() {
+        // Each alias of the `frac` arm and each wrapper of the font arm.
+        assert_eq!(math_to_unicode("\\dfrac{a}{b}"), "a/b");
+        assert_eq!(math_to_unicode("\\tfrac{a}{b}"), "a/b");
+        assert_eq!(math_to_unicode("\\mathbf{x}"), "x");
+        assert_eq!(math_to_unicode("\\mathit{y}"), "y");
+        assert_eq!(math_to_unicode("\\mathsf{z}"), "z");
+        assert_eq!(math_to_unicode("\\mathtt{w}"), "w");
+        assert_eq!(math_to_unicode("\\operatorname{arg}"), "arg");
+    }
+
+    #[test]
+    fn sizing_and_delimiter_commands_expand_to_nothing() {
+        // The delimiter that FOLLOWS is emitted by the normal path; the sizing
+        // command itself must vanish. If the arm were gone, `symbol` would
+        // return None and the raw `\bigl` would be printed.
+        assert_eq!(math_to_unicode("\\bigl( x \\bigr)"), "( x )");
+        assert_eq!(math_to_unicode("\\Bigl[ y \\Bigr]"), "[ y ]");
+        assert_eq!(math_to_unicode("\\big| z \\big|"), "| z |");
+        assert_eq!(math_to_unicode("\\Big( w \\Big)"), "( w )");
+        assert_eq!(math_to_unicode("\\displaystyle x"), "x");
+    }
+
+    #[test]
+    fn frac_without_a_denominator_omits_the_separator() {
+        // A dangling `a/` reads as a typo rather than as the partial fraction
+        // it is, so the separator is tied to having an actual denominator
+        // (math.rs:116).
+        assert_eq!(math_to_unicode("\\frac{a}{}"), "a");
+        assert_eq!(math_to_unicode("\\frac{a}"), "a");
+        // …and a well-formed fraction still gets it.
+        assert_eq!(math_to_unicode("\\frac{a}{b}"), "a/b");
+    }
+
+    #[test]
+    fn read_group_skips_whitespace_before_its_argument() {
+        // Without the skip loop (math.rs:180) the space itself becomes the
+        // argument and the fraction renders as ` /a`.
+        assert_eq!(math_to_unicode("\\frac {a} {b}"), "a/b");
+        assert_eq!(math_to_unicode("\\sqrt  {x+y}"), "√(x+y)");
+    }
+
+    #[test]
+    fn read_group_ignores_an_escaped_brace_while_scanning() {
+        // The `'\\' => *i += 1` arm (math.rs:192) steps over the escaped brace
+        // so it cannot unbalance the scan. Without it the group ends early at
+        // the `\}` and the tail leaks out of the radical.
+        assert_eq!(math_to_unicode("\\sqrt{a\\}b}"), "√(a}b)");
+    }
+
+    #[test]
+    fn read_group_takes_a_non_alphabetic_command_whole() {
+        // `\{` is a two-character command; the `else if` at math.rs:216 is what
+        // consumes its second character into the argument.
+        assert_eq!(math_to_unicode("\\sqrt\\{x"), "√{x");
+    }
+
+    #[test]
+    fn an_empty_rendered_script_group_keeps_the_bare_marker() {
+        // `{}` inside the group renders to nothing, so `to_script` is handed an
+        // EMPTY string. Its `is_empty` guard (math.rs:241) is what turns that
+        // into the fallback marker instead of an empty mapping that would make
+        // the `^` disappear entirely.
+        assert_eq!(math_to_unicode("x^{{}}"), "x^");
+        // The other empty-group path: `read_group` returns nothing at all.
+        assert_eq!(math_to_unicode("x^{}"), "x^");
+    }
+
+    #[test]
+    fn an_unbraced_multi_character_script_body_is_not_parenthesised() {
+        // The parentheses in the fallback are conditional on the group having
+        // been BRACED (math.rs:154, :164). `\qquad` is an unbraced argument
+        // that renders to two characters, so it must NOT gain parentheses —
+        // the one input that distinguishes `braced` from a constant `true`.
+        assert_eq!(math_to_unicode("x^\\qquad"), "x^");
+    }
+
+    #[test]
+    fn named_function_commands_render_as_words() {
+        // These arms map a command to its own name; if one were deleted the
+        // backslash would survive into the preview.
+        assert_eq!(math_to_unicode("\\sin x"), "sin x");
+        assert_eq!(math_to_unicode("\\log_2 n"), "log₂ n");
+        assert_eq!(math_to_unicode("\\lim_{n} a"), "limₙ a");
+    }
+
+    #[test]
+    fn script_tables_reach_the_preview_through_math_to_unicode() {
+        // A thin end-to-end tie-back: the unit tests above pin the tables, and
+        // these prove the tables are the ones the pipeline actually consults.
+        assert_eq!(math_to_unicode("x_{10}"), "x₁₀");
+        assert_eq!(math_to_unicode("A^{-1}"), "A⁻¹");
+        assert_eq!(math_to_unicode("v_{max}"), "vₘₐₓ");
     }
 }
