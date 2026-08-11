@@ -276,7 +276,11 @@ exclude_re = [
   # Per-page mutant accounting (render_sections baseline 191 after the chrome
   # lift):
   #   appearance : render_sections 191 -> 177, appearance.rs 17 (15 moved + 2)
+  #   fonts+editor: render_sections 177 ->  81, fonts.rs 40 + editor.rs 62
+  #                 (98 moved + 4 whole-fn, 2 call-line `|=` stay gated)
   'settings/appearance\.rs.*\brender\b',
+  'settings/fonts\.rs.*\brender\b',
+  'settings/editor\.rs.*\brender\b',
   # app/chrome.rs frameless-window chrome painting
   '\bcaption_btn\b',
   '\bhandle_frameless_resize\b',
