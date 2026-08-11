@@ -39,11 +39,11 @@
 //!    to detect.
 //!
 //! Falsification ledger. Every cell below was OBSERVED red once before being
-//! committed — 33 mutations of the PRODUCT source, 33 killed, each hash-verified
+//! committed — 39 mutations of the PRODUCT source, 39 killed, each hash-verified
 //! as applied and hash-verified as restored (a mutate-and-restore pass that
 //! never confirms the file changed reports fake kills).
 //!
-//! Cuts (22), one per present cell: the mode publish on each of S-FOLD / S-RO /
+//! Cuts (25), one per present cell: the mode publish on each of S-FOLD / S-RO /
 //! S-ROPE / G-*; `EditorMode::Standard` swapped for `Rope`, which is what proves
 //! the badge-LESS assertion discriminates rather than passing on absence;
 //! `show_fold_view`; the diagnostics painter on each of S-ROPE / S-TE / G-ROPE /
@@ -56,13 +56,28 @@
 //! one S-ROPE and G-ROPE share). Those three are cut at the LOOKUP rather than
 //! at the painter, so the squiggle keeps rendering: R1 stayed green through all
 //! three, which is what proves the hover row measures something R1 cannot see.
+//! For the R23 promotion row: the grid pane's stable `TextEdit` id, the
+//! clipboard-image paste hook, and the focus->active sync (that last one as
+//! R23's control, so a broken sync cannot be mistaken for the gap R23 pins).
 //!
-//! Grafts (11), one per still-expected-absent cell, each a rehearsal of the edit
+//! Grafts (14), one per still-expected-absent cell, each a rehearsal of the edit
 //! that will one day flip its pin: a guessed-height publish into the fold arm;
 //! the fold check hoisted above the grid fork; a rope pane made reachable by the
 //! focus sync; auto-focus added to the grid pane; a minimal ink painter into
-//! each of S-FOLD / S-RO / G-RO; an arm made to publish `RopeMmap`; and a
-//! minimal hover registration into each of S-FOLD / S-RO / G-RO.
+//! each of S-FOLD / S-RO / G-RO; an arm made to publish `RopeMmap`; a minimal
+//! hover registration into each of S-FOLD / S-RO / G-RO; and — for R23 — the
+//! promoted rope pane reclaiming `pane_editor_id`, the `editor_focused` gate
+//! opened, and a pane-rect click-to-activate that reaches a rope pane without
+//! touching focus at all.
+//!
+//! One of those grafts earned its keep immediately. The R23 hook cell first
+//! SURVIVED the gate-opening graft, and the reason was not the product: a
+//! successful image paste emits its own `Event::Paste` on the next frame, and
+//! `image_paste_gesture` suppresses the image branch for 20 frames after any
+//! text paste — so the second paste was refused by that grace window and the
+//! cell was passing for the wrong reason. Draining the window in the fixture is
+//! what made the graft turn it red. A survived graft is the signal that an
+//! absence pin is measuring its fixture rather than its wire.
 //!
 //! The ninth graft — `fold_view` added to the gutter-clear predicate — is no
 //! longer a rehearsal. It was the real defect this matrix found, and landing it
@@ -1045,5 +1060,329 @@ fn the_diagnostic_hover_names_the_problem_on_exactly_the_four_editable_arms() {
         "{} cell(s) red:\n{}",
         red.len(),
         red.join("\n")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// R23 — the grid pane that is PROMOTED to the rope editor while the user is
+//       typing in it
+// ---------------------------------------------------------------------------
+
+/// The command modifier the `editor_focused`-gated editor hooks are bound to.
+const CTRL: egui::Modifiers = egui::Modifiers::COMMAND;
+
+/// A grid whose panes start UNDER a real 1 KiB rope threshold.
+///
+/// Every other fixture in this file pins `rope_editor_auto_threshold_bytes = 0`
+/// so each arm is entered EXPLICITLY and cannot drift onto a neighbour. This one
+/// deliberately does the opposite: the transition is the subject. A pane starts
+/// as `GTe`, the buffer grows past the threshold, and the pane becomes `GRope`
+/// underneath a user who is mid-sentence — which is the production path (the
+/// default threshold is 16 MiB and a paste, a generated file or an appended log
+/// crosses it without asking).
+///
+/// Both tabs are markdown list lines, and long enough to fill the pane: a click
+/// 40% down a SHORT buffer lands past the end of the widget, gives the pane no
+/// focus, and would make every cell below pass vacuously — the fixture-geometry
+/// trap `grid_parity_tests::diag_grid_text` documents.
+fn promotable_grid() -> ScribeApp {
+    // 60 x 15 bytes = 900 bytes, comfortably under the 1 KiB threshold below.
+    let under = "- short buffer\n".repeat(60);
+    let mut cfg = grid_config();
+    cfg.editor.grid_enabled = true;
+    cfg.editor.rope_editor_auto_threshold_bytes = 1024;
+    cfg.editor.experimental_rope_editor = false;
+    cfg.spellcheck.enabled = false;
+    let mut app = ScribeApp::new_test(cfg);
+    app.tabs[0].text.clone_from(&under);
+    app.tabs.push(EditorTab::scratch());
+    app.tabs[1].text = under;
+    app.active = 0;
+    app
+}
+
+/// The same list shape, past the threshold. Still list items on purpose: a
+/// grown buffer with nothing to toggle would make the chord cell below pass
+/// because there was no checkbox to make, not because the chord never fired.
+fn over_threshold_list() -> String {
+    (0..400)
+        .map(|i| format!("- line {i:04} ................................\n"))
+        .collect()
+}
+
+/// A settled `promotable_grid`, with the handles every promotion cell needs.
+///
+/// The three cells below are written as three tests rather than one, because
+/// they share a root cause and therefore share candidate fixes: restoring focus
+/// on the promoted pane changes what the OTHER cells' controls observe, so a
+/// single test would abort in one cell's control while another cell's verdict
+/// went unstated. Split, each graft turns exactly the cell it rehearses red.
+struct Promotable {
+    app: ScribeApp,
+    p: Probe,
+    te0: egui::Id,
+    te1: egui::Id,
+    rect0: egui::Rect,
+    body0: egui::Pos2,
+    body1: egui::Pos2,
+}
+
+/// Settle the fixture and prove pane 0 really starts as `GTe` — without that,
+/// every promotion cell could pass on a pane that was a rope pane all along.
+fn promotable() -> Promotable {
+    promotable_in(None)
+}
+
+/// As [`promotable`], with a notes vault configured — the clipboard-image paste
+/// hook refuses outright without one, so its cell needs a real destination.
+fn promotable_in(vault: Option<&std::path::Path>) -> Promotable {
+    let mut app = promotable_grid();
+    app.config.notes.vault_dir = vault.map(std::path::Path::to_path_buf);
+    let p = Probe::new();
+    p.settle(&mut app);
+
+    let doc0 = app.tabs[0].doc_id;
+    let doc1 = app.tabs[1].doc_id;
+    let rect0 = super::grid_parity_tests::pane_rect(&app, doc0).expect("pane 0 laid out");
+    let rect1 = super::grid_parity_tests::pane_rect(&app, doc1).expect("pane 1 laid out");
+
+    let out = p.idle(&mut app);
+    assert!(
+        !painted_text(&out).contains("[ ROPE ]"),
+        "precondition: pane 0 starts UNDER the threshold, i.e. as G-TE"
+    );
+    assert!(
+        app.tabs[0].rope_state.is_none(),
+        "precondition: …and has built no rope state yet"
+    );
+
+    Promotable {
+        te0: grid_methods::pane_editor_id(doc0),
+        te1: grid_methods::pane_editor_id(doc1),
+        rect0,
+        // 40% down, below the pane's header chip and well inside the body.
+        body0: egui::pos2(rect0.center().x, rect0.top() + rect0.height() * 0.4),
+        body1: egui::pos2(rect1.center().x, rect1.top() + rect1.height() * 0.4),
+        app,
+        p,
+    }
+}
+
+/// Grow pane 0's buffer past the threshold and prove the promotion happened.
+fn promote(f: &mut Promotable) {
+    f.app.tabs[0].text = over_threshold_list();
+    f.p.idle(&mut f.app);
+    let out = f.p.idle(&mut f.app);
+    assert!(
+        painted_text(&out).contains("[ ROPE ]"),
+        "the grown pane must render through the owned-rope arm and say so"
+    );
+    assert!(
+        f.app.tabs[0].rope_state.is_some(),
+        "…and `rope_state` is created by that arm and by nothing else here"
+    );
+}
+
+/// Cell 1 — the promotion silently takes the keyboard away.
+///
+/// This is the first of the three cells the matrix left as UNKNOWN rather than
+/// guessed, and it is settled here by RUNNING: egui does NOT retain focus on
+/// `pane_editor_id` across the swap. The `TextEdit` simply stops being created,
+/// so its focus is dropped, and from the FIRST promoted frame `Memory::focused()`
+/// is `None` — the rope pane registers under `drag_scroll::rope_editor_focus_id`
+/// instead, which nothing here matches.
+///
+/// The click precondition is what makes the silence meaningful: the pane took
+/// the keyboard a moment earlier, in the same fixture, from the same gesture.
+///
+/// Pinned as the current behaviour so a fix breaks it loudly — making the
+/// promoted rope pane reclaim `pane_editor_id` turns this red.
+#[test]
+fn a_grid_pane_promoted_to_the_rope_editor_mid_session_loses_the_keyboard() {
+    let mut f = promotable();
+    f.p.mod_click(&mut f.app, f.body0, egui::Modifiers::NONE);
+    f.p.idle(&mut f.app);
+    assert!(
+        f.p.ctx.memory(|m| m.has_focus(f.te0)),
+        "precondition: clicking a G-TE pane's body at {:?} (pane rect {:?}) must \
+         give ITS editor the keyboard",
+        f.body0,
+        f.rect0
+    );
+    assert_eq!(
+        f.app.active, 0,
+        "precondition: …and the focus->active sync must make it the active tab"
+    );
+
+    promote(&mut f);
+
+    assert_eq!(
+        f.p.ctx.memory(|m| m.focused()),
+        None,
+        "expected-absent: the promotion drops keyboard focus entirely — nothing \
+         holds it at all, one frame after the same pane held it. Something does \
+         now, so the swap carries focus across — flip this pin"
+    );
+    assert!(
+        !f.p.ctx.memory(|m| m.has_focus(f.te0)),
+        "expected-absent: …and in particular NOT the pane's own editor id"
+    );
+}
+
+/// The PNGs a clipboard-image paste has landed in the vault so far.
+fn attachment_pngs(vault: &std::path::Path) -> usize {
+    std::fs::read_dir(vault.join("attachments")).map_or(0, |d| {
+        d.filter_map(Result::ok)
+            .filter(|e| e.path().extension().is_some_and(|x| x == "png"))
+            .count()
+    })
+}
+
+/// A tiny opaque clipboard image, handed to the paste hook through the
+/// `note_capture` test seam.
+fn clipboard_image() -> crate::app::note_capture::ClipboardImage {
+    crate::app::note_capture::ClipboardImage {
+        width: 2,
+        height: 2,
+        rgba: vec![0x40u8; 2 * 2 * 4],
+    }
+}
+
+/// Cell 2 — and every capability gated on that focus goes with it.
+///
+/// `render_grid_central_panel` runs ONE block `if !active_read_only &&
+/// editor_focused`, where `editor_focused` is
+/// `has_focus(pane_editor_id(active_doc))`. Behind it sit the markdown chords
+/// (Ctrl+B / Ctrl+I / Ctrl+` / Ctrl+Shift+X / Ctrl+Enter) AND the
+/// clipboard-image paste hook. Cell 1 showed that focus is gone one frame after
+/// the promotion, so this entire block stops running — silently, with the
+/// buffer still editable and no signal that half the editor's chords went away.
+///
+/// The clipboard-image paste is the witness, and the choice is deliberate. The
+/// chords are the more obvious one, but they cannot be pinned honestly here:
+/// widening the gate does NOT bring a chord back, because the drain
+/// (`apply_pending_caret_ops` -> `active_line_span`) also needs the `TextEdit`
+/// caret state that a promoted pane no longer maintains. An assertion that no
+/// available fix can turn red would silently survive the fix it exists to
+/// detect — the one thing an absence pin must never do. The paste hook has no
+/// such second dependency: it writes the PNG into the vault before it ever
+/// touches a caret, so it is gated on `editor_focused` and nothing else, and
+/// opening that gate turns this red.
+///
+/// Asserted on the FILE, never on `pending_insert_text`: the latch was
+/// historically the thing that got set and never drained, so a latch assertion
+/// is exactly the one that cannot see this class of bug.
+#[test]
+fn a_promoted_grid_pane_silently_stops_answering_the_focus_gated_editor_hooks() {
+    let vault = tempfile::tempdir().expect("temp vault");
+    let mut f = promotable_in(Some(vault.path()));
+    f.p.mod_click(&mut f.app, f.body0, egui::Modifiers::NONE);
+    f.p.idle(&mut f.app);
+
+    // The RELEASE alone, which is the only event `egui_winit` emits for an
+    // image-only clipboard — it special-cases the paste chord on key-DOWN and
+    // returns before pushing any `Event::Key`.
+    //
+    // The trailing idle frames are LOAD-BEARING, and finding out why is the
+    // reason this cell is trustworthy. A successful image paste inserts its
+    // markdown by emitting `Event::Paste("![pasted image](…)")` on the NEXT
+    // frame, and `image_paste_gesture` records every text paste to suppress the
+    // image branch for `PASTE_IMAGE_TEXT_GRACE_FRAMES` (20) — the window that
+    // joins a real clipboard's key-down `Paste` to its later `V` release. So a
+    // second paste taken within 20 frames of the first is refused BY THAT
+    // WINDOW, whatever the focus gate says. Without this drain the
+    // expected-absent assertion below passed for the wrong reason: opening the
+    // `editor_focused` gate did not turn it red, because the grace window was
+    // suppressing the paste and the pin was measuring the fixture rather than
+    // the promotion.
+    let paste = |f: &mut Promotable| {
+        crate::app::note_capture::test_hooks::set_next_image(clipboard_image());
+        f.p.frame(
+            &mut f.app,
+            CTRL,
+            vec![egui::Event::Key {
+                key: egui::Key::V,
+                physical_key: None,
+                pressed: false,
+                repeat: false,
+                modifiers: CTRL,
+            }],
+        );
+        // One to deliver the insertion, then past the grace window.
+        for _ in 0..24 {
+            f.p.idle(&mut f.app);
+        }
+    };
+
+    assert_eq!(
+        attachment_pngs(vault.path()),
+        0,
+        "precondition: the vault starts with no attachments"
+    );
+    paste(&mut f);
+    assert_eq!(
+        attachment_pngs(vault.path()),
+        1,
+        "precondition: Ctrl+V with an image on the clipboard must land a PNG in \
+         the vault while the G-TE pane holds focus — if the hook does nothing \
+         HERE, the assertion below measures nothing"
+    );
+
+    promote(&mut f);
+
+    paste(&mut f);
+    assert_eq!(
+        attachment_pngs(vault.path()),
+        1,
+        "expected-absent: the promotion silently switches off every hook behind \
+         the `editor_focused` gate — the same paste that landed an attachment \
+         moments ago now writes nothing, and the markdown chords go with it. A \
+         second PNG appeared, so the gate reaches the promoted pane now — flip \
+         this pin"
+    );
+}
+
+/// Cell 3 — and clicking the pane does not give any of it back.
+///
+/// The focus->active sync matches `pane_editor_id` alone, so a promoted pane is
+/// unreachable: `self.active` stays on whichever pane was last a `TextEdit`, and
+/// the status bar's counters, encoding, language, EOL, caret readout and the
+/// diagnostics span resolution all keep describing THAT pane while the user
+/// looks at this one.
+///
+/// R22 pins the same gap for a pane that was always a rope pane. This is the
+/// direction a user actually reaches it — the pane was theirs, and the app
+/// quietly stopped agreeing.
+///
+/// `active` is moved to the sibling first, and that move is a hard control:
+/// without it "still 0" would be indistinguishable from "came back to 0".
+#[test]
+fn a_promoted_grid_pane_can_no_longer_be_clicked_into_activity() {
+    let mut f = promotable();
+    promote(&mut f);
+
+    f.p.mod_click(&mut f.app, f.body1, egui::Modifiers::NONE);
+    f.p.idle(&mut f.app);
+    assert_eq!(
+        f.app.active, 1,
+        "control: the sibling pane is still a `TextEdit`, so clicking IT must \
+         still move `active` — if this fails the sync is broken outright and the \
+         assertion below is not measuring the promotion"
+    );
+    assert!(
+        f.p.ctx.memory(|m| m.has_focus(f.te1)),
+        "control: …and that pane's editor holds the keyboard"
+    );
+
+    f.p.mod_click(&mut f.app, f.body0, egui::Modifiers::NONE);
+    f.p.idle(&mut f.app);
+    assert_eq!(
+        f.app.active, 1,
+        "expected-absent: clicking the PROMOTED pane's body at {:?} (pane rect \
+         {:?}) must NOT make it active — the focus->active sync matches \
+         `pane_editor_id` alone and this pane no longer registers one. It became \
+         active, so the pane is reachable again — flip this pin (and R22's half \
+         with it)",
+        f.body0, f.rect0
     );
 }
