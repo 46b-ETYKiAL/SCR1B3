@@ -2538,7 +2538,18 @@ impl ScribeApp {
         // `RopeEditor::show_rows` lays out with — so an empty vector is the
         // correct state here, not merely a safe one. Hiding the panel without
         // clearing would fix the paint and leave navigation wrong.
-        if (rope_arm || read_only) && !self.line_gutter.is_empty() {
+        //
+        // `fold_view` is in the predicate for the SAME reason, and it is the
+        // stronger case of the two. The fold preview draws no app-owned gutter
+        // either — the panel's own gate on the next line is already `!fold_view`
+        // — but its projection OMITS the folded-away lines, so a surviving row
+        // list is not merely one buffer stale: index `i` no longer denotes
+        // document line `i` at all. A go-to-line, find-navigate or bookmark jump
+        // taken while folded would read `line_gutter[line0]` and scroll to a Y
+        // that corresponds to no line the user asked for. Clearing hands those
+        // three the `line0 * (editor_size * line_height)` estimate instead,
+        // which is monotone in the document line the user named.
+        if (rope_arm || read_only || self.fold_view) && !self.line_gutter.is_empty() {
             self.line_gutter.clear();
         }
         if show_line_numbers && !self.fold_view && !read_only && !rope_arm && !chrome_hidden {

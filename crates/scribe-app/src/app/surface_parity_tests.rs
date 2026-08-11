@@ -43,20 +43,26 @@
 //! as applied and hash-verified as restored (a mutate-and-restore pass that
 //! never confirms the file changed reports fake kills).
 //!
-//! Cuts (18), one per present cell: the mode publish on each of S-FOLD / S-RO /
+//! Cuts (19), one per present cell: the mode publish on each of S-FOLD / S-RO /
 //! S-ROPE / G-*; `EditorMode::Standard` swapped for `Rope`, which is what proves
 //! the badge-LESS assertion discriminates rather than passing on absence;
 //! `show_fold_view`; the diagnostics painter on each of S-ROPE / S-TE / G-ROPE /
 //! G-TE; the metrics publish on S-TE, on `finish_embedded_scroll` (S-RO+S-ROPE)
-//! and on the grid apply; the gutter feed on S-TE and G-TE plus the rope/browse
-//! CLEAR; the focus->active sync; the S-TE auto-focus.
+//! and on the grid apply; the gutter feed on S-TE and G-TE plus the CLEAR on the
+//! rope/browse arms and — since the fold gap below was closed — on the fold arm
+//! too, cut at BOTH its pin and its navigation consequence; the focus->active
+//! sync; the S-TE auto-focus.
 //!
-//! Grafts (9), one per expected-absent cell, each a rehearsal of the edit that
-//! will one day flip its pin: a guessed-height publish into the fold arm;
-//! `fold_view` added to the gutter-clear predicate; the fold check hoisted above
-//! the grid fork; a rope pane made reachable by the focus sync; auto-focus added
-//! to the grid pane; a minimal ink painter into each of S-FOLD / S-RO / G-RO;
-//! and an arm made to publish `RopeMmap`.
+//! Grafts (8), one per still-expected-absent cell, each a rehearsal of the edit
+//! that will one day flip its pin: a guessed-height publish into the fold arm;
+//! the fold check hoisted above the grid fork; a rope pane made reachable by the
+//! focus sync; auto-focus added to the grid pane; a minimal ink painter into
+//! each of S-FOLD / S-RO / G-RO; and an arm made to publish `RopeMmap`.
+//!
+//! The ninth graft — `fold_view` added to the gutter-clear predicate — is no
+//! longer a rehearsal. It was the real defect this matrix found, and landing it
+//! turned its expected-absent pin into the enforcement assertion the R4 row now
+//! carries, so it moved into the cut list above.
 //!
 //! Scope, stated so no row is over-read: these pin the RENDERING wire, not the
 //! language server (every diagnostics fixture injects `app.diagnostics`
@@ -479,27 +485,32 @@ fn every_arm_but_the_fold_preview_publishes_scroll_metrics() {
 /// Y, which is worse than missing and looks identical to working from the
 /// outside.
 ///
-/// The pin is therefore THREE-sided, and the third side is a live defect this
-/// matrix found on its first run:
+/// The pin is therefore TWO-sided, and the second side closed a live defect
+/// this matrix found on its first run:
 ///
 /// * the two `TextEdit` arms must REPLACE the poison with this frame's rows;
-/// * the four rope / browse arms must CLEAR it — that clear is the recently
-///   landed half of the fix, and it is what makes their absence honest rather
-///   than stale;
-/// * **the fold arm does NEITHER.** The clear predicate is
-///   `(rope_arm || read_only)`; `fold_view` is not in it, while the PANEL's own
-///   gate at the next line is `!fold_view`. So folding hides the gutter and
-///   leaves its feed pointing at the pre-fold rows — and the projection has
-///   FOLDED lines, so those row indices do not even correspond to document
-///   lines any more. A go-to-line or find-navigate while folded reads
-///   `line_gutter[line0]` and jumps to a Y that means nothing.
+/// * **all five** non-`TextEdit` arms — the four rope / browse arms AND the
+///   fold preview — must CLEAR it, which is what makes their absence honest
+///   rather than stale.
 ///
-/// That last cell is pinned as the CURRENT (wrong) behaviour, not asserted
-/// away: the poison is expected to SURVIVE. Adding `fold_view` to the clear
-/// predicate — the one-token fix, exactly parallel to the rope/browse half —
-/// turns this red, which is the whole point of pinning it.
+/// The fold cell was originally pinned as EXPECTED-ABSENT: the clear predicate
+/// read `(rope_arm || read_only)` with `fold_view` missing, while the PANEL's
+/// own gate on the very next line already was `!fold_view`. Folding therefore
+/// hid the gutter and left its feed pointing at the pre-fold rows — and worse
+/// than one-buffer-stale, because the projection OMITS folded lines, so row
+/// index `i` no longer denoted document line `i` at all. Adding `fold_view` to
+/// the predicate flipped that cell to enforcement, and this assertion is that
+/// flip: the poison must now be GONE for `SFold` exactly as it is for the rope
+/// and browse arms.
+///
+/// The paint is not the property that matters, so it is not the property this
+/// module proves alone:
+/// `folding_hands_go_to_line_and_find_navigate_the_row_pitch_estimate` below
+/// drives the actual `goto_line` and `find_navigate` jumps after a folded frame
+/// and pins the fallback Y, because a test that only observed the hidden panel
+/// would have passed on the broken code.
 #[test]
-fn the_external_gutter_feed_is_written_by_textedit_arms_and_cleared_by_all_but_fold() {
+fn the_external_gutter_feed_is_written_by_textedit_arms_and_cleared_by_every_other_arm() {
     for arm in Arm::ALL {
         let mut app = app_for(arm);
         let p = Probe::new();
@@ -520,27 +531,133 @@ fn the_external_gutter_feed_is_written_by_textedit_arms_and_cleared_by_all_but_f
                  left {left:?} — a single negative Y IS the poison sentinel, so \
                  nothing wrote the feed"
             ),
-            Arm::SRope | Arm::GRope | Arm::SRo | Arm::GRo => assert!(
+            Arm::SRope | Arm::GRope | Arm::SRo | Arm::GRo | Arm::SFold => assert!(
                 left.is_empty(),
                 "{arm:?} lays out no app-drawn gutter, so it must CLEAR the feed \
                  rather than leave the previous surface's rows behind — \
                  go-to-line and find-navigate read `line_gutter[line0]` and \
                  would jump to the old buffer's Y. It left {left:?}"
             ),
-            Arm::SFold => assert_eq!(
-                left,
-                vec![-1.0],
-                "EXPECTED-ABSENT (live gap): the fold arm neither writes nor \
-                 clears the gutter feed — the clear predicate is \
-                 `(rope_arm || read_only)` and `fold_view` is not in it, while \
-                 the panel's own gate on the next line IS `!fold_view`. The \
-                 poison must therefore SURVIVE the frame. It did not, which \
-                 means the clear was extended to cover folding: that is the \
-                 fix — flip this pin to `left.is_empty()` and move it up into \
-                 the arm above. Do not weaken it"
-            ),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// R4b — the gutter feed's NAVIGATION consequence, driven end to end
+// ---------------------------------------------------------------------------
+
+/// The panel being hidden is not the property that matters.
+///
+/// `find_nav.rs` reads `line_gutter[line0]` as the PREFERRED scroll source for
+/// go-to-line (`goto_line`, which bookmark jumps and the CLI `file:LINE` jump
+/// also drive) and for find-navigate (`scroll_to_offset`). Both fall through to
+/// a `line0 * (editor_size * line_height)` row-pitch estimate only when the
+/// lookup MISSES. So a fold arm that hides the panel without clearing the feed
+/// leaves all three jumping to a Y taken from the pre-fold rows — and the fold
+/// projection omits the folded-away lines, so those indices do not denote
+/// document lines at all.
+///
+/// This drives the jump itself rather than observing the paint, because a test
+/// that only asserted the gutter panel was invisible would have passed on the
+/// broken code: `!fold_view` was already on the panel's gate while `fold_view`
+/// was still missing from the clear predicate. That gap is exactly the shape of
+/// the half-fix `e45341b` rejected for the rope arm, where hiding the strip was
+/// explicitly not enough for the same reason.
+///
+/// The control is load-bearing: it jumps ONCE with the poison still in place,
+/// before any folded frame, and requires the poisoned Y back. Without it this
+/// test would pass just as happily if `goto_line` had stopped consulting
+/// `line_gutter` altogether, which is a vacuous green, not a fix.
+#[test]
+fn folding_hands_go_to_line_and_find_navigate_the_row_pitch_estimate() {
+    // A line deep inside the brace scope line 0 opens — i.e. one the fold
+    // projection collapses away, which is precisely when a surviving row index
+    // denotes nothing.
+    const TARGET_1BASED: usize = 120;
+    // A Y no real row of this fixture carries, so a surviving read is
+    // unmistakable rather than merely off by a little.
+    const POISON_Y: f32 = 777.0;
+    // `matrix_text` line 4 + 137 -> document line index 141, matched by a query
+    // that occurs exactly once.
+    const FIND_QUERY: &str = "filler line 137,";
+    const FIND_LINE0: usize = 141;
+
+    let mut app = app_for(Arm::SFold);
+    let p = Probe::new();
+    p.settle(&mut app);
+
+    let size = app.config.fonts.clamped_editor_size();
+    let lh = app.config.fonts.clamped_line_height();
+    let pitch = size * lh;
+
+    // Long enough that `line_gutter.get(line0)` HITS for both targets — a short
+    // vector would miss and take the fallback for the wrong reason.
+    let poison = vec![POISON_Y; 205];
+
+    // ---- Control: the preferred-source branch is live and this fixture reaches
+    // it. If this does not come back as the poison, nothing below discriminates.
+    app.line_gutter.clone_from(&poison);
+    app.pending_scroll = None;
+    app.goto_line(TARGET_1BASED);
+    assert_eq!(
+        app.pending_scroll,
+        Some(POISON_Y),
+        "control: a populated `line_gutter` IS the preferred scroll source, so \
+         a jump must read it. It did not, which means this test can no longer \
+         tell a cleared feed from an unread one — fix the control before \
+         trusting the assertions below"
+    );
+
+    // ---- One folded frame, with the feed poisoned going in.
+    app.line_gutter.clone_from(&poison);
+    let out = p.idle(&mut app);
+    assert_arm(&app, &out, Arm::SFold);
+
+    // ---- Go-to-line (also the bookmark-jump and CLI-jump pipe).
+    app.pending_scroll = None;
+    app.goto_line(TARGET_1BASED);
+    assert_ne!(
+        app.pending_scroll,
+        Some(POISON_Y),
+        "a go-to-line taken while folded read the PRE-FOLD gutter row and \
+         scrolled to a stale Y. The fold arm must clear `line_gutter` like the \
+         rope and browse arms do"
+    );
+    assert_eq!(
+        app.pending_scroll,
+        Some((TARGET_1BASED - 1) as f32 * pitch),
+        "with the feed cleared, go-to-line must take the \
+         `line0 * (editor_size * line_height)` row-pitch estimate — the \
+         specific fallback, not merely 'not the poison'"
+    );
+
+    // ---- Find-navigate, which reaches the SECOND reader (`scroll_to_offset`).
+    app.line_gutter.clone_from(&poison);
+    let out = p.idle(&mut app);
+    assert_arm(&app, &out, Arm::SFold);
+
+    FIND_QUERY.clone_into(&mut app.find_query);
+    assert_eq!(
+        app.find_matches_active().len(),
+        1,
+        "fixture: the find query must match exactly once, or the jump below is \
+         not the jump this test names"
+    );
+    app.find_match_idx = 0;
+    app.pending_scroll = None;
+    app.find_navigate(true);
+    assert_ne!(
+        app.pending_scroll,
+        Some(POISON_Y),
+        "find-navigate reads the same feed through `scroll_to_offset`; folding \
+         must not leave it a stale Y either"
+    );
+    assert_eq!(
+        app.pending_scroll,
+        Some(FIND_LINE0 as f32 * pitch),
+        "find-navigate must land on the row-pitch estimate for the match's own \
+         line"
+    );
 }
 
 // ---------------------------------------------------------------------------
