@@ -81,6 +81,10 @@ pub struct RopeEditor<'a> {
     /// pressed right after a known snippet prefix expands it instead of
     /// inserting an indent. `None` disables snippet expansion entirely.
     pub(crate) snippets: Option<&'a scribe_core::snippets::SnippetSet>,
+    /// Keyboard-focus id for [`RopeEditor::show_editable`], when the HOST owns
+    /// the identity of the thing being edited. `None` derives it from the `Ui`
+    /// (see [`RopeEditor::with_focus_id`] for why a host would override).
+    pub(crate) focus_id: Option<egui::Id>,
 }
 
 impl<'a> RopeEditor<'a> {
@@ -97,7 +101,24 @@ impl<'a> RopeEditor<'a> {
             gutter_color: Color32::from_rgb(0x5a, 0x58, 0x69),
             render_whitespace: false,
             snippets: None,
+            focus_id: None,
         }
+    }
+
+    /// Take the editor's keyboard-focus id from the HOST instead of deriving it
+    /// from the `Ui` path.
+    ///
+    /// The default id is `ui.id().with("scr1b3-rope-editable")` — reproducible
+    /// only from the `Ui` the widget was handed, i.e. only from INSIDE the
+    /// render closure. That is sufficient for a host with one editor, which can
+    /// re-derive it in place. It is not sufficient for a host whose editable
+    /// surface can change while the thing being edited does not: such a host has
+    /// to know, BEFORE it renders, which document owns the keyboard, and a
+    /// Ui-derived id cannot answer that. Handing the id in keeps the focus
+    /// identity attached to the DOCUMENT, so it survives a surface swap.
+    pub fn with_focus_id(mut self, id: egui::Id) -> Self {
+        self.focus_id = Some(id);
+        self
     }
 
     /// Enable Tab-trigger snippet expansion using `set`. A Tab pressed right
@@ -248,7 +269,9 @@ impl<'a> RopeEditor<'a> {
         ui: &mut Ui,
         state: &mut RopeEditorState,
     ) -> (RopeEditorResponse, Option<String>) {
-        let editor_id = ui.id().with("scr1b3-rope-editable");
+        let editor_id = self
+            .focus_id
+            .unwrap_or_else(|| ui.id().with("scr1b3-rope-editable"));
         let focused = ui.memory(|m| m.has_focus(editor_id));
         let mut clipboard: Option<String> = None;
         let mut caret_moved = false;

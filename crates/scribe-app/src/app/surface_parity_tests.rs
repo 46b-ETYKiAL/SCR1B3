@@ -60,15 +60,12 @@
 //! clipboard-image paste hook, and the focus->active sync (that last one as
 //! R23's control, so a broken sync cannot be mistaken for the gap R23 pins).
 //!
-//! Grafts (14), one per still-expected-absent cell, each a rehearsal of the edit
+//! Grafts (10), one per still-expected-absent cell, each a rehearsal of the edit
 //! that will one day flip its pin: a guessed-height publish into the fold arm;
-//! the fold check hoisted above the grid fork; a rope pane made reachable by the
-//! focus sync; auto-focus added to the grid pane; a minimal ink painter into
-//! each of S-FOLD / S-RO / G-RO; an arm made to publish `RopeMmap`; a minimal
-//! hover registration into each of S-FOLD / S-RO / G-RO; and — for R23 — the
-//! promoted rope pane reclaiming `pane_editor_id`, the `editor_focused` gate
-//! opened, and a pane-rect click-to-activate that reaches a rope pane without
-//! touching focus at all.
+//! the fold check hoisted above the grid fork; auto-focus added to the grid
+//! pane; a minimal ink painter into each of S-FOLD / S-RO / G-RO; an arm made
+//! to publish `RopeMmap`; and a minimal hover registration into each of S-FOLD /
+//! S-RO / G-RO.
 //!
 //! One of those grafts earned its keep immediately. The R23 hook cell first
 //! SURVIVED the gate-opening graft, and the reason was not the product: a
@@ -83,6 +80,24 @@
 //! longer a rehearsal. It was the real defect this matrix found, and landing it
 //! turned its expected-absent pin into the enforcement assertion the R4 row now
 //! carries, so it moved into the cut list above.
+//!
+//! Four more have since stopped being rehearsals, all closed by ONE edit. The
+//! R23 grafts (the promoted rope pane reclaiming `pane_editor_id`, the paste
+//! gate opened, click-to-activate reaching a rope pane) and R22's rope-half
+//! graft (the focus sync made to reach a rope pane) were four rehearsals of the
+//! same root cause: a grid pane's keyboard identity was the SURFACE rendering it
+//! rather than the DOCUMENT it renders. Handing `RopeEditor::show_editable` the
+//! pane's own `pane_editor_id` closed all four at once, and the R22/R23 rows now
+//! carry enforcement assertions.
+//!
+//! That fix is also why the R23 CHORD cell below is a NEW expected-absent pin
+//! rather than a fifth flip. Restoring focus reaches the hooks that need only
+//! focus (the image paste) and does NOT reach the ones that also need
+//! `TextEditState` (every markdown chord, via `apply_pending_caret_ops` ->
+//! `active_line_span`). Widening the chord gate to match would consume Ctrl+D
+//! and Ctrl+Enter — which the rope editor implements natively — and then drop
+//! the latch, so the chord gate deliberately keeps the extra `TextEdit` term and
+//! the remaining gap is pinned rather than forced.
 //!
 //! Scope, stated so no row is over-read: these pin the RENDERING wire, not the
 //! language server (every diagnostics fixture injects `app.diagnostics`
@@ -730,7 +745,7 @@ fn turning_the_grid_on_silently_ignores_an_already_folded_view() {
 }
 
 // ---------------------------------------------------------------------------
-// R22 — focus->active sync reaches only the `TextEdit` pane
+// R22 — focus->active sync reaches every editable pane
 // ---------------------------------------------------------------------------
 
 /// A two-pane grid whose panes both render through `arm`, with the SECOND tab
@@ -748,24 +763,24 @@ fn two_pane_grid(arm: Arm) -> ScribeApp {
     app
 }
 
-/// Clicking a pane makes it active — but ONLY if it is a `TextEdit` pane.
+/// Clicking an editable pane makes it active, on either editable surface.
 ///
-/// The focus->active sync matches on `pane_editor_id`, which is handed to the
-/// `TextEdit` widget alone; the rope and browse panes register their focus
-/// under `drag_scroll::rope_editor_focus_id` instead. So a rope pane can never
-/// become active by being clicked, and every `active`-keyed surface — the
-/// status-bar counters, encoding, language, EOL, the caret readout, and the
-/// diagnostics span resolution — keeps describing a pane the user has left.
-/// That is precisely the class of bug the G-TE sync was landed to fix; two of
-/// the three grid arms never received it.
+/// The focus->active sync matches on `pane_editor_id`. That id used to be handed
+/// to the `TextEdit` widget alone, while a rope pane registered its focus under
+/// a `Ui`-derived id (`drag_scroll::rope_editor_focus_id`) — so a rope pane
+/// could never become active by being clicked, and every `active`-keyed surface
+/// (the status-bar counters, encoding, language, EOL, the caret readout, and the
+/// diagnostics span resolution) kept describing a pane the user had left. That
+/// is precisely the class of bug the G-TE sync was landed to fix, and the rope
+/// arm never received it until `RopeEditor` was given the pane's own id.
 ///
-/// The G-TE half is the ENFORCE pin and the G-ROPE half the expected-absent
-/// one, in one test on purpose: they share a fixture and a gesture, so the
-/// pair proves the click itself lands. Extending the sync to
-/// `rope_editor_focus_id` turns the second half red.
+/// Both halves are ENFORCE pins now, in one test on purpose: they share a
+/// fixture and a gesture, so the pair proves the click itself lands rather than
+/// either arm passing on a gesture that missed. Taking `with_focus_id` back off
+/// the rope arm turns the second half red.
 #[test]
-fn only_a_textedit_grid_pane_can_be_clicked_into_activity() {
-    for (arm, expect_active) in [(Arm::GTe, 1usize), (Arm::GRope, 0usize)] {
+fn either_editable_grid_pane_can_be_clicked_into_activity() {
+    for (arm, expect_active) in [(Arm::GTe, 1usize), (Arm::GRope, 1usize)] {
         let mut app = two_pane_grid(arm);
         let p = Probe::new();
         p.settle(&mut app);
@@ -781,13 +796,12 @@ fn only_a_textedit_grid_pane_can_be_clicked_into_activity() {
         p.idle(&mut app);
 
         assert_eq!(
-            app.active,
-            expect_active,
+            app.active, expect_active,
             "{arm:?}: clicking pane 1's body at {body:?} (pane rect {rect:?}) \
-             must {} make it active. GTe is the enforce pin; GRope is pinned \
-             expected-absent because the sync matches only `pane_editor_id` — \
-             if the sync was extended to `rope_editor_focus_id`, flip that pin",
-            if expect_active == 1 { "" } else { "NOT" }
+             must make it active. Both editable arms register the same \
+             document-scoped `pane_editor_id`, so the focus->active sync reaches \
+             both; a 0 here means this arm's pane is unreachable by click and \
+             every `active`-keyed surface is describing pane 0"
         );
     }
 }
@@ -1183,22 +1197,26 @@ fn promote(f: &mut Promotable) {
     );
 }
 
-/// Cell 1 — the promotion silently takes the keyboard away.
+/// Cell 1 — the promotion keeps the keyboard on the pane.
 ///
 /// This is the first of the three cells the matrix left as UNKNOWN rather than
-/// guessed, and it is settled here by RUNNING: egui does NOT retain focus on
-/// `pane_editor_id` across the swap. The `TextEdit` simply stops being created,
-/// so its focus is dropped, and from the FIRST promoted frame `Memory::focused()`
-/// is `None` — the rope pane registers under `drag_scroll::rope_editor_focus_id`
-/// instead, which nothing here matches.
+/// guessed, and it was settled by RUNNING: egui does NOT retain focus across the
+/// swap on its own. The `TextEdit` stops being created, and a `RopeEditor` that
+/// derives its focus id from the `Ui` path claims a DIFFERENT id — so
+/// `Memory::focused()` was `None` from the first promoted frame and the pane
+/// went dark under a user mid-sentence.
 ///
-/// The click precondition is what makes the silence meaningful: the pane took
-/// the keyboard a moment earlier, in the same fixture, from the same gesture.
+/// The fix is that a pane's keyboard identity is its DOCUMENT: the rope arm is
+/// handed the same `pane_editor_id` the `TextEdit` arm uses, so focus survives a
+/// surface swap the user never asked for and never sees.
 ///
-/// Pinned as the current behaviour so a fix breaks it loudly — making the
-/// promoted rope pane reclaim `pane_editor_id` turns this red.
+/// The click precondition is what makes the assertion meaningful: the pane took
+/// the keyboard a moment earlier, in the same fixture, from the same gesture, so
+/// "still focused" cannot pass on a pane that was never focused at all. And the
+/// keystroke at the end is why this asserts more than bookkeeping — focus that
+/// does not accept typing would satisfy `has_focus` and still be dark.
 #[test]
-fn a_grid_pane_promoted_to_the_rope_editor_mid_session_loses_the_keyboard() {
+fn a_grid_pane_promoted_to_the_rope_editor_mid_session_keeps_the_keyboard() {
     let mut f = promotable();
     f.p.mod_click(&mut f.app, f.body0, egui::Modifiers::NONE);
     f.p.idle(&mut f.app);
@@ -1218,14 +1236,28 @@ fn a_grid_pane_promoted_to_the_rope_editor_mid_session_loses_the_keyboard() {
 
     assert_eq!(
         f.p.ctx.memory(|m| m.focused()),
-        None,
-        "expected-absent: the promotion drops keyboard focus entirely — nothing \
-         holds it at all, one frame after the same pane held it. Something does \
-         now, so the swap carries focus across — flip this pin"
+        Some(f.te0),
+        "the promotion carries the keyboard across the surface swap: the pane's \
+         own editor id still holds focus one frame after its `TextEdit` stopped \
+         being created. `None` here is the pane going dark; any OTHER id is the \
+         rope arm claiming a `Ui`-derived id the app cannot name before it renders"
     );
-    assert!(
-        !f.p.ctx.memory(|m| m.has_focus(f.te0)),
-        "expected-absent: …and in particular NOT the pane's own editor id"
+
+    // Bookkeeping is not the product. Type into the promoted pane and require
+    // the character to arrive — a focus id that no longer accepts input would
+    // satisfy every assertion above and still leave the user typing into a void.
+    let before = f.app.tabs[0].text.clone();
+    f.p.frame(
+        &mut f.app,
+        egui::Modifiers::NONE,
+        vec![egui::Event::Text("Z".to_string())],
+    );
+    f.p.idle(&mut f.app);
+    assert_eq!(
+        f.app.tabs[0].text.strip_prefix('Z'),
+        Some(before.as_str()),
+        "…and the promoted pane still ANSWERS that keyboard: a typed character \
+         lands at its caret"
     );
 }
 
@@ -1248,32 +1280,33 @@ fn clipboard_image() -> crate::app::note_capture::ClipboardImage {
     }
 }
 
-/// Cell 2 — and every capability gated on that focus goes with it.
+/// Cell 2 — and the capabilities gated on that focus come with it.
 ///
-/// `render_grid_central_panel` runs ONE block `if !active_read_only &&
+/// `render_grid_central_panel` used to run ONE block `if !active_read_only &&
 /// editor_focused`, where `editor_focused` is
-/// `has_focus(pane_editor_id(active_doc))`. Behind it sit the markdown chords
+/// `has_focus(pane_editor_id(active_doc))`. Behind it sat the markdown chords
 /// (Ctrl+B / Ctrl+I / Ctrl+` / Ctrl+Shift+X / Ctrl+Enter) AND the
-/// clipboard-image paste hook. Cell 1 showed that focus is gone one frame after
-/// the promotion, so this entire block stops running — silently, with the
-/// buffer still editable and no signal that half the editor's chords went away.
+/// clipboard-image paste hook, so when the promotion dropped focus the whole
+/// block stopped running — silently, with the buffer still editable and no
+/// signal that half the editor's chords had gone away.
 ///
 /// The clipboard-image paste is the witness, and the choice is deliberate. The
 /// chords are the more obvious one, but they cannot be pinned honestly here:
-/// widening the gate does NOT bring a chord back, because the drain
+/// restoring focus does NOT bring a chord back, because the drain
 /// (`apply_pending_caret_ops` -> `active_line_span`) also needs the `TextEdit`
-/// caret state that a promoted pane no longer maintains. An assertion that no
+/// caret state that a promoted pane no longer maintains. A cell that no
 /// available fix can turn red would silently survive the fix it exists to
-/// detect — the one thing an absence pin must never do. The paste hook has no
-/// such second dependency: it writes the PNG into the vault before it ever
-/// touches a caret, so it is gated on `editor_focused` and nothing else, and
-/// opening that gate turns this red.
+/// detect — the one thing a pin must never do. The paste hook has no such
+/// second dependency: it writes the PNG into the vault before it ever touches a
+/// caret, so it is gated on focus and nothing else, and it is the hook that
+/// restoring focus genuinely returns. The chord half the fix does NOT reach is
+/// pinned separately, one cell below.
 ///
 /// Asserted on the FILE, never on `pending_insert_text`: the latch was
 /// historically the thing that got set and never drained, so a latch assertion
 /// is exactly the one that cannot see this class of bug.
 #[test]
-fn a_promoted_grid_pane_silently_stops_answering_the_focus_gated_editor_hooks() {
+fn a_promoted_grid_pane_still_answers_the_focus_gated_image_paste() {
     let vault = tempfile::tempdir().expect("temp vault");
     let mut f = promotable_in(Some(vault.path()));
     f.p.mod_click(&mut f.app, f.body0, egui::Modifiers::NONE);
@@ -1333,31 +1366,97 @@ fn a_promoted_grid_pane_silently_stops_answering_the_focus_gated_editor_hooks() 
     paste(&mut f);
     assert_eq!(
         attachment_pngs(vault.path()),
-        1,
-        "expected-absent: the promotion silently switches off every hook behind \
-         the `editor_focused` gate — the same paste that landed an attachment \
-         moments ago now writes nothing, and the markdown chords go with it. A \
-         second PNG appeared, so the gate reaches the promoted pane now — flip \
-         this pin"
+        2,
+        "the promotion does not switch the paste hook off: the same gesture that \
+         landed an attachment moments ago lands another one on the promoted \
+         pane. Still 1 means the pane lost the keyboard across the swap (or the \
+         gate went back to requiring a `TextEdit`) and the hook went dark with it"
     );
 }
 
-/// Cell 3 — and clicking the pane does not give any of it back.
+/// Cell 2b — the chords the restored focus does NOT bring back.
 ///
-/// The focus->active sync matches `pane_editor_id` alone, so a promoted pane is
-/// unreachable: `self.active` stays on whichever pane was last a `TextEdit`, and
-/// the status bar's counters, encoding, language, EOL, caret readout and the
-/// diagnostics span resolution all keep describing THAT pane while the user
-/// looks at this one.
+/// This is the half of the `editor_focused` block that focus alone cannot fix,
+/// pinned separately because it is a SECOND defect rather than a leftover of the
+/// first. Every markdown chord latches a `pending_*` that
+/// `apply_pending_caret_ops` drains through `TextEdit::load_state` ->
+/// `active_line_span`. A promoted pane keeps no `TextEditState`, so the drain
+/// finds nothing and returns; the chord is dead on this surface no matter who
+/// owns the keyboard.
 ///
-/// R22 pins the same gap for a pane that was always a rope pane. This is the
-/// direction a user actually reaches it — the pane was theirs, and the app
-/// quietly stopped agreeing.
+/// Which is exactly why the chord gate carries an extra term
+/// (`active_on_textedit`) that the paste gate does not. Widening it to plain
+/// focus does not deliver a chord — it makes the app CONSUME the keystroke and
+/// then drop the latch, and Ctrl+Enter and Ctrl+D are keys the rope editor
+/// implements natively. A swallowed keystroke is strictly worse than an absent
+/// chord: the user gets nothing AND loses the behaviour the surface did have.
+///
+/// So the two assertions are one gesture read twice. Ctrl+Enter must NOT make a
+/// checkbox (the chord is still absent — the gap) and MUST still insert the
+/// rope editor's own newline (the key was left alone — the guard). Grafting the
+/// chord gate open to `editor_focused` turns the second one red.
+#[test]
+fn a_promoted_grid_pane_has_no_markdown_chords_but_keeps_the_keys() {
+    let mut f = promotable();
+    f.p.mod_click(&mut f.app, f.body0, egui::Modifiers::NONE);
+    f.p.idle(&mut f.app);
+    promote(&mut f);
+    assert!(
+        f.p.ctx.memory(|m| m.has_focus(f.te0)),
+        "precondition: the promoted pane owns the keyboard, so a chord that does \
+         nothing here is doing nothing for want of a CARET, not for want of focus"
+    );
+
+    let lines_before = f.app.tabs[0].text.lines().count();
+    f.p.frame(
+        &mut f.app,
+        CTRL,
+        vec![egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: CTRL,
+        }],
+    );
+    f.p.idle(&mut f.app);
+
+    assert!(
+        !f.app.tabs[0].text.contains("- [ ]") && !f.app.tabs[0].text.contains("- [x]"),
+        "expected-absent: Ctrl+Enter makes no task checkbox on a promoted pane — \
+         the fixture is all list items, so there was something to toggle, and the \
+         drain still needs a `TextEditState` this surface does not keep. A \
+         checkbox appeared, so the chords reach the rope surface now — flip this pin"
+    );
+    assert_eq!(
+        f.app.tabs[0].text.lines().count(),
+        lines_before + 1,
+        "…and the key is LEFT for the surface that can act on it: the rope \
+         editor's own Ctrl+Enter inserted its newline. An unchanged line count \
+         means the app consumed the chord and dropped the latch, which costs the \
+         user a keystroke they used to have"
+    );
+}
+
+/// Cell 3 — and clicking the pane gives all of it back.
+///
+/// The focus->active sync matches `pane_editor_id`, which used to reach the
+/// `TextEdit` arm alone — so a promoted pane was unreachable: `self.active`
+/// stayed on whichever pane was last a `TextEdit`, and the status bar's
+/// counters, encoding, language, EOL, caret readout and the diagnostics span
+/// resolution all kept describing THAT pane while the user looked at this one.
+/// Now the rope arm registers the same document-scoped id, so the pane the user
+/// clicks is the pane the app talks about.
+///
+/// R22 pins the same wire for a pane that was always a rope pane. This is the
+/// direction a user actually reaches it — the pane was theirs, they pasted a
+/// generated file into it, and the app quietly stopped agreeing about where
+/// they were.
 ///
 /// `active` is moved to the sibling first, and that move is a hard control:
-/// without it "still 0" would be indistinguishable from "came back to 0".
+/// without it "0" would be indistinguishable from "never left 0".
 #[test]
-fn a_promoted_grid_pane_can_no_longer_be_clicked_into_activity() {
+fn a_promoted_grid_pane_can_still_be_clicked_into_activity() {
     let mut f = promotable();
     promote(&mut f);
 
@@ -1377,12 +1476,11 @@ fn a_promoted_grid_pane_can_no_longer_be_clicked_into_activity() {
     f.p.mod_click(&mut f.app, f.body0, egui::Modifiers::NONE);
     f.p.idle(&mut f.app);
     assert_eq!(
-        f.app.active, 1,
-        "expected-absent: clicking the PROMOTED pane's body at {:?} (pane rect \
-         {:?}) must NOT make it active — the focus->active sync matches \
-         `pane_editor_id` alone and this pane no longer registers one. It became \
-         active, so the pane is reachable again — flip this pin (and R22's half \
-         with it)",
+        f.app.active, 0,
+        "clicking the PROMOTED pane's body at {:?} (pane rect {:?}) makes it \
+         active again — the rope arm registers the pane's own `pane_editor_id`, \
+         so the focus->active sync reaches it. Still 1 means the promoted pane is \
+         unreachable and every `active`-keyed surface is describing the sibling",
         f.body0, f.rect0
     );
 }

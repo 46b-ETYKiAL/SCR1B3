@@ -136,6 +136,21 @@ impl ScribeApp {
         // (rather than a modal) owns the keyboard this frame.
         let overlay_open = self.find_open || self.palette_open || self.settings_open;
         let active_read_only = self.tabs[active].doc.is_read_only_large();
+        // Which surface the active pane will render on, decided from the tab
+        // alone and therefore knowable BEFORE anything renders — the same
+        // function the mode badge falls back to.
+        //
+        // `editor_focused` says the pane owns the keyboard; it does NOT say the
+        // pane keeps an `egui::TextEditState`. Only the `TextEdit` arm does, and
+        // every caret-op seam below (`apply_pending_caret_ops` ->
+        // `active_line_span`, `mc_load_primary`) is `TextEdit::load_state` or
+        // nothing. Gating those on focus alone would let them CONSUME chords
+        // (Ctrl+D, Ctrl+Enter) that the rope editor implements natively and then
+        // silently drop the latch — a swallowed keystroke, which is worse than
+        // the chord being absent. So the caret-op gate carries the extra term
+        // and the hooks that need no caret (the image paste) do not.
+        let active_on_textedit = matches!(self.editor_mode_for_tab(active), EditorMode::Standard);
+        let caret_focused = editor_focused && active_on_textedit;
 
         // ---- P2 multi-cursor — pre-render half ----
         // Identical ordering to the single-pane path: reconcile the carets'
@@ -143,7 +158,7 @@ impl ScribeApp {
         // BEFORE any `TextEdit` consumes this frame's events.
         self.mc_reconcile_owner(active);
         self.mc_collapse_on_escape(ctx, overlay_open);
-        let mc_focus = !active_read_only && !overlay_open && editor_focused;
+        let mc_focus = !active_read_only && !overlay_open && caret_focused;
         if mc_focus {
             self.handle_multi_cursor_keys(ctx, editor_id, active);
         }
@@ -191,7 +206,15 @@ impl ScribeApp {
         // This runs BEFORE `CentralPanel::show`, which is the same position the
         // single-pane block occupies relative to its editor: the keys must be
         // consumed before any `TextEdit` sees this frame's events.
-        if !active_read_only && editor_focused {
+        //
+        // The two halves carry DIFFERENT gates, and the difference is the point.
+        // The chords latch a `pending_*` that `apply_pending_caret_ops` drains
+        // through `TextEdit::load_state`, so on a pane with no `TextEditState`
+        // they would consume the key and then do nothing — see `caret_focused`.
+        // The image paste has no such second dependency: it writes its PNG into
+        // the vault before it ever touches a caret, so it is gated on focus
+        // alone and reaches every editable pane the user is typing in.
+        if !active_read_only && caret_focused {
             ctx.input_mut(|i| {
                 use egui::{Key, Modifiers};
                 let ctrl = Modifiers::COMMAND;
@@ -212,13 +235,17 @@ impl ScribeApp {
                     self.pending_wrap_marker = Some("~~");
                 }
             });
-            // Ctrl/Cmd+V with an IMAGE on the clipboard saves it into the
-            // vault's attachments folder and inserts the markdown link. See
-            // `grid_render::image_paste_gesture` for why the hook is the key
-            // RELEASE rather than `consume_key(COMMAND, V)`.
-            if grid_render::image_paste_gesture(ctx) && self.config.notes.vault_dir.is_some() {
-                self.paste_image_attachment();
-            }
+        }
+        // Ctrl/Cmd+V with an IMAGE on the clipboard saves it into the
+        // vault's attachments folder and inserts the markdown link. See
+        // `grid_render::image_paste_gesture` for why the hook is the key
+        // RELEASE rather than `consume_key(COMMAND, V)`.
+        if !active_read_only
+            && editor_focused
+            && grid_render::image_paste_gesture(ctx)
+            && self.config.notes.vault_dir.is_some()
+        {
+            self.paste_image_attachment();
         }
 
         // ---- Inline LSP diagnostics (single-pane parity) ----
@@ -383,7 +410,19 @@ impl ScribeApp {
                         ui,
                         super::drag_scroll::DEFAULT_SCROLL_SALT,
                     );
-                    let focus_id = super::drag_scroll::rope_editor_focus_id(ui);
+                    // A pane's keyboard identity is its DOCUMENT, not the
+                    // surface that happens to be rendering it. `RopeEditor`
+                    // otherwise derives its focus id from the `Ui` path, which
+                    // is only reproducible from inside this closure — so when a
+                    // pane crossed `rope_editor_auto_threshold_bytes` mid-session
+                    // the `TextEdit` stopped being created, its focus was
+                    // dropped, and the focus->active sync at the top of this
+                    // function (which runs BEFORE any `ui` exists) had nothing
+                    // to match. The pane went dark: no keyboard, no way to click
+                    // it back into `active`, and the status bar carried on
+                    // describing a different pane. Handing the widget the pane's
+                    // own id makes focus survive the swap.
+                    let focus_id = pane_id;
                     let viewport = ui.max_rect();
                     let tab = &mut tabs[idx];
                     // Lazily (re)build the persistent rope from `text`, as a
@@ -403,6 +442,7 @@ impl ScribeApp {
                             .with_gutter_color(muted)
                             .with_line_numbers(show_line_numbers)
                             .with_render_whitespace(render_whitespace)
+                            .with_focus_id(focus_id)
                             .with_syntax(hl, ext.clone());
                     if snippets_enabled {
                         editor = editor.with_snippets(snippets);
