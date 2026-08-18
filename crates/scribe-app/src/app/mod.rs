@@ -2557,6 +2557,9 @@ mod grid_pane_tests;
 mod grid_parity_tests;
 
 #[cfg(test)]
+mod inline_preview_parity_tests;
+
+#[cfg(test)]
 mod filetree_tests;
 
 #[cfg(test)]

@@ -28,7 +28,7 @@ use egui_kittest::kittest::Queryable as _;
 
 /// A grid config whose rope-swap threshold is tiny, so a few KiB of text is
 /// enough to cross the "large file" cliff that the badge exists to announce.
-fn grid_config() -> Config {
+pub(super) fn grid_config() -> Config {
     let mut cfg = Config::default();
     cfg.editor.first_run_completed = true;
     cfg.appearance.frameless = false;
@@ -512,18 +512,18 @@ fn pane_editor_ids_are_document_scoped_and_distinct() {
 /// `Shape::LineSegment`s in the severity colour (`render_support::paint_squiggle`
 /// emits nothing else), and a tooltip is a `Shape::Text` carrying the message.
 /// Both are decidable from the shapes alone, with no pixels and no GPU.
-struct Probe {
-    ctx: egui::Context,
+pub(super) struct Probe {
+    pub(super) ctx: egui::Context,
 }
 
 impl Probe {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             ctx: egui::Context::default(),
         }
     }
 
-    fn frame(
+    pub(super) fn frame(
         &self,
         app: &mut ScribeApp,
         modifiers: egui::Modifiers,
@@ -541,14 +541,14 @@ impl Probe {
         self.ctx.run(input, |ctx| app.frame_tick(ctx))
     }
 
-    fn idle(&self, app: &mut ScribeApp) -> egui::FullOutput {
+    pub(super) fn idle(&self, app: &mut ScribeApp) -> egui::FullOutput {
         self.frame(app, egui::Modifiers::NONE, Vec::new())
     }
 
     /// Settle the app: `sync_grid_state` allocates doc ids on the first frame
     /// and the panes lay out on the second, so nothing is measurable before
     /// the third.
-    fn settle(&self, app: &mut ScribeApp) {
+    pub(super) fn settle(&self, app: &mut ScribeApp) {
         self.idle(app);
         self.idle(app);
     }
@@ -593,7 +593,7 @@ impl Probe {
 
 /// egui nests shapes in `Shape::Vec`, so a flat scan of `FullOutput::shapes`
 /// misses everything a panel painted.
-fn walk_shape(shape: &egui::Shape, f: &mut impl FnMut(&egui::Shape)) {
+pub(super) fn walk_shape(shape: &egui::Shape, f: &mut impl FnMut(&egui::Shape)) {
     if let egui::Shape::Vec(inner) = shape {
         for s in inner {
             walk_shape(s, f);

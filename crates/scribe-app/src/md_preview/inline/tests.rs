@@ -357,16 +357,34 @@ fn constructs_owned_by_the_existing_colouring_layer_are_left_alone() {
     // implementation of a shipped feature, and the user's per-token switch would
     // stop working. This pin turns red the moment one is added — which is the
     // point: it is the rehearsal of the edit that must NOT be made silently.
+    //
+    // Stated as an EXACT span set, not as "no content-styled spans". The first
+    // draft filtered `Marker` out before asserting, which meant a divider or a
+    // table pipe styled as a marker would have slipped straight through — the pin
+    // could not have gone red for the most likely way of adding one. A mutation
+    // pass is what surfaced that; the assertion below has no such escape.
+    //
+    // The ONE legitimate span here is the task item's `- ` bullet: that is a list
+    // marker, which this module does own. The task BOX `[x]` inside it belongs to
+    // `md_color_task_boxes` and must stay untouched.
     let src = "---\n#tag\n~~gone~~\n- [x] done\n| a | b |\n";
     let got = spans(src);
-    let content: Vec<_> = got
+    let item_at = src.find("- [x]").expect("the fixture has a task item");
+    let expected = vec![(item_at..(item_at + 2), InlineStyle::ListMarker)];
+    let actual: Vec<_> = got
         .iter()
-        .filter(|s| s.style != InlineStyle::ListMarker && s.style != InlineStyle::Marker)
-        .map(|s| (&src[s.range.clone()], s.style))
-        .collect();
-    assert!(
-        content.is_empty(),
-        "these constructs belong to the MdColorOpts layer; inline styled {content:?}"
+        .map(|s| (s.range.clone(), s.style))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        actual,
+        expected,
+        "dividers, #tags, ~~strike~~, task boxes and table pipes belong to the \
+         MdColorOpts colouring layer, which is per-token switchable in Settings; \
+         styling one here would be a second implementation and would silently \
+         override the user's switch. Styled: {:?}",
+        got.iter()
+            .map(|s| (&src[s.range.clone()], s.style))
+            .collect::<Vec<_>>()
     );
 }
 
@@ -494,22 +512,29 @@ fn a_heading_grows_both_the_glyph_and_its_row() {
     // setting. Growing the glyph inside an unchanged row clips the ascenders, so
     // the row has to grow with it — a defect that is invisible in a span dump and
     // only shows up in the format.
+    //
+    // Neither assertion may compute its expected value by calling
+    // `heading_scale` — that is the function under test, and a mutation pass
+    // caught exactly that: with the whole scale table flattened to 1.0 this cell
+    // stayed GREEN, because it was asking the product what the answer should be.
+    // The growth claim is now stated against the BASE size, and the row claim
+    // against the ratio actually OBSERVED on the glyph.
     let src = "# Title\n";
     let mut j = job(src);
     restyle_job(&mut j, &spans(src), &palette());
     let head = section_at(&j, 3).format.clone();
-    let scale = heading_scale(1);
     assert!(
-        (head.font_id.size - BASE_SIZE * scale).abs() < 1e-3,
-        "heading glyph not scaled: {} vs {}",
-        head.font_id.size,
-        BASE_SIZE * scale
+        head.font_id.size > BASE_SIZE,
+        "the heading glyph must be larger than body text: {} vs {BASE_SIZE}",
+        head.font_id.size
     );
+    let observed = head.font_id.size / BASE_SIZE;
     assert!(
         head.line_height
-            .is_some_and(|h| (h - BASE_LINE_H * scale).abs() < 1e-3),
-        "heading row not scaled with the glyph: {:?}",
-        head.line_height
+            .is_some_and(|h| (h - BASE_LINE_H * observed).abs() < 1e-3),
+        "the row must grow by the same ratio the glyph did ({observed}x): {:?} vs {}",
+        head.line_height,
+        BASE_LINE_H * observed
     );
     assert_eq!(head.color, palette().heading, "heading tone");
     // ...and the marker beside it is dimmed at BODY size, so the contrast is real.
@@ -527,19 +552,31 @@ fn an_inner_construct_refines_the_outer_one_instead_of_erasing_it() {
     // colour. A last-span-wins rule would drop the size (the strong span is
     // narrower and emitted later); a first-span-wins rule would drop the colour.
     // Only widest-first composition gets both, and only this test can tell.
+    //
+    // Stated against the size the SIBLING heading text actually got, never against
+    // `heading_scale` — a mutation pass caught this cell staying green with the
+    // scale table flattened to 1.0, because it was asking the product for its own
+    // expected value.
     let src = "# a **b** c\n";
     let mut j = job(src);
     restyle_job(&mut j, &spans(src), &palette());
-    let strong = section_at(&j, 6).format.clone();
+    let plain_heading = section_at(&j, 2).format.clone(); // `a` — heading, not strong
+    let strong = section_at(&j, 6).format.clone(); // `b` — heading AND strong
+    assert!(
+        plain_heading.font_id.size > BASE_SIZE,
+        "precondition: the heading must have grown at all, else `the size survived` \
+         is a claim about nothing"
+    );
     assert_eq!(
         strong.color,
         palette().strong,
         "inner construct sets the tone"
     );
     assert!(
-        (strong.font_id.size - BASE_SIZE * heading_scale(1)).abs() < 1e-3,
-        "the outer heading's size must survive the inner span: {}",
-        strong.font_id.size
+        (strong.font_id.size - plain_heading.font_id.size).abs() < 1e-3,
+        "the outer heading's size must survive the inner span: {} vs {}",
+        strong.font_id.size,
+        plain_heading.font_id.size
     );
 }
 
@@ -644,5 +681,50 @@ fn a_span_reaching_past_the_text_cannot_corrupt_the_sections() {
             .iter()
             .map(|s| s.byte_range.clone())
             .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn spans_taken_from_the_wrong_string_land_on_the_wrong_bytes() {
+    // THE CONTROL for the fold view's projected-buffer cell.
+    //
+    // `inline_preview_parity_tests::the_fold_view_styles_the_projection_it_\
+    // actually_laid_out` asserts that a COLLAPSED fold still styles its own
+    // heading. That is only worth something if the opposite would genuinely fail,
+    // so this pins the failure directly: spans derived from the DOCUMENT, applied
+    // to a job built over the PROJECTION, style the wrong bytes.
+    //
+    // This is why `restyle_job` takes spans the caller derived from the string it
+    // laid out, and why `make_layouter` has exactly one string in scope to derive
+    // them from. The hazard is real; the shape of the API is what forecloses it.
+    let document = "# Alpha\nbody of alpha\n# Beta\ntail line\n";
+    // What a collapsed first section projects to: Alpha's body is gone.
+    let projection = "# Alpha\n# Beta\ntail line\n";
+
+    let doc_at = document.find("Beta").expect("in document");
+    let proj_at = projection.find("Beta").expect("in projection");
+    assert_ne!(
+        doc_at, proj_at,
+        "the fixture must actually shift the offsets, else neither direction can be \
+         distinguished from the other"
+    );
+
+    // Right: spans from the string being laid out.
+    let mut right = job(projection);
+    restyle_job(&mut right, &spans(projection), &palette());
+    assert_eq!(
+        section_at(&right, proj_at).format.color,
+        palette().heading,
+        "projection-derived spans must style the projection's own heading"
+    );
+
+    // Wrong: spans from the document, applied to the projection.
+    let mut wrong = job(projection);
+    restyle_job(&mut wrong, &spans(document), &palette());
+    assert_ne!(
+        section_at(&wrong, proj_at).format.color,
+        palette().heading,
+        "document-derived spans must MISS the projection's heading — if they hit it \
+         anyway, this fixture cannot discriminate and the fold cell proves nothing"
     );
 }

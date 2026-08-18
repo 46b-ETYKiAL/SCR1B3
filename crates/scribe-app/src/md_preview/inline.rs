@@ -440,20 +440,20 @@ pub fn restyle_job(job: &mut egui::text::LayoutJob, spans: &[InlineSpan], pal: &
     if spans.is_empty() || job.sections.is_empty() {
         return;
     }
-    // Cut points: every section boundary plus every span boundary, so each
-    // resulting piece is uniform in both the base format and the applied styles.
-    let text_len = job.text.len();
-    let mut cuts: Vec<usize> = Vec::with_capacity(job.sections.len() * 2 + spans.len() * 2);
-    for s in &job.sections {
-        cuts.push(s.byte_range.start);
-        cuts.push(s.byte_range.end);
-    }
+    // Cut points: the SPAN boundaries only.
+    //
+    // Section boundaries are deliberately NOT collected, and out-of-range cuts are
+    // deliberately NOT filtered — both would be dead code. The rebuild loop below
+    // walks one section at a time and takes only the cuts STRICTLY INSIDE it, so a
+    // section's own start/end can never be selected (the inequalities exclude
+    // them) and a cut past the end of the text can never fall inside any section.
+    // A mutation pass proved both: neither an added section-boundary cut nor an
+    // out-of-range one changes a single output section. Keeping them would be
+    // defensive-looking code that no test could ever hold to account.
+    let mut cuts: Vec<usize> = Vec::with_capacity(spans.len() * 2);
     for s in spans {
-        for c in [s.range.start, s.range.end] {
-            if c <= text_len {
-                cuts.push(c);
-            }
-        }
+        cuts.push(s.range.start);
+        cuts.push(s.range.end);
     }
     cuts.sort_unstable();
     cuts.dedup();
