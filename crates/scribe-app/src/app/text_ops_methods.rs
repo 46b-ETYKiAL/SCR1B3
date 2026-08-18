@@ -294,7 +294,7 @@ impl ScribeApp {
             self.toast = Some("Commenting isn't available for this file type.".to_string());
             return;
         }
-        let text = &mut self.tabs[self.active].text;
+        let text = &self.tabs[self.active].text;
         // Cheap full-buffer rewrite: split, decide direction by ALL-vs-ANY,
         // toggle, rejoin. The user's "selection" surface is the whole
         // buffer until we wire egui's selection range through to the rope
@@ -332,12 +332,16 @@ impl ScribeApp {
             .collect();
         // Preserve a trailing newline if the original buffer had one.
         let trailing_nl = text.ends_with('\n');
-        *text = new_lines.join("\n");
+        let mut new_text = new_lines.join("\n");
         if trailing_nl {
-            text.push('\n');
+            new_text.push('\n');
         }
+        // MUST go through `set_text`: writing `text` in place leaves the
+        // persistent `rope_buf` alive, and on the rope path the next content
+        // edit writes that stale rope back over `text`, destroying this edit.
+        // `set_text` also bumps `edit_gen` (no manual bump here).
         let i = self.active;
-        self.tabs[i].edit_gen = self.tabs[i].edit_gen.wrapping_add(1);
+        self.tabs[i].set_text(new_text);
     }
 
     /// F-017 — Swap the cursor line with the neighbour `dir` rows away (-1 =
@@ -353,7 +357,7 @@ impl ScribeApp {
             .last_cursor_line_col
             .map(|(l, _)| l.saturating_sub(1))
             .unwrap_or(0);
-        let text = &mut self.tabs[self.active].text;
+        let text = &self.tabs[self.active].text;
         let trailing_nl = text.ends_with('\n');
         let mut lines: Vec<String> = text.split('\n').map(str::to_string).collect();
         // split('\n') with a trailing newline produces a trailing "" — drop it.
@@ -382,12 +386,13 @@ impl ScribeApp {
         let new_ln = target as usize + 1;
         let new_col = self.last_cursor_line_col.map(|(_, c)| c).unwrap_or(1);
         self.last_cursor_line_col = Some((new_ln, new_col));
-        *text = lines.join("\n");
+        let mut new_text = lines.join("\n");
         if trailing_nl {
-            text.push('\n');
+            new_text.push('\n');
         }
+        // MUST go through `set_text` — see `toggle_comment_active`.
         let i = self.active;
-        self.tabs[i].edit_gen = self.tabs[i].edit_gen.wrapping_add(1);
+        self.tabs[i].set_text(new_text);
     }
 
     /// F-017 — Duplicate the cursor line in-place: the new copy lands on the
@@ -400,7 +405,7 @@ impl ScribeApp {
             .last_cursor_line_col
             .map(|(l, _)| l.saturating_sub(1))
             .unwrap_or(0);
-        let text = &mut self.tabs[self.active].text;
+        let text = &self.tabs[self.active].text;
         let trailing_nl = text.ends_with('\n');
         let mut lines: Vec<String> = text.split('\n').map(str::to_string).collect();
         if trailing_nl && lines.last().is_some_and(|l| l.is_empty()) {
@@ -416,12 +421,13 @@ impl ScribeApp {
         // both yield `[…, X, X, …]` — identical output for every input. No test
         // can kill it because there is nothing to detect.
         lines.insert(ln + 1, copy);
-        *text = lines.join("\n");
+        let mut new_text = lines.join("\n");
         if trailing_nl {
-            text.push('\n');
+            new_text.push('\n');
         }
+        // MUST go through `set_text` — see `toggle_comment_active`.
         let i = self.active;
-        self.tabs[i].edit_gen = self.tabs[i].edit_gen.wrapping_add(1);
+        self.tabs[i].set_text(new_text);
     }
 
     // -------------------------------------------------------------------
@@ -793,7 +799,7 @@ impl ScribeApp {
             .last_cursor_line_col
             .map(|(l, _)| l.saturating_sub(1))
             .unwrap_or(0);
-        let text = &mut self.tabs[self.active].text;
+        let text = &self.tabs[self.active].text;
         let trailing_nl = text.ends_with('\n');
         let mut lines: Vec<String> = text.split('\n').map(str::to_string).collect();
         if trailing_nl && lines.last().is_some_and(|l| l.is_empty()) {
@@ -810,11 +816,415 @@ impl ScribeApp {
         } else {
             format!("{cur} {nxt}")
         };
-        *text = lines.join("\n");
+        let mut new_text = lines.join("\n");
         if trailing_nl {
-            text.push('\n');
+            new_text.push('\n');
         }
+        // MUST go through `set_text` — see `toggle_comment_active`.
         let i = self.active;
-        self.tabs[i].edit_gen = self.tabs[i].edit_gen.wrapping_add(1);
+        self.tabs[i].set_text(new_text);
+    }
+}
+
+/// Regression tests for the two silent data-loss defects on the rope path.
+///
+/// Defect 1 — the in-place line/comment commands wrote `tabs[i].text` directly,
+/// leaving the persistent `rope_buf` alive. On the rope path `frame_tick`
+/// rebuilds the rope only when `rope_buf.is_none()`, so the stale rope survived
+/// the command and the next content edit wrote it straight back over `text`,
+/// destroying the user's edit with no error.
+///
+/// Defect 2 — `set_text` cleared `rope_buf` but never `rope_state`, whose undo
+/// `History` holds snapshots of the PREVIOUS content. The first Undo after an
+/// external edit therefore restored a buffer the user never had.
+#[cfg(test)]
+mod rope_writeback_tests {
+    use super::*;
+    use scribe_core::config::Config;
+
+    /// The rope path is selected by `use_rope_editor(experimental, text_len,
+    /// auto_threshold)` — a pure size comparison already pinned by
+    /// `wave3_perf_tests::use_rope_editor_decision_matrix`. The 16 MiB default
+    /// is not load-bearing for these defects; it only decides *when* the rope
+    /// path engages. These tests therefore lower the threshold and use a buffer
+    /// above it, taking the byte-identical `frame_tick` branch a 16 MiB file
+    /// takes — without a multi-second debug-build frame over a 16 MiB rope
+    /// (exactly why the sibling 8 MiB scale test is `#[ignore]`d and so never
+    /// actually protects anything).
+    const ROPE_THRESHOLD_BYTES: usize = 64;
+
+    fn rope_path_config() -> Config {
+        let mut cfg = Config::default();
+        cfg.editor.first_run_completed = true;
+        // Auto-promotion by size — NOT the `experimental_rope_editor` opt-in,
+        // so this is the same path a large file takes for a default user.
+        cfg.editor.experimental_rope_editor = false;
+        cfg.editor.rope_editor_auto_threshold_bytes = ROPE_THRESHOLD_BYTES;
+        cfg
+    }
+
+    /// Run `n` full UI frames against a fresh headless egui context.
+    fn run_frames(app: &mut ScribeApp, n: usize) {
+        let ctx = egui::Context::default();
+        for _ in 0..n {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(1100.0, 720.0),
+                )),
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| app.frame_tick(ctx));
+        }
+    }
+
+    fn text_event(s: &str) -> egui::Event {
+        egui::Event::Text(s.to_string())
+    }
+
+    fn ctrl_z() -> egui::Event {
+        egui::Event::Key {
+            key: egui::Key::Z,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers {
+                command: true,
+                ctrl: true,
+                ..Default::default()
+            },
+        }
+    }
+
+    /// A `.rs` file comfortably over `ROPE_THRESHOLD_BYTES` so the rope path
+    /// engages, with a language hint so `toggle_comment_active` has a prefix.
+    fn open_rope_backed_rs_file(app: &mut ScribeApp) -> (tempfile::TempDir, usize) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rope_backed.rs");
+        let body: String = (0..12).map(|i| format!("fn f{i}() {{}}\n")).collect();
+        assert!(
+            body.len() > ROPE_THRESHOLD_BYTES,
+            "fixture must exceed the rope threshold or the test proves nothing \
+             (got {} bytes, need > {ROPE_THRESHOLD_BYTES})",
+            body.len()
+        );
+        std::fs::write(&path, &body).unwrap();
+        app.open_path(path);
+        let idx = app.active;
+        (dir, idx)
+    }
+
+    /// The invariant every in-place command must hold: after the command and
+    /// the frames that follow it, the persistent rope and `text` agree.
+    ///
+    /// This is the exact precondition of the write-back at `frame_tick`'s
+    /// `resp.content_changed` arm (`tab.text = rope.to_string()`). When rope
+    /// and `text` agree that write-back is a no-op and the user's edit is
+    /// safe; when they diverge it silently overwrites `text` with the stale
+    /// rope. Asserting the agreement therefore proves the edit survives the
+    /// next keystroke without re-implementing the write-back in the test.
+    fn assert_rope_and_text_agree(app: &ScribeApp, idx: usize, label: &str) {
+        let rope = app.tabs[idx]
+            .rope_buf
+            .as_ref()
+            .and_then(scribe_core::buffer::Buffer::as_rope)
+            .map(std::string::ToString::to_string)
+            .unwrap_or_else(|| {
+                panic!("{label}: the rope path must have (re)built a persistent rope")
+            });
+        assert_eq!(
+            rope, app.tabs[idx].text,
+            "{label}: the persistent rope still holds PRE-command content — the next \
+             keystroke's write-back would overwrite `text` with it and destroy the edit"
+        );
+    }
+
+    /// Drive one in-place command on a rope-backed buffer and prove the edit
+    /// both lands in `text` AND survives the following frames.
+    fn assert_command_survives_rope_writeback(label: &str, command: impl FnOnce(&mut ScribeApp)) {
+        let mut app = ScribeApp::new_test(rope_path_config());
+        let (_dir, idx) = open_rope_backed_rs_file(&mut app);
+
+        // Frames build + persist the rope (the state a user has after scrolling
+        // around a large file for a moment).
+        run_frames(&mut app, 3);
+        assert!(
+            app.tabs[idx].rope_buf.is_some(),
+            "{label}: precondition — the rope path must be active for this fixture"
+        );
+        let before = app.tabs[idx].text.clone();
+
+        app.last_cursor_line_col = Some((1, 1));
+        command(&mut app);
+
+        let after_command = app.tabs[idx].text.clone();
+        assert_ne!(
+            before, after_command,
+            "{label}: precondition — the command must actually change the buffer"
+        );
+
+        // The next frames: the rope is rebuilt from the new `text`.
+        run_frames(&mut app, 2);
+        assert_rope_and_text_agree(&app, idx, label);
+        assert_eq!(
+            app.tabs[idx].text, after_command,
+            "{label}: the user's edit must still be in the buffer after the \
+             following frames"
+        );
+    }
+
+    // ---- Defect 1: one test per command that mutated `text` in place ----
+
+    #[test]
+    fn toggle_comment_survives_the_rope_writeback() {
+        assert_command_survives_rope_writeback("toggle-comment", |app| {
+            app.toggle_comment_active();
+        });
+    }
+
+    #[test]
+    fn duplicate_line_survives_the_rope_writeback() {
+        assert_command_survives_rope_writeback("duplicate-line", |app| {
+            app.duplicate_cursor_line();
+        });
+    }
+
+    #[test]
+    fn move_line_survives_the_rope_writeback() {
+        assert_command_survives_rope_writeback("move-line", |app| {
+            app.move_cursor_line(1);
+        });
+    }
+
+    #[test]
+    fn join_line_survives_the_rope_writeback() {
+        assert_command_survives_rope_writeback("join-line", |app| {
+            app.join_cursor_line_with_next();
+        });
+    }
+
+    // ---- Defect 2: undo after an external edit on the rope path ----
+
+    /// Types through the REAL `scribe_render::apply_event` path (so the undo
+    /// history records a genuine snapshot), performs a command-palette-class
+    /// edit, then presses Ctrl+Z. Undo must never resurrect the pre-edit
+    /// content over the newer buffer.
+    #[test]
+    fn undo_after_external_edit_does_not_resurrect_pre_edit_content() {
+        let mut app = ScribeApp::new_test(rope_path_config());
+        let (_dir, idx) = open_rope_backed_rs_file(&mut app);
+        run_frames(&mut app, 3);
+
+        let original = app.tabs[idx].text.clone();
+
+        // 1. The user types — the rope editor records an undo snapshot of
+        //    `original` and the frame syncs the rope back into `text`.
+        {
+            let tab = &mut app.tabs[idx];
+            let state = tab
+                .rope_state
+                .as_mut()
+                .expect("the rope path creates its editing state on first frame");
+            let rope = tab
+                .rope_buf
+                .as_mut()
+                .and_then(scribe_core::buffer::Buffer::as_rope_mut)
+                .expect("the rope path builds a persistent rope");
+            scribe_render::apply_event(rope, state, &text_event("Z"));
+            tab.text = rope.to_string();
+        }
+        let typed = app.tabs[idx].text.clone();
+        assert_ne!(typed, original, "precondition — typing changed the buffer");
+
+        // 2. A command-palette / find-replace class edit replaces the buffer.
+        //    The replacement must ALSO stay above the rope threshold, or
+        //    `use_rope_editor` hands the tab back to the egui TextEdit path and
+        //    the test stops exercising the rope undo at all.
+        let replaced: String = (0..12).map(|i| format!("fn g{i}() {{}}\n")).collect();
+        assert!(
+            replaced.len() > ROPE_THRESHOLD_BYTES,
+            "the replacement must keep the tab on the rope path"
+        );
+        app.tabs[idx].set_text(replaced.clone());
+        run_frames(&mut app, 2);
+        assert_eq!(
+            app.tabs[idx].text, replaced,
+            "precondition — the external edit landed"
+        );
+
+        // 3. Undo.
+        {
+            let tab = &mut app.tabs[idx];
+            let state = tab.rope_state.as_mut().expect("rope state present");
+            let rope = tab
+                .rope_buf
+                .as_mut()
+                .and_then(scribe_core::buffer::Buffer::as_rope_mut)
+                .expect("rope rebuilt after the external edit");
+            scribe_render::apply_event(rope, state, &ctrl_z());
+            tab.text = rope.to_string();
+        }
+
+        let restored = app.tabs[idx].text.clone();
+        assert_ne!(
+            restored, typed,
+            "undo restored content from BEFORE the external edit — the user's \
+             current buffer was silently destroyed"
+        );
+        assert_ne!(
+            restored, original,
+            "undo restored the pre-typing content — a buffer two edits stale"
+        );
+        assert_eq!(
+            restored, replaced,
+            "the history described content that no longer exists, so undo must \
+             be a no-op and leave the current buffer intact"
+        );
+
+        // The caret must stay addressable in the NEW buffer.
+        let cursor = app.tabs[idx]
+            .rope_state
+            .as_ref()
+            .map_or(0, |s| s.edit.cursor);
+        assert!(
+            cursor <= app.tabs[idx].text.chars().count(),
+            "caret {cursor} is past the end of the {}-char buffer",
+            app.tabs[idx].text.chars().count()
+        );
+    }
+
+    /// A caret already inside the buffer is kept (clamped) rather than thrown
+    /// back to the origin, so an in-place command does not scroll the user to
+    /// the top of a large file.
+    #[test]
+    fn set_text_clamps_rather_than_discards_the_caret() {
+        let mut tab = EditorTab::scratch();
+        tab.text = "0123456789".to_string();
+        let mut st = scribe_render::RopeEditorState::new();
+        st.edit = scribe_core::editing::EditState::at(9);
+        tab.rope_state = Some(st);
+
+        // Shorter replacement → the old caret is out of range and must clamp.
+        tab.set_text("abc".to_string());
+        assert_eq!(
+            tab.rope_state.as_ref().map(|s| s.edit.cursor),
+            Some(3),
+            "an out-of-range caret must clamp to the new end, never point past it"
+        );
+
+        // Longer replacement → the caret is in range and is preserved.
+        let mut st = scribe_render::RopeEditorState::new();
+        st.edit = scribe_core::editing::EditState::at(2);
+        tab.rope_state = Some(st);
+        tab.set_text("abcdefghij".to_string());
+        assert_eq!(
+            tab.rope_state.as_ref().map(|s| s.edit.cursor),
+            Some(2),
+            "an in-range caret is preserved so the view does not jump to the top"
+        );
+    }
+
+    /// A tab the rope editor has not claimed keeps `rope_state == None` — the
+    /// next frame builds it fresh, and creating one here would be pointless
+    /// work on every `set_text` for every egui-TextEdit-path tab.
+    #[test]
+    fn set_text_leaves_an_unclaimed_tab_without_rope_state() {
+        let mut tab = EditorTab::scratch();
+        tab.text = "before".to_string();
+        assert!(tab.rope_state.is_none());
+        tab.set_text("after".to_string());
+        assert!(
+            tab.rope_state.is_none(),
+            "set_text must not fabricate editing state for a tab the rope \
+             editor never claimed"
+        );
+    }
+
+    // ---- The cache-invalidation audit ----
+
+    /// Every `EditorTab` field that is DERIVED from `text` must be invalidated
+    /// by `set_text`.
+    ///
+    /// The exhaustive destructuring below is the load-bearing part: adding a
+    /// field to `EditorTab` makes this test fail TO COMPILE, forcing whoever
+    /// adds it to decide whether `set_text` must invalidate it. Never replace
+    /// it with `..` — the missing-field compile error IS the assertion.
+    #[test]
+    fn set_text_invalidates_every_text_derived_cache() {
+        let mut app = ScribeApp::new_test(rope_path_config());
+        let (_dir, idx) = open_rope_backed_rs_file(&mut app);
+        // Warm every text-derived cache: the rope, the rope editing state (via
+        // a real typed edit, so the undo history is non-empty), and the
+        // gen-keyed change-bar cache.
+        run_frames(&mut app, 3);
+        {
+            let tab = &mut app.tabs[idx];
+            let state = tab.rope_state.as_mut().expect("rope state present");
+            let rope = tab
+                .rope_buf
+                .as_mut()
+                .and_then(scribe_core::buffer::Buffer::as_rope_mut)
+                .expect("rope present");
+            scribe_render::apply_event(rope, state, &text_event("Q"));
+            tab.text = rope.to_string();
+        }
+        app.ensure_change_states(idx);
+        assert!(
+            app.tabs[idx].change_gen.is_some(),
+            "precondition — the change-bar cache is warm"
+        );
+        assert!(
+            app.tabs[idx]
+                .rope_state
+                .as_ref()
+                .is_some_and(|s| s.history.retained_bytes() > 0),
+            "precondition — the undo history holds a snapshot of the old content"
+        );
+        let gen_before = app.tabs[idx].edit_gen;
+
+        app.tabs[idx].set_text("fn replaced() {}\n".to_string());
+
+        let EditorTab {
+            doc: _,
+            text,
+            doc_id: _,
+            pinned: _,
+            disk_mtime: _,
+            disk_text: _,
+            rope_state,
+            rope_buf,
+            bookmarks: _,
+            edit_gen,
+            external_change: _,
+            session_baseline: _,
+            saved_baseline: _,
+            change_states: _,
+            change_gen,
+        } = &app.tabs[idx];
+
+        assert_eq!(text, "fn replaced() {}\n", "the new content is in place");
+        assert!(
+            rope_buf.is_none(),
+            "`rope_buf` caches the OLD content — it must be invalidated or the \
+             next keystroke writes it back over `text`"
+        );
+        assert!(
+            rope_state
+                .as_ref()
+                .is_some_and(|s| s.history.retained_bytes() == 0),
+            "`rope_state.history` holds snapshots of the OLD content — it must \
+             be dropped or undo restores a buffer the user never had"
+        );
+        assert_ne!(
+            *edit_gen, gen_before,
+            "`edit_gen` keys the minimap / spellcheck / change-bar caches — it \
+             must move or every one of them serves stale derived data"
+        );
+        assert_ne!(
+            *change_gen,
+            Some(*edit_gen),
+            "the change-bar cache must not claim to be computed for the new \
+             generation"
+        );
     }
 }
