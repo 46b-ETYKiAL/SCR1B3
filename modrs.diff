@@ -1,0 +1,384 @@
+diff --git a/crates/scribe-render/src/rope_editor/mod.rs b/crates/scribe-render/src/rope_editor/mod.rs
+index 9b780ad..0ffc12e 100644
+--- a/crates/scribe-render/src/rope_editor/mod.rs
++++ b/crates/scribe-render/src/rope_editor/mod.rs
+@@ -38,7 +38,9 @@ use egui::text::LayoutJob;
+ use egui::{Color32, FontId, TextFormat, Ui};
+ use ropey::Rope;
+ 
++pub mod page_nav;
+ mod tab_geometry;
++pub mod word_nav;
+ use scribe_core::buffer::Buffer;
+ use scribe_core::syntax::{Highlighter, HlSpan, IncrementalHighlightState};
+ use tab_geometry::{col_to_rel_x, layout_line, rel_x_to_col};
+@@ -577,6 +579,14 @@ impl<'a> RopeEditor<'a> {
+                 range
+             });
+ 
++        // Record the viewport's row count for the NEXT frame's PageUp/PageDown
++        // (the input phase runs before this paint, so the step is always the
++        // last painted height — which is what the user just saw). One row is
++        // held back so a page keeps a line of context, matching every editor.
++        state.page_rows = ((scroll.inner_rect.height() / line_h).floor() as usize)
++            .saturating_sub(1)
++            .max(1);
++
+         // Pointer input: click to place the caret, click-drag to select,
+         // shift-click to extend (TextEdit parity). Clicking also focuses the
+         // editor so keyboard input flows.
+@@ -980,8 +990,17 @@ pub struct RopeEditorState {
+     /// Edit-generation-keyed whole-document highlight cache (P-02 fix +
+     /// C-01 cross-line correctness). See [`HighlightCache`].
+     hl_cache: HighlightCache,
++    /// Rows of text the viewport showed on the last painted frame — the step
++    /// PageUp/PageDown moves by. Refreshed by `show_editable` each frame (so
++    /// it tracks window resizes / zoom); [`DEFAULT_PAGE_ROWS`] until the first
++    /// paint, and for headless callers that drive `apply_event` directly.
++    page_rows: usize,
+ }
+ 
++/// PageUp/PageDown step used before the first paint has reported a real
++/// viewport height (and by headless `apply_event` callers).
++pub const DEFAULT_PAGE_ROWS: usize = 20;
++
+ impl Default for RopeEditorState {
+     fn default() -> Self {
+         Self {
+@@ -991,6 +1010,7 @@ impl Default for RopeEditorState {
+             block_anchor: None,
+             edit_gen: 0,
+             hl_cache: HighlightCache::default(),
++            page_rows: DEFAULT_PAGE_ROWS,
+         }
+     }
+ }
+@@ -1157,6 +1177,25 @@ pub fn apply_event(
+             state.set_carets(carets);
+         }};
+     }
++    // Step the snapshot history one entry in either direction. Shared by
++    // Ctrl+Z, Ctrl+Shift+Z and Ctrl+Y so the three chords cannot drift apart.
++    macro_rules! history_step {
++        ($dir:ident) => {{
++            state.clear_extra_carets();
++            let current = Snapshot::new(rope.to_string(), state.edit.cursor);
++            if let Some(snap) = state.history.$dir(current) {
++                *rope = Rope::from_str(&snap.text);
++                state.edit = EditState::at(snap.cursor);
++                out.mutated = true;
++            }
++            out.consumed = true;
++        }};
++    }
++
++    // Rows one PageUp/PageDown moves by, measured from the last painted
++    // viewport (see `RopeEditorState::page_rows`). Read before the match so the
++    // caret-vector borrow in `move_all!` cannot conflict with it.
++    let page_rows = state.page_rows;
+ 
+     match event {
+         Event::Text(text) if !text.is_empty() => {
+@@ -1291,6 +1330,19 @@ pub fn apply_event(
+                     }
+                     out.consumed = true;
+                 }
++                // Ctrl+Backspace / Ctrl+Delete delete a whole word. Both arms
++                // MUST precede the plain Backspace/Delete arms below, which
++                // carry no modifier guard and would otherwise shadow them.
++                Key::Backspace if cmd => {
++                    record_before!(EditKind::Delete);
++                    edit_all!(word_nav::delete_word_prev);
++                    out.consumed = true;
++                }
++                Key::Delete if cmd => {
++                    record_before!(EditKind::Delete);
++                    edit_all!(word_nav::delete_word_next);
++                    out.consumed = true;
++                }
+                 Key::Backspace => {
+                     record_before!(EditKind::Delete);
+                     edit_all!(editing::backspace);
+@@ -1355,6 +1407,22 @@ pub fn apply_event(
+                     }
+                     out.consumed = true;
+                 }
++                // Ctrl+Left / Ctrl+Right (and their Shift-extending forms) jump
++                // by a word, using the SAME boundary functions egui's TextEdit
++                // path uses — see `word_nav`. Guarded arms first: the plain
++                // arrow arms below have no modifier guard.
++                Key::ArrowLeft if cmd => {
++                    move_all!(|r: &mut Rope, c: &mut EditState| word_nav::move_word(
++                        r, c, -1, shift
++                    ));
++                    out.consumed = true;
++                }
++                Key::ArrowRight if cmd => {
++                    move_all!(|r: &mut Rope, c: &mut EditState| word_nav::move_word(
++                        r, c, 1, shift
++                    ));
++                    out.consumed = true;
++                }
+                 Key::ArrowLeft => {
+                     move_all!(|r: &mut Rope, c: &mut EditState| editing::move_horizontal(
+                         r, c, -1, shift
+@@ -1379,6 +1447,34 @@ pub fn apply_event(
+                     ));
+                     out.consumed = true;
+                 }
++                // PageUp/PageDown — egui implements neither on any path, so
++                // both editors get them from `page_nav`. The step is the last
++                // painted viewport's row count.
++                Key::PageUp => {
++                    move_all!(|r: &mut Rope, c: &mut EditState| page_nav::move_page(
++                        r, c, -1, page_rows, shift
++                    ));
++                    out.consumed = true;
++                }
++                Key::PageDown => {
++                    move_all!(|r: &mut Rope, c: &mut EditState| page_nav::move_page(
++                        r, c, 1, page_rows, shift
++                    ));
++                    out.consumed = true;
++                }
++                // Ctrl+Home / Ctrl+End jump to the document ends. They collapse
++                // to a single caret first: every caret would otherwise land on
++                // the same offset and be deduped into one anyway.
++                Key::Home if cmd => {
++                    state.clear_extra_carets();
++                    word_nav::move_document(rope, &mut state.edit, -1, shift);
++                    out.consumed = true;
++                }
++                Key::End if cmd => {
++                    state.clear_extra_carets();
++                    word_nav::move_document(rope, &mut state.edit, 1, shift);
++                    out.consumed = true;
++                }
+                 Key::Home => {
+                     move_all!(|r: &mut Rope, c: &mut EditState| editing::move_line_start(
+                         r, c, shift
+@@ -1396,26 +1492,11 @@ pub fn apply_event(
+                     editing::select_all(rope, &mut state.edit);
+                     out.consumed = true;
+                 }
+-                Key::Z if cmd && !shift => {
+-                    state.clear_extra_carets();
+-                    let current = Snapshot::new(rope.to_string(), state.edit.cursor);
+-                    if let Some(prev) = state.history.undo(current) {
+-                        *rope = Rope::from_str(&prev.text);
+-                        state.edit = EditState::at(prev.cursor);
+-                        out.mutated = true;
+-                    }
+-                    out.consumed = true;
+-                }
+-                Key::Z if cmd && shift => {
+-                    state.clear_extra_carets();
+-                    let current = Snapshot::new(rope.to_string(), state.edit.cursor);
+-                    if let Some(next) = state.history.redo(current) {
+-                        *rope = Rope::from_str(&next.text);
+-                        state.edit = EditState::at(next.cursor);
+-                        out.mutated = true;
+-                    }
+-                    out.consumed = true;
+-                }
++                Key::Z if cmd && !shift => history_step!(undo),
++                Key::Z if cmd && shift => history_step!(redo),
++                // Ctrl+Y is the Windows redo chord; egui's TextEdit path binds
++                // it too (`text_edit/builder.rs`), so the rope path matches.
++                Key::Y if cmd => history_step!(redo),
+                 _ => {}
+             }
+         }
+@@ -1643,6 +1724,192 @@ mod tests {
+         assert_eq!(r.to_string(), "ab\ncd\n", "each X removed");
+     }
+ 
++    // ---- keyboard-parity wiring (plan: rope-path key parity) ----
++    //
++    // These drive `apply_event` — the real dispatch — rather than the
++    // `word_nav` / `page_nav` primitives, so they fail if a binding is removed
++    // from the match even while the underlying function still works.
++
++    /// 6 lines so a 20-row page (the headless [`DEFAULT_PAGE_ROWS`]) clamps.
++    fn paged_doc() -> Rope {
++        Rope::from_str("aaaa\nbb\ncccccc\nd\neeeee\nffff")
++    }
++
++    #[test]
++    fn ctrl_arrows_move_by_word_and_shift_extends() {
++        let mut r = Rope::from_str("alpha beta gamma");
++        let mut st = RopeEditorState::new();
++
++        apply_event(&mut r, &mut st, &key_ev(egui::Key::ArrowRight, false, true));
++        assert_eq!(st.edit.cursor, 5, "Ctrl+Right jumped a word, not a char");
++        assert!(!st.edit.has_selection());
++
++        apply_event(&mut r, &mut st, &key_ev(egui::Key::ArrowRight, true, true));
++        assert_eq!(st.edit.anchor, 5, "Ctrl+Shift+Right pinned the anchor");
++        assert!(st.edit.has_selection(), "and selected");
++
++        let mut st = RopeEditorState::new();
++        st.edit = EditState::at(11);
++        apply_event(&mut r, &mut st, &key_ev(egui::Key::ArrowLeft, false, true));
++        assert!(st.edit.cursor < 11, "Ctrl+Left jumped back");
++        assert!(!st.edit.has_selection());
++    }
++
++    #[test]
++    fn plain_arrows_still_move_by_one_char() {
++        // The guarded Ctrl arms are declared FIRST in the match; this pins that
++        // they did not shadow the unmodified arrows.
++        let mut r = Rope::from_str("alpha beta");
++        let mut st = RopeEditorState::new();
++        apply_event(
++            &mut r,
++            &mut st,
++            &key_ev(egui::Key::ArrowRight, false, false),
++        );
++        assert_eq!(st.edit.cursor, 1);
++    }
++
++    #[test]
++    fn ctrl_backspace_and_ctrl_delete_remove_a_word() {
++        let mut r = Rope::from_str("alpha beta");
++        let mut st = RopeEditorState::new();
++        st.edit = EditState::at(10);
++        apply_event(&mut r, &mut st, &key_ev(egui::Key::Backspace, false, true));
++        assert_eq!(r.to_string(), "alpha ");
++
++        let mut r = Rope::from_str("alpha beta");
++        let mut st = RopeEditorState::new();
++        apply_event(&mut r, &mut st, &key_ev(egui::Key::Delete, false, true));
++        assert_eq!(r.to_string(), " beta");
++    }
++
++    #[test]
++    fn ctrl_backspace_at_line_start_joins_the_previous_line() {
++        let mut r = Rope::from_str("alpha beta\ngamma");
++        let mut st = RopeEditorState::new();
++        st.edit = EditState::at(r.line_to_char(1));
++        apply_event(&mut r, &mut st, &key_ev(egui::Key::Backspace, false, true));
++        let after = r.to_string();
++        assert!(!after.contains('\n'), "the newline was consumed: {after:?}");
++        assert!(after.ends_with("gamma"));
++    }
++
++    #[test]
++    fn plain_backspace_still_removes_one_char() {
++        let mut r = Rope::from_str("alpha beta");
++        let mut st = RopeEditorState::new();
++        st.edit = EditState::at(10);
++        apply_event(&mut r, &mut st, &key_ev(egui::Key::Backspace, false, false));
++        assert_eq!(r.to_string(), "alpha bet");
++    }
++
++    #[test]
++    fn ctrl_word_delete_is_undoable() {
++        // The Ctrl arms must record a history checkpoint like their plain
++        // counterparts, or a word delete would be unrecoverable.
++        let mut r = Rope::from_str("alpha beta");
++        let mut st = RopeEditorState::new();
++        st.edit = EditState::at(10);
++        apply_event(&mut r, &mut st, &key_ev(egui::Key::Backspace, false, true));
++        assert_eq!(r.to_string(), "alpha ");
++        apply_event(&mut r, &mut st, &key_ev(egui::Key::Z, false, true));
++        assert_eq!(r.to_string(), "alpha beta", "Ctrl+Z restored the word");
++    }
++
++    #[test]
++    fn ctrl_home_and_ctrl_end_jump_to_the_document_ends() {
++        let mut r = paged_doc();
++        let end = r.len_chars();
++        let mut st = RopeEditorState::new();
++        st.edit = EditState::at(9);
++
++        apply_event(&mut r, &mut st, &key_ev(egui::Key::End, false, true));
++        assert_eq!(st.edit.cursor, end, "Ctrl+End -> document end");
++        apply_event(&mut r, &mut st, &key_ev(egui::Key::Home, false, true));
++        assert_eq!(st.edit.cursor, 0, "Ctrl+Home -> document start");
++        assert!(!st.edit.has_selection());
++
++        // Shift variants extend instead of collapsing.
++        st.edit = EditState::at(9);
++        apply_event(&mut r, &mut st, &key_ev(egui::Key::End, true, true));
++        assert_eq!(st.edit.anchor, 9);
++        assert_eq!(st.edit.cursor, end);
++    }
++
++    #[test]
++    fn plain_home_and_end_still_act_on_the_line() {
++        let mut r = paged_doc();
++        let mut st = RopeEditorState::new();
++        st.edit = EditState::at(9); // line 2 ("cccccc"), col 1
++        apply_event(&mut r, &mut st, &key_ev(egui::Key::Home, false, false));
++        assert_eq!(editing::line_col(&r, st.edit.cursor), (2, 0));
++        apply_event(&mut r, &mut st, &key_ev(egui::Key::End, false, false));
++        assert_eq!(editing::line_col(&r, st.edit.cursor), (2, 6));
++    }
++
++    #[test]
++    fn ctrl_y_redoes_like_ctrl_shift_z() {
++        let mut r = Rope::from_str("");
++        let mut st = RopeEditorState::new();
++        apply_event(&mut r, &mut st, &text_event("hi"));
++        assert_eq!(r.to_string(), "hi");
++        apply_event(&mut r, &mut st, &key_ev(egui::Key::Z, false, true));
++        assert_eq!(r.to_string(), "", "undone");
++        apply_event(&mut r, &mut st, &key_ev(egui::Key::Y, false, true));
++        assert_eq!(r.to_string(), "hi", "Ctrl+Y redid it");
++    }
++
++    #[test]
++    fn page_down_and_page_up_move_the_caret() {
++        // DEFAULT_PAGE_ROWS (20) exceeds this 6-line doc, so one PageDown lands
++        // on the last line and one PageUp returns to the first — the clamping
++        // path, which is exactly the buffer-edge case.
++        let mut r = paged_doc();
++        let last = r.len_lines() - 1;
++        let mut st = RopeEditorState::new();
++
++        apply_event(&mut r, &mut st, &key_ev(egui::Key::PageDown, false, false));
++        assert_eq!(editing::line_col(&r, st.edit.cursor).0, last);
++        apply_event(&mut r, &mut st, &key_ev(egui::Key::PageUp, false, false));
++        assert_eq!(editing::line_col(&r, st.edit.cursor).0, 0);
++    }
++
++    #[test]
++    fn page_up_at_the_top_and_page_down_at_the_bottom_are_stable() {
++        let mut r = paged_doc();
++        let mut st = RopeEditorState::new();
++        apply_event(&mut r, &mut st, &key_ev(egui::Key::PageUp, false, false));
++        assert_eq!(st.edit.cursor, 0, "PageUp at the top stays at the top");
++
++        st.edit = EditState::at(r.len_chars());
++        apply_event(&mut r, &mut st, &key_ev(egui::Key::PageDown, false, false));
++        assert_eq!(
++            st.edit.cursor,
++            r.len_chars(),
++            "PageDown at the bottom stays at the bottom"
++        );
++    }
++
++    #[test]
++    fn shift_page_extends_the_selection() {
++        let mut r = paged_doc();
++        let mut st = RopeEditorState::new();
++        apply_event(&mut r, &mut st, &key_ev(egui::Key::PageDown, true, false));
++        assert_eq!(st.edit.anchor, 0, "anchor pinned");
++        assert!(st.edit.has_selection(), "Shift+PageDown selected");
++    }
++
++    #[test]
++    fn page_keys_are_consumed_and_do_not_mutate() {
++        let mut r = paged_doc();
++        let before = r.to_string();
++        let mut st = RopeEditorState::new();
++        let out = apply_event(&mut r, &mut st, &key_ev(egui::Key::PageDown, false, false));
++        assert!(out.consumed, "the host must not re-handle the key");
++        assert!(!out.mutated, "navigation is not an edit");
++        assert_eq!(r.to_string(), before);
++    }
++
+     #[test]
+     fn apply_event_auto_closes_brackets() {
+         let mut r = Rope::from_str("");
